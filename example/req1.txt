@@ -1,0 +1,15 @@
+POST /api/login HTTP/1.1
+Host: localhost
+User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/118.0
+Accept: application/json, text/plain, */*
+Accept-Language: en-US,pt-PT;q=0.7,en;q=0.3
+Accept-Encoding: gzip, deflate, br
+Content-Type: application/json
+Dnt: 1
+Sec-Gpc: 1
+Referer: https://google.com
+Sec-Fetch-Dest: empty
+Sec-Fetch-Mode: cors
+Sec-Fetch-Site: same-site
+
+{"username":"testuser","pass":"!aqui!"}

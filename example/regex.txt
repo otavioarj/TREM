@@ -1,0 +1,2 @@
+"userAccount": (\d{8}),`:userAccount $ "transactionType": "(PIX|TED)"`:transactionType
+"reportType": "([a-f0-9-]{36})"`:reportType
