@@ -18,6 +18,10 @@ go build -ldflags="-s -w"
 ./trem -l "req1.txt,req2.txt,...reqN.txt" -re patterns.txt [options]
 ```
 
+## Demo
+![Demo](NullByte-2025/vid.gif)
+
+
 ## Flags
 
 | Flag | Default | Description |
