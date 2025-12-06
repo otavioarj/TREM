@@ -81,7 +81,6 @@ Threads synchronize at a barrier before sending the first request simultaneously
 ### Pattern File Format
 
 Each line in the pattern file corresponds to extracting values from response N to use in request N+1.
-
 ```
 regex1`:key1 $ regex2`:key2
 regex3`:key3
@@ -90,49 +89,64 @@ regex3`:key3
 - Use backtick (`) before colon, not apostrophe
 - Multiple patterns per line separated by ` $ `
 - Regex must have one capture group `()`
+- Line 1 extracts from response 1 → used in request 2
+- Line 2 extracts from response 2 → used in request 3
 
 ### Request File Placeholders
 
 Use `$key$` in request files to mark replacement points:
-
 ```http
 POST /api/action HTTP/1.1
 Host: example.com
-Authorization: Bearer $token$
 Content-Type: application/json
 
-{"session": "$sessionId$"}
+{"session": "$sessionId$", "type": "$actionType$"}
 ```
 
 ### Example
 
 **req1.txt** - Login request:
 ```http
-POST /login HTTP/1.1
-Host: api.example.com
+POST /api/login HTTP/1.1
+Host: localhost
 Content-Type: application/json
 
-{"user":"test","pass":"test"}
+{"username":"testuser","pass":"!aqui!"}
 ```
 
-**req2.txt** - Action using token from login:
+**req2.txt** - Transaction using values from login response:
 ```http
-POST /transfer HTTP/1.1
-Host: api.example.com
-Authorization: Bearer $token$
+POST /api/transaction HTTP/1.1
+Host: localhost
+Content-Type: application/json
 
-{"amount":100}
+{"userAccount":$userAccount$,"transactionType":"$transactionType$","amount":5000}
 ```
 
-**patterns.txt**:
-```
-"token":"([^"]+)"`:token
+**req3.txt** - Report using value from transaction response:
+```http
+POST /api/report HTTP/1.1
+Host: localhost
+Content-Type: application/json
+
+{"reportType":"$reportType$","includeDetails":true}
 ```
 
-**Run:**
+**regex.txt**:
+```
+"userAccount": (\d{8}),`:userAccount $ "transactionType": "(PIX|TED)"`:transactionType
+"reportType": "([a-f0-9-]{36})"`:reportType
+```
+
+- Line 1: Extracts `userAccount` (8 digits) and `transactionType` (PIX or TED) from response 1
+- Line 2: Extracts `reportType` (UUID format) from response 2
+
+**Run with universal replacement:**
 ```bash
-./trem -l "req1.txt,req2.txt" -re patterns.txt -th 5 -mode sync
+./trem -l "req1.txt,req2.txt,req3.txt" -re regex.txt -u '!aqui!=secretpass123'
 ```
+
+The `!aqui!` placeholder in req1.txt becomes `secretpass123` at runtime.
 
 ## Looping
 
