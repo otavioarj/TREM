@@ -15,7 +15,7 @@ go build -ldflags="-s -w"
 ## Usage
 
 ```bash
-./trem -l "req1.txt,req2.txt,req3.txt" -re patterns.txt [options]
+./trem -l "req1.txt,req2.txt,...reqN.txt" -re patterns.txt [options]
 ```
 
 ## Flags
