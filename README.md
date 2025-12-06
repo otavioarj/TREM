@@ -26,7 +26,7 @@ go build -ldflags="-s -w"
 | `-re` | *required* | Regex patterns file for value extraction between requests |
 | `-h` | | Host:port override (default: extracted from Host header) |
 | `-th` | 1 | Thread count |
-| `-d` | 100 | Delay in milliseconds between requests |
+| `-d` | 0 | Delay in milliseconds between requests |
 | `-o` | false | Save last response per thread as `out_<time>_t<id>.txt` |
 | `-u` | | Universal replacement `key=val` applied to all requests |
 | `-px` | | HTTP proxy URL (e.g., `http://127.0.0.1:8080`) |

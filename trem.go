@@ -121,7 +121,7 @@ func main() {
 	listFlag := flag.String("l", "", "Comma-separated request RAW HTTP/1.1 files.")
 	reFlag := flag.String("re", "", "Regex (Golang) definitions file. Each line applies to a request file, respectively.\nExamples:\n  One Regex line for each request file, e.g., line 1 will use regexes for request 1\n  Format: regex1':key1$$regex2':key2$$...regex':keyN supports multiples regex per line/request\n  Note: Use backtick character, not (').")
 	thrFlag := flag.Int("th", 1, "Threads count.")
-	delayFlag := flag.Int("d", 100, "Delay ms between reqs.")
+	delayFlag := flag.Int("d", 0, "Delay ms between reqs.")
 	outFlag := flag.Bool("o", false, "Save *last* (per-thread) HTTP response as out_<timestamp>_t<threadID>.txt")
 	univFlag := flag.String("u", "", "Universal replace key=val every request; e.g., !treco!=Val replaces !treco! to Val in every request, multiple times if matched.")
 	proxyFlag := flag.String("px", "", "HTTP proxy; http://ip:port")
