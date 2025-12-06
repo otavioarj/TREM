@@ -5,7 +5,11 @@ HTTP/1.1 race condition testing tool with request chaining support. Allows seque
 ## Build
 
 ```bash
-go build -o trem trem.go
+# Debugging build
+go build 
+
+# Release? :P
+go build -ldflags="-s -w"
 ```
 
 ## Usage
