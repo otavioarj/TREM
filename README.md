@@ -5,6 +5,10 @@ HTTP/1.1 race condition testing tool with request chaining support. Allows seque
 ## Build
 
 ```bash
+#Init 
+git clone https://github.com/otavioarj/TREM.git
+go mod tidy
+
 # Debugging build
 go build 
 

@@ -14,8 +14,8 @@ import (
 	"time"
 )
 
-// send - creates new connection and sends req
-func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, logger LogWriter) (resp, status string, err error) {
+// send - creates new connection and sends request
+func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, logger LogWriter, threadID int) (resp, status string, err error) {
 	conn, err := dialWithProxy(addr, proxyURL)
 	if err != nil {
 		return "", "", err
@@ -24,7 +24,7 @@ func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Durati
 	host, port, _ := net.SplitHostPort(addr)
 
 	if port == "443" {
-		tlsConn, err := tlsHandshake(conn, host, cliMode, tlsTimeout, logger)
+		tlsConn, err := tlsHandshake(conn, host, cliMode, tlsTimeout, logger, threadID)
 		if err != nil {
 			conn.Close()
 			return "", "", err
@@ -33,17 +33,24 @@ func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Durati
 	}
 
 	defer conn.Close()
-	return sendOnConn(raw, conn)
+	return sendOnConn(raw, conn, threadID)
 }
 
-// sendOnConn - sends req on existing connection
-func sendOnConn(raw []byte, conn net.Conn) (resp, status string, err error) {
+// sendOnConn - sends request on existing connection, reports metrics
+func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, err error) {
+	// Only measure latency in verbose mode
+	var startTime time.Time
+	if verbose {
+		startTime = time.Now()
+	}
+
 	var sb strings.Builder
 	var contentLength int64 = -1
 	var chunked bool
 	var encoding string
 	var decodedBody bytes.Buffer
 
+	bytesOut := len(raw)
 	_, err = conn.Write(raw)
 	if err != nil {
 		return "", "", err
@@ -60,12 +67,22 @@ func sendOnConn(raw []byte, conn net.Conn) (resp, status string, err error) {
 		status = parts[1]
 	}
 
+	// Check for HTTP error
+	statusCode, _ := strconv.Atoi(status)
+	if statusCode >= 400 {
+		stats.ReportHTTPError(threadID, statusCode)
+	}
+
 	// Parse headers
+	var bytesIn int
+	bytesIn += len(line)
+
 	for {
 		l, err := reader.ReadString('\n')
 		if err != nil {
 			return "", "", err
 		}
+		bytesIn += len(l)
 		sb.WriteString(l)
 		if l == "\r\n" || l == "\n" {
 			break
@@ -73,7 +90,6 @@ func sendOnConn(raw []byte, conn net.Conn) (resp, status string, err error) {
 
 		lower := strings.ToLower(l)
 
-		// Parse Content-Length
 		if contentLength < 0 {
 			if strings.HasPrefix(lower, "content-length:") {
 				val := strings.TrimSpace(l[15:])
@@ -82,14 +98,12 @@ func sendOnConn(raw []byte, conn net.Conn) (resp, status string, err error) {
 			}
 		}
 
-		// Parse Transfer-Encoding
 		if strings.HasPrefix(lower, "transfer-encoding:") {
 			if strings.Contains(lower, "chunked") {
 				chunked = true
 			}
 		}
 
-		// Parse Content-Encoding
 		if encoding == "" {
 			if strings.HasPrefix(lower, "content-encoding:") {
 				encoding = strings.TrimSpace(strings.ToLower(l[17:]))
@@ -98,55 +112,55 @@ func sendOnConn(raw []byte, conn net.Conn) (resp, status string, err error) {
 		}
 	}
 
-	// Read body based on transfer type
+	// Read body
 	body := &bytes.Buffer{}
 
 	if chunked {
-		// Handle chunked transfer encoding
 		for {
 			sizeLine, err := reader.ReadString('\n')
 			if err != nil {
 				break
 			}
+			bytesIn += len(sizeLine)
 			sizeLine = strings.TrimSpace(sizeLine)
 			size, err := strconv.ParseInt(sizeLine, 16, 64)
 			if err != nil || size == 0 {
-				// Read trailing CRLF after last chunk
 				reader.ReadString('\n')
 				break
 			}
 
 			chunk := make([]byte, size)
-			_, err = io.ReadFull(reader, chunk)
+			n, err := io.ReadFull(reader, chunk)
+			bytesIn += n
 			if err != nil {
 				break
 			}
 			body.Write(chunk)
 
-			// Read CRLF after chunk
-			reader.ReadString('\n')
+			crlf, _ := reader.ReadString('\n')
+			bytesIn += len(crlf)
 		}
 	} else if contentLength > 0 {
-		// Known content length
 		limited := io.LimitReader(reader, contentLength)
-		io.Copy(body, limited)
+		n, _ := io.Copy(body, limited)
+		bytesIn += int(n)
 	} else if contentLength == 0 {
 		// No body
 	} else {
-		// Unknown length, read until EOF
 		buf := make([]byte, 4096)
 		for {
 			n, err := reader.Read(buf)
 			if n > 0 {
+				bytesIn += n
 				body.Write(buf[:n])
 			}
 			if err != nil {
-				break // EOF or error, both mean end of body
+				break
 			}
 		}
 	}
 
-	// Decode body if compressed
+	// Decode compressed body
 	switch encoding {
 	case "", "identity":
 		decodedBody = *body
@@ -168,7 +182,6 @@ func sendOnConn(raw []byte, conn net.Conn) (resp, status string, err error) {
 			return "", "", fmt.Errorf("deflate read err: %v", err)
 		}
 	default:
-		// Unknown encoding, return raw body
 		if verbose {
 			fmt.Printf("[V] unknown encoding: %s, returning raw\n", encoding)
 		}
@@ -176,6 +189,14 @@ func sendOnConn(raw []byte, conn net.Conn) (resp, status string, err error) {
 	}
 
 	sb.Write(decodedBody.Bytes())
+
+	// Report metrics (latency only if verbose)
+	var latencyUs uint32
+	if verbose {
+		latencyUs = uint32(time.Since(startTime).Microseconds())
+	}
+	stats.ReportRequest(threadID, latencyUs, uint32(bytesIn), uint32(bytesOut))
+
 	return sb.String(), status, nil
 }
 
@@ -201,7 +222,6 @@ func dialWithProxy(addr, proxyURL string) (net.Conn, error) {
 		return nil, err
 	}
 
-	// Use buffered reader instead of byte-by-byte
 	reader := bufio.NewReader(proxyConn)
 	respLine, err := reader.ReadString('\n')
 	if err != nil {
@@ -214,7 +234,6 @@ func dialWithProxy(addr, proxyURL string) (net.Conn, error) {
 		return nil, fmt.Errorf("proxy CONNECT failed: %s", strings.TrimSpace(respLine))
 	}
 
-	// Read remaining headers until empty line
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil || line == "\r\n" || line == "\n" {
@@ -235,7 +254,7 @@ func (o *Orch) closeWorkerConn(w *monkey) {
 	}
 }
 
-// dialWithRetry - dial with exponential backoff retry
+// dialWithRetry - dial with exponential backoff
 func (o *Orch) dialWithRetry(w *monkey, addr string) (net.Conn, error) {
 	var lastErr error
 	backoff := 100 * time.Millisecond
@@ -253,7 +272,6 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) (net.Conn, error) {
 			}
 		}
 
-		// New TCP connection for each attempt
 		conn, err := dialWithProxy(addr, o.proxyURL)
 		if err != nil {
 			lastErr = err
@@ -262,10 +280,9 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) (net.Conn, error) {
 
 		host, port, _ := net.SplitHostPort(addr)
 		if port == "443" {
-			// New TLS handshake on fresh connection!
-			tlsConn, err := tlsHandshake(conn, host, o.clientHelloID, o.tlsTimeout, w.logger)
+			tlsConn, err := tlsHandshake(conn, host, o.clientHelloID, o.tlsTimeout, w.logger, w.id)
 			if err != nil {
-				conn.Close() // Close TCP conn on TLS failure
+				conn.Close()
 				lastErr = err
 				continue
 			}
@@ -278,7 +295,7 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) (net.Conn, error) {
 	return nil, fmt.Errorf("dial failed after %d retries: %v", o.maxRetries, lastErr)
 }
 
-// sendWithRetry - send with retry on any error
+// sendWithRetry - send with retry on error
 func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string, error) {
 	var lastErr error
 	backoff := 100 * time.Millisecond
@@ -296,7 +313,7 @@ func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string
 			}
 		}
 
-		resp, status, err := send(raw, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, w.logger)
+		resp, status, err := send(raw, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, w.logger, w.id)
 		if err == nil {
 			return resp, status, nil
 		}
@@ -312,29 +329,25 @@ func (o *Orch) sendWithReconnect(w *monkey, raw []byte, conn net.Conn, addr stri
 		return o.sendWithRetry(w, raw, addr)
 	}
 
-	resp, status, err := sendOnConn(raw, conn)
+	resp, status, err := sendOnConn(raw, conn, w.id)
 	if err != nil {
 		if verbose {
 			w.logger.Write(fmt.Sprintf("[V] send on conn failed: %v, reconnecting\n", err))
 		}
 
-		// Close old connection
 		o.closeWorkerConn(w)
 
-		// Establish new connection
 		newConn, dialErr := o.dialWithRetry(w, addr)
 		if dialErr != nil {
 			return "", "", fmt.Errorf("reconnect failed: %v (original: %v)", dialErr, err)
 		}
 
-		// Update worker connection
 		w.connMu.Lock()
 		w.conn = newConn
 		w.connAddr = addr
 		w.connMu.Unlock()
 
-		// Retry send
-		return sendOnConn(raw, newConn)
+		return sendOnConn(raw, newConn, w.id)
 	}
 
 	return resp, status, nil

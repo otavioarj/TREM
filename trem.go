@@ -5,53 +5,40 @@ package main
 import (
 	"flag"
 	"fmt"
-	"math/rand"
 	"net"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/gdamore/tcell/v2"
-	"github.com/rivo/tview"
 )
+
+// Release :)
+var version = "v1.1"
 
 // Verbose mode flag
 var verbose bool
+
+// Global stats collector
+var stats *StatsCollector
 
 type pattern struct {
 	re      *regexp.Regexp
 	keyword string
 }
 
-// LogWriter - interface for worker (my monkeys) output, one mokey per thread :)
+// LogWriter - interface for worker output
 type LogWriter interface {
 	Write(msg string)
-}
-
-// TVLogWriter - writes to tview.TextView
-type TVLogWriter struct {
-	tv  *tview.TextView
-	app *tview.Application
-	mu  sync.Mutex
-}
-
-func (t *TVLogWriter) Write(msg string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.app.QueueUpdateDraw(func() {
-		fmt.Fprint(t.tv, msg)
-	})
 }
 
 // monkey - represents single thread
 type monkey struct {
 	id       int
 	logger   LogWriter
-	conn     net.Conn   // if persistent connection (keepalive) is on
-	connAddr string     // address of current connection for reconnect detection
-	connMu   sync.Mutex // mutex for connection operations
+	conn     net.Conn   // persistent connection (keepalive)
+	connAddr string     // current connection address
+	connMu   sync.Mutex // connection mutex
 	prevResp string
 	reqFiles []string
 	patterns [][]pattern
@@ -83,61 +70,54 @@ type Orch struct {
 	clientHelloID int
 	tlsTimeout    time.Duration
 	maxRetries    int
-	// Sync barrier with mutex protection
+	// Sync barrier
 	barrierMu    sync.Mutex
 	barrierCount int
 }
 
-// Pre-compiled regex for performance :)
+// Pre-compiled regex
 var httpVersionRe = regexp.MustCompile(`HTTP/\d+\.\d+`)
 
-var app *tview.Application
-var pages *tview.Pages
-
-var logo = [3]string{`
-░▒▓████████▓▒░▒▓███████▓▒░░▒▓████████▓▒░▒▓██████████████▓▒░  
-   ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░ 
-   ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░ 
-   ░▒▓█▓▒░   ░▒▓███████▓▒░░▒▓██████▓▒░ ░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░ 
-   ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░ 
-   ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░ 
-   ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓████████▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░ `, `
-▄▄▄█████▓ ██▀███  ▓█████  ███▄ ▄███▓
-▓  ██▒ ▓▒▓██ ▒ ██▒▓█   ▀ ▓██▒▀█▀ ██▒
-▒ ▓██░ ▒░▓██ ░▄█ ▒▒███   ▓██    ▓██░
-░ ▓██▓ ░ ▒██▀▀█▄  ▒▓█  ▄ ▒██    ▒██ 
-  ▒██▒ ░ ░██▓ ▒██▒░▒████▒▒██▒   ░██▒
-  ▒ ░░   ░ ▒▓ ░▒▓░░░ ▒░ ░░ ▒░   ░  ░
-    ░      ░▒ ░ ▒░ ░ ░  ░░  ░      ░
-  ░        ░░   ░    ░   ░      ░   
-            ░        ░  ░       ░   `, `
-░▀█▀░█▀▄░█▀▀░█▄█
-░░█░░█▀▄░█▀▀░█░█
-░░▀░░▀░▀░▀▀▀░▀░▀
-`}
+// Config summit banner for stats window
+var configBanner string
 
 func main() {
-	hostFlag := flag.String("h", "", "Host:port override; default is addr from Host HTTP Header.")
+	hostFlag := flag.String("h", "", "Host:port override; default from Host header.")
 	listFlag := flag.String("l", "", "Comma-separated request RAW HTTP/1.1 files.")
-	reFlag := flag.String("re", "", "Regex (Golang) definitions file. Each line applies to a request file, respectively.\nExamples:\n  One Regex line for each request file, e.g., line 1 will use regexes for request 1\n  Format: regex1':key1$$regex2':key2$$...regex':keyN supports multiples regex per line/request\n  Note: Use backtick character, not (').")
-	thrFlag := flag.Int("th", 1, "Threads count.")
-	delayFlag := flag.Int("d", 0, "Delay ms between reqs.")
-	outFlag := flag.Bool("o", false, "Save *last* (per-thread) HTTP response as out_<timestamp>_t<threadID>.txt")
-	univFlag := flag.String("u", "", "Universal replace key=val every request; e.g., !treco!=Val replaces !treco! to Val in every request, multiple times if matched.")
+	reFlag := flag.String("re", "", "Regex definitions file. Format: regex`:key per line.")
+	thrFlag := flag.Int("th", 5, "Thread count.")
+	delayFlag := flag.Int("d", 0, "Delay ms between requests.")
+	outFlag := flag.Bool("o", false, "Save last response per thread.")
+	univFlag := flag.String("u", "", "Universal replace key=val.")
 	proxyFlag := flag.String("px", "", "HTTP proxy; http://ip:port")
 	modeFlag := flag.String("mode", "async", "Mode: sync or async.")
-	kaFlag := flag.Bool("k", false, "Keep-alive connections; persist TLS tunnels for every request, including while looping (-xt N).")
-	loopStartFlag := flag.Int("x", -1, "When looping, chain request x to N, where x is -l [1..x..N], default disabled.\n Ex: -l \"req1,req2,req4\" -x 2, does reqs 1 to 4, then iterates -xt times from req2 to req4")
-	loopTimesFlag := flag.Int("xt", 0, "Requests loop count:\n 0=infinite\n-1= zero loops")
-	cliFlag := flag.Int("cli", 0, "ClientHello ID: 0=RandomNoALPN, 1=Chrome_Auto, 2=Firefox_Auto, 3=iOS_Auto, 4=Edge_Auto, 5=Safari_Auto")
-	touFlag := flag.Int("tou", 1000, "TLS handshake timeout in milliseconds")
-	retryFlag := flag.Int("retry", 3, "Max retries on connection/TLS errors")
-	verboseFlag := flag.Bool("v", false, "Verbose debug output")
+	kaFlag := flag.Bool("k", true, "Keep-alive connections.")
+	loopStartFlag := flag.Int("x", 1, "Loop start index (1-based).")
+	loopTimesFlag := flag.Int("xt", 1, "Loop count (0=infinite).")
+	cliFlag := flag.Int("cli", 0, "ClientHello ID: 0=RandomNoALPN, 1=Chrome, 2=Firefox, 3=iOS, 4=Edge, 5=Safari")
+	touFlag := flag.Int("tou", 500, "TLS timeout in ms.")
+	retryFlag := flag.Int("retry", 3, "Max retries on errors.")
+	verboseFlag := flag.Bool("v", false, "Verbose output.")
+	swFlag := flag.Int("sw", 0, "Stats window size (0=auto: 10 normal, 50 verbose).")
 	flag.Parse()
 
+	configBanner = FormatConfig(*thrFlag, *modeFlag, *delayFlag, *kaFlag,
+		*loopStartFlag, *loopTimesFlag, *cliFlag, *touFlag,
+		*verboseFlag, *proxyFlag, *hostFlag)
 	verbose = *verboseFlag
 
-	fmt.Print(logo[rand.Intn(len(logo))] + "\nTransactional Racing Executor Monkey - aka Macaco v1.0\n\n")
+	// Stats window size
+	windowSize := *swFlag
+	if windowSize <= 0 {
+		if verbose {
+			windowSize = 50
+		} else {
+			windowSize = 10
+		}
+	}
+
+	PrintLogo()
+
 	if *listFlag == "" || *reFlag == "" {
 		flag.PrintDefaults()
 		os.Exit(1)
@@ -148,12 +128,11 @@ func main() {
 		exitErr("Need at least 2 req files")
 	}
 
-	// Validate loop flags
 	if *loopStartFlag > len(reqFiles) {
 		exitErr(fmt.Sprintf("-x must be between 1 and %d", len(reqFiles)))
 	}
 	if *loopStartFlag == 0 || (*loopStartFlag == -1 && *loopTimesFlag > 1) {
-		*loopStartFlag = 1 // treat 0 as 1
+		*loopStartFlag = 1
 	}
 
 	allPatterns, err := loadPatterns(*reFlag)
@@ -173,42 +152,24 @@ func main() {
 		univKey, univVal = parts[0], parts[1]
 	}
 
-	// Init TView
-	app = tview.NewApplication()
-	pages = tview.NewPages()
+	// Init stats collector
+	stats = NewStatsCollector(windowSize, verbose)
 
-	// Create monkeys and tabs
+	// Init UI
+	ui := NewUIManager(*thrFlag)
+	ui.StartStatsConsumer(stats.OutputChan())
+
+	// Create monkeys
 	monkeys := make([]*monkey, *thrFlag)
-	tabNames := make([]string, *thrFlag)
-
 	for i := 0; i < *thrFlag; i++ {
-		tv := tview.NewTextView().
-			SetDynamicColors(true).
-			SetScrollable(true)
-
-		// Capture tv in local scope for closure
-		textView := tv
-		tv.SetChangedFunc(func() {
-			app.QueueUpdateDraw(func() {
-				textView.ScrollToEnd()
-			})
-		})
-
-		tv.SetBorder(true).SetTitle(fmt.Sprintf(" Thread %d | Tab:Next Shift+Tab:Prev Q:Quit ", i+1))
-		logWriter := &TVLogWriter{tv: tv, app: app}
 		monkeys[i] = &monkey{
 			id:       i,
-			logger:   logWriter,
+			logger:   ui.GetLogger(i),
 			reqFiles: reqFiles,
 			patterns: allPatterns,
 			univKey:  univKey,
 			univVal:  univVal,
 		}
-
-		tabName := fmt.Sprintf("t%d", i+1)
-		tabNames[i] = tabName
-		pages.AddPage(tabName, tv, true, i == 0)
-		fmt.Fprintf(tv, "Thread %d starting...\n", i+1)
 	}
 
 	// Create orchestrator
@@ -227,37 +188,10 @@ func main() {
 		tlsTimeout:    time.Duration(*touFlag) * time.Millisecond,
 		maxRetries:    *retryFlag,
 	}
-	// Tab navigation
-	currentTab := 0
-	monkeysFinished := false
-	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyTab {
-			currentTab = (currentTab + 1) % len(tabNames)
-			pages.SwitchToPage(tabNames[currentTab])
-			return nil
-		} else if event.Key() == tcell.KeyBacktab {
-			currentTab = (currentTab - 1 + len(tabNames)) % len(tabNames)
-			pages.SwitchToPage(tabNames[currentTab])
-			return nil
-		} else if event.Rune() == 'q' || event.Rune() == 'Q' {
-			if monkeysFinished {
-				app.Stop()
-			} else {
-				// Signal quit for infinite loops
-				select {
-				case <-orch.quitChan:
-					// already closed
-				default:
-					close(orch.quitChan)
-				}
-				app.Stop()
-			}
-			return nil
-		}
-		return event
-	})
 
-	// Sync mode has a logic barrier at first TLS tunnel, to sync the request
+	monkeysFinished := false
+	ui.SetupInputCapture(orch, &monkeysFinished)
+
 	if orch.mode == "sync" {
 		orch.readyChan = make(chan int, *thrFlag)
 		orch.startChan = make(chan struct{})
@@ -266,13 +200,13 @@ func main() {
 		}
 	}
 
-	// Start monkeys
+	// Start workers
 	for _, w := range monkeys {
 		orch.wg.Add(1)
 		go orch.runWorker(w)
 	}
 
-	// Sync mode: wait for all ready, then broadcast start; thus logic barrier :)
+	// Sync barrier orchestration
 	if orch.mode == "sync" {
 		go func() {
 			readyCount := 0
@@ -291,11 +225,9 @@ func main() {
 				orch.barrierMu.Unlock()
 			}
 
-			// Loop orchestration
 			if orch.loopStart > 0 {
 				loopCount := 0
 				for {
-					// Check exit conditions
 					if orch.loopTimes > 0 && loopCount >= orch.loopTimes {
 						break
 					}
@@ -306,7 +238,6 @@ func main() {
 					default:
 					}
 
-					// Reset barrier channels for next iteration
 					orch.barrierMu.Lock()
 					orch.readyChan = make(chan int, len(monkeys))
 					orch.startChan = make(chan struct{})
@@ -314,10 +245,8 @@ func main() {
 					orch.loopChan = make(chan struct{})
 					orch.barrierMu.Unlock()
 
-					// Signal all monkeys to start next loop
 					close(oldLoopChan)
 
-					// Wait for all ready
 					readyCount = 0
 					for range orch.readyChan {
 						readyCount++
@@ -326,7 +255,6 @@ func main() {
 						}
 					}
 
-					// Broadcast start
 					close(orch.startChan)
 					loopCount++
 				}
@@ -334,30 +262,26 @@ func main() {
 		}()
 	}
 
-	// Wait completion in background
+	// Wait completion
 	go func() {
 		orch.wg.Wait()
 		monkeysFinished = true
-
-		// Show completion message in all tabs
-		for _, w := range monkeys {
-			w.logger.Write("\n=== All requests completed ===\n")
-			w.logger.Write("Press Q to quit, Tab/Shift+Tab to navigate\n")
-		}
+		stats.Stop()
+		ui.BroadcastMessage("\n=== All requests completed ===\n")
+		ui.BroadcastMessage("Press Q to quit, Tab/Shift+Tab to navigate\n")
 	}()
 
-	// Start UI - this blocks until app.Stop()
-	if err := app.SetRoot(pages, true).EnableMouse(true).Run(); err != nil {
+	if err := ui.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "TView error: %v\n", err)
 	}
 }
 
-// runWorker - executes req chain for single monkey
+// runWorker - executes request chain for single monkey
 func (o *Orch) runWorker(w *monkey) {
 	defer o.wg.Done()
 	defer o.closeWorkerConn(w)
 
-	// Load file cache if loop enabled
+	// Load cache if loop enabled
 	if o.loopStart > 0 {
 		w.reqCache = make([]string, len(w.reqFiles))
 		for i, file := range w.reqFiles {
@@ -370,9 +294,7 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 	}
 
-	// Phase 1: Prepare first req + connection (sync mode)
 	if o.mode == "sync" {
-		// Parse first req
 		raw, err := os.ReadFile(w.reqFiles[0])
 		if err != nil {
 			w.logger.Write(fmt.Sprintf("ERR: read file: %v\n", err))
@@ -380,20 +302,17 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 		req := normalizeRequest(string(raw))
 
-		// Apply universal replace
 		if w.univKey != "" {
 			req = strings.ReplaceAll(req, w.univKey, w.univVal)
 			w.logger.Write(fmt.Sprintf("Univ %s: %s\n", w.univKey, w.univVal))
 		}
 
-		// Parse host
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			w.logger.Write(fmt.Sprintf("ERR: parse host: %v\n", err))
 			return
 		}
 
-		// Establish connection with retry
 		w.logger.Write(fmt.Sprintf("Connecting: %s\n", addr))
 		conn, err := o.dialWithRetry(w, addr)
 		if err != nil {
@@ -408,15 +327,12 @@ func (o *Orch) runWorker(w *monkey) {
 			w.connMu.Unlock()
 		}
 
-		// Signal ready
 		o.readyChan <- w.id
 		w.logger.Write("Ready, waiting for sync...\n")
 
-		// Wait for start signal
 		<-o.startChan
 		w.logger.Write("Sync start!\n")
 
-		// Send first req with reconnect on error
 		resp, status, err := o.sendWithReconnect(w, []byte(req), conn, addr)
 		if err != nil {
 			w.logger.Write(fmt.Sprintf("ERR: send: %v\n", err))
@@ -432,11 +348,9 @@ func (o *Orch) runWorker(w *monkey) {
 			conn.Close()
 		}
 
-		// Continue chain from req2
 		for i := 1; i < len(w.reqFiles); i++ {
-			// Save loop start point
 			if o.loopStart > 0 && i == o.loopStart-1 {
-				w.loopStartReq = "" // will be set in processReq
+				w.loopStartReq = ""
 				w.loopStartAddr = addr
 			}
 
@@ -447,7 +361,6 @@ func (o *Orch) runWorker(w *monkey) {
 			time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
 		}
 
-		// Execute loops if enabled
 		if o.loopStart > 0 {
 			loopCount := 0
 			for {
@@ -455,10 +368,7 @@ func (o *Orch) runWorker(w *monkey) {
 				case <-o.quitChan:
 					return
 				case <-o.loopChan:
-					// Reset prevResp for clean loop
 					w.prevResp = ""
-
-					// Wait for barrier
 					o.readyChan <- w.id
 					<-o.startChan
 
@@ -469,7 +379,6 @@ func (o *Orch) runWorker(w *monkey) {
 						w.logger.Write(fmt.Sprintf("\n[Loop %d/%d]\n", loopCount, o.loopTimes))
 					}
 
-					// Send cached loop start req with reconnect
 					w.connMu.Lock()
 					conn := w.conn
 					w.connMu.Unlock()
@@ -482,7 +391,6 @@ func (o *Orch) runWorker(w *monkey) {
 					w.logger.Write(fmt.Sprintf("HTTP %s\n", status))
 					w.prevResp = resp
 
-					// Continue from loopStart+1 to end
 					for i := o.loopStart; i < len(w.reqFiles); i++ {
 						if err := o.processReq(w, i, w.loopStartAddr); err != nil {
 							w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
@@ -494,12 +402,11 @@ func (o *Orch) runWorker(w *monkey) {
 			}
 		}
 	} else {
-		// Async mode: process all reqs sequentially
+		// Async mode
 		w.logger.Write(fmt.Sprintf("Univ %s: %s\n", w.univKey, w.univVal))
 		for i := 0; i < len(w.reqFiles); i++ {
-			// Save loop start point
 			if o.loopStart > 0 && i == o.loopStart-1 {
-				w.loopStartReq = "" // will be set in processReqAsync
+				w.loopStartReq = ""
 				w.loopStartAddr = ""
 			}
 
@@ -510,11 +417,9 @@ func (o *Orch) runWorker(w *monkey) {
 			time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
 		}
 
-		// Execute loops if enabled
 		if o.loopStart > 0 {
 			loopCount := 0
 			for {
-				// Check exit conditions
 				if o.loopTimes > 0 && loopCount >= o.loopTimes {
 					break
 				}
@@ -532,10 +437,8 @@ func (o *Orch) runWorker(w *monkey) {
 					w.logger.Write(fmt.Sprintf("\n[Loop %d/%d]\n", loopCount, o.loopTimes))
 				}
 
-				// Reset prevResp for clean loop
 				w.prevResp = ""
 
-				// Send cached loop start req with retry
 				resp, status, err := o.sendWithRetry(w, []byte(w.loopStartReq), w.loopStartAddr)
 				if err != nil {
 					w.logger.Write(fmt.Sprintf("ERR: loop send: %v\n", err))
@@ -544,7 +447,6 @@ func (o *Orch) runWorker(w *monkey) {
 				w.logger.Write(fmt.Sprintf("HTTP %s\n", status))
 				w.prevResp = resp
 
-				// Continue from loopStart+1 to end
 				for i := o.loopStart; i < len(w.reqFiles); i++ {
 					if err := o.processReqAsync(w, i); err != nil {
 						w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
@@ -556,7 +458,6 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 	}
 
-	// Save output if requested
 	if o.outFlag {
 		filename := fmt.Sprintf("out_%s_t%d.txt", time.Now().Format("15:04:05"), w.id)
 		os.WriteFile(filename, []byte(w.prevResp), 0666)

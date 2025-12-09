@@ -235,6 +235,30 @@ func normalizeRequest(req string) string {
 	return strings.Join(normalized, "\r\n")
 }
 
+func FormatConfig(threads int, mode string, delay int, keepAlive bool,
+	loopStart, loopTimes int, cliHello int, tlsTimeout int, verbose bool,
+	proxy string, host string) string {
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Verbose: %v   Threads: %d  TLS t.o: %dms\n", verbose, threads, tlsTimeout))
+	lines = append(lines, fmt.Sprintf("Keep-alive: %v Delay: %dms  Mode: %s\n", keepAlive, delay, mode))
+	loopTimesStr := "∞"
+
+	if loopTimes != 0 {
+		loopTimesStr = fmt.Sprintf("%d", loopTimes)
+	}
+	lines = append(lines, fmt.Sprintf("LoopStart: %d LoopTimes: %s CliHello: %s\n", loopStart, loopTimesStr,
+		clientHelloNames[cliHello]))
+
+	if proxy != "" {
+		lines = append(lines, fmt.Sprintf("Proxy: %s\n", proxy))
+	}
+
+	if host != "" {
+		lines = append(lines, fmt.Sprintf("Forced Host: %s\n", host))
+	}
+	return strings.Join(lines, "")
+}
+
 func parseHost(req, override string) (string, error) {
 	if override != "" {
 		return override, nil

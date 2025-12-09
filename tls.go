@@ -19,8 +19,6 @@ var clientHelloNames = map[int]string{
 }
 
 // getClientHelloID - returns utls ClientHelloID for given mode
-//
-//	it may TRIGGER WAFs, better client is Randomized
 func getClientHelloID(cliMode int) utls.ClientHelloID {
 	switch cliMode {
 	case 1:
@@ -38,26 +36,25 @@ func getClientHelloID(cliMode int) utls.ClientHelloID {
 	}
 }
 
-// tlsHandshake - performs TLS handshake with proper deadline handling
-// Note: Does NOT retry internally - caller must create new TCP conn for each retry!!!
-func tlsHandshake(conn net.Conn, host string, cliMode int, timeout time.Duration, logger LogWriter) (*utls.UConn, error) {
-	helloID := getClientHelloID(cliMode)
-
+// tlsHandshake - performs TLS handshake, reports metrics in verbose mode
+// Note: Does NOT retry - caller must create new TCP conn for each retry
+func tlsHandshake(conn net.Conn, host string, cliMode int, timeout time.Duration, logger LogWriter, threadID int) (*utls.UConn, error) {
+	var startTime time.Time
 	if verbose {
+		startTime = time.Now()
 		helloName := clientHelloNames[cliMode]
 		logger.Write(fmt.Sprintf("[V] TLS handshake: host=%s, hello=%s\n", host, helloName))
 	}
 
-	// Set deadline before handshake
-	conn.SetDeadline(time.Now().Add(timeout))
+	helloID := getClientHelloID(cliMode)
 
-	// Ensure deadline is cleared even on error
+	conn.SetDeadline(time.Now().Add(timeout))
 	defer conn.SetDeadline(time.Time{})
 
 	tlsConf := &utls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         host,
-		NextProtos:         []string{"http/1.1"}, // Force NO ALPN
+		NextProtos:         []string{"http/1.1"},
 	}
 
 	tlsConn := utls.UClient(conn, tlsConf, helloID)
@@ -66,11 +63,16 @@ func tlsHandshake(conn net.Conn, host string, cliMode int, timeout time.Duration
 	if err != nil {
 		if verbose {
 			logger.Write(fmt.Sprintf("[V] TLS handshake failed: %v\n", err))
+			stats.ReportTLSRetry(threadID)
 		}
 		return nil, err
 	}
 
+	// Report successful handshake (verbose only)
 	if verbose {
+		latencyUs := uint32(time.Since(startTime).Microseconds())
+		stats.ReportTLS(threadID, latencyUs, 1)
+
 		state := tlsConn.ConnectionState()
 		logger.Write(fmt.Sprintf("[V] TLS handshake ok: version=0x%04x, cipher=0x%04x\n",
 			state.Version, state.CipherSuite))
