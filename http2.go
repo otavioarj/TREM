@@ -118,8 +118,8 @@ func (h *H2Conn) readAndAckSettings() error {
 	return nil
 }
 
-// sendReq - sends HTTP/2 request, returns response
-func (h *H2Conn) sendReq(req *ParsedReq, threadID int) (resp, status string, err error) {
+// sendReqH2 - sends HTTP/2 request, returns response
+func (h *H2Conn) sendReqH2(req *ParsedReq, threadID int) (resp, status string, err error) {
 	var startTime time.Time
 	if verbose {
 		startTime = time.Now()
@@ -190,7 +190,6 @@ func (h *H2Conn) sendReq(req *ParsedReq, threadID int) (resp, status string, err
 		latencyUs = uint32(time.Since(startTime).Microseconds())
 	}
 	stats.ReportRequest(threadID, latencyUs, uint32(bytesIn), uint32(bytesOut))
-
 	return resp, status, nil
 }
 
@@ -212,7 +211,8 @@ func (h *H2Conn) readResponse(streamID uint32) (resp, status string, bytesIn int
 		length := int(hdr[0])<<16 | int(hdr[1])<<8 | int(hdr[2])
 		ftype := hdr[3]
 		flags := hdr[4]
-		fStreamID := binary.BigEndian.Uint32(hdr[5:]) & 0x7FFFFFFF
+		// 4 bytes into correct endian
+		fStreamID := uint32(hdr[5]&0x7F)<<24 | uint32(hdr[6])<<16 | uint32(hdr[7])<<8 | uint32(hdr[8])
 
 		var payload []byte
 		if length > 0 {
@@ -286,7 +286,8 @@ func (h *H2Conn) readResponse(streamID uint32) (resp, status string, bytesIn int
 
 		case frameRstStream:
 			if fStreamID == streamID {
-				errCode := binary.BigEndian.Uint32(payload)
+				// 4 bytes into correct endian
+				errCode := uint32(payload[0])<<24 | uint32(payload[1])<<16 | uint32(payload[2])<<8 | uint32(payload[3])
 				return "", "", bytesIn, fmt.Errorf("RST_STREAM: %d", errCode)
 			}
 
@@ -353,40 +354,11 @@ func decodeBody(body *bytes.Buffer, encoding string) []byte {
 	}
 }
 
-// sendH2 - creates new conn and sends HTTP/2 request
-func sendH2(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, logger LogWriter, threadID int) (resp, status string, err error) {
-	conn, err := dialWithProxy(addr, proxyURL)
-	if err != nil {
-		return "", "", err
-	}
-
-	host, port, _ := net.SplitHostPort(addr)
-
-	if port == "443" {
-		tlsConn, err := tlsHandshakeDo(conn, host, cliMode, tlsTimeout, logger, threadID, true)
-		if err != nil {
-			conn.Close()
-			return "", "", err
-		}
-		conn = tlsConn
-	}
-
-	defer conn.Close()
-
-	req := parseRawReq2H2(string(raw))
-	if req == nil {
-		return "", "", fmt.Errorf("failed to parse request")
-	}
-
-	h2 := newH2Conn(conn)
-	return h2.sendReq(req, threadID)
-}
-
 // sendOnConnH2 - sends on existing H2 connection
 func sendOnConnH2(raw []byte, h2 *H2Conn, threadID int) (resp, status string, err error) {
 	req := parseRawReq2H2(string(raw))
 	if req == nil {
 		return "", "", fmt.Errorf("failed to parse request")
 	}
-	return h2.sendReq(req, threadID)
+	return h2.sendReqH2(req, threadID)
 }

@@ -14,34 +14,35 @@ import (
 	"time"
 )
 
-// send - creates new connection and sends HTTP/1.1 request
-func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, logger LogWriter, threadID int) (resp, status string, err error) {
+// sendH2 - creates new conn and sends request
+func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, logger LogWriter, threadID int, httpVer int) (resp, status string, err error) {
 	conn, err := dialWithProxy(addr, proxyURL)
 	if err != nil {
 		return "", "", err
 	}
 
 	host, port, _ := net.SplitHostPort(addr)
-
 	if port == "443" {
-		tlsConn, err := tlsHandshakeDo(conn, host, cliMode, tlsTimeout, logger, threadID, false)
+		tlsConn, err := tlsHandshakeDo(conn, host, cliMode, tlsTimeout, logger, threadID, true)
 		if err != nil {
 			conn.Close()
 			return "", "", err
 		}
 		conn = tlsConn
 	}
-
 	defer conn.Close()
-	return sendOnConn(raw, conn, threadID)
-}
 
-// sendAuto - routes to HTTP/1 or HTTP/2 based on httpVer
-func sendAuto(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, logger LogWriter, threadID int, httpVer int) (resp, status string, err error) {
-	if httpVer == 2 {
-		return sendH2(raw, addr, proxyURL, cliMode, tlsTimeout, logger, threadID)
+	req := parseRawReq2H2(string(raw))
+	if req == nil {
+		return "", "", fmt.Errorf("failed to parse request")
 	}
-	return send(raw, addr, proxyURL, cliMode, tlsTimeout, logger, threadID)
+
+	if httpVer == 1 {
+		return sendOnConn(raw, conn, threadID)
+	} else {
+		h2 := newH2Conn(conn)
+		return h2.sendReqH2(req, threadID)
+	}
 }
 
 // sendOnConn - sends request on existing connection, reports metrics
@@ -340,7 +341,7 @@ func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string
 			}
 		}
 
-		resp, status, err := sendAuto(raw, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, w.logger, w.id, o.httpVer)
+		resp, status, err := send(raw, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, w.logger, w.id, o.httpVer)
 		if err == nil {
 			return resp, status, nil
 		}
