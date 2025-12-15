@@ -59,11 +59,14 @@ go build -ldflags="-s -w"
 | 4 | Edge_Auto |
 | 5 | Safari_Auto |
 
-> **Note**: Modes 1-5 negotiate ALPN which may cause issues with HTTP/1.1 servers expecting no ALPN. Mode 0 (RandomizedNoALPN) works best for HTTP/1.1 raw requests. For proper ALPN support with modes 1-5, use the experimental `h2` branch which handles ALPN negotiation correctly for both HTTP/1.1 and HTTP/2.
+> **Note**: Modes 1-5 negotiate ALPN which may cause issues with HTTP/1.1 servers expecting no ALPN. 
+Mode 0 (RandomizedNoALPN) works best for HTTP/1.1 raw requests. 
+For proper ALPN support with modes 1-5, use the experimental `h2` branch which handles ALPN negotiation correctly for both HTTP/1.1 and HTTP/2.
 
 ## Branch H2 (HTTP/2.0)
 
-The `h2` branch adds experimental HTTP/2 support. Request files remain in HTTP/1.1 raw format - TREM automatically converts them to HTTP/2 frames when `-http 2` is specified.
+The `h2` branch adds experimental HTTP/2 support. Request files remain in HTTP/1.1 raw format. 
+TREM automatically converts them to HTTP/2 frames when `-http 2` is specified.
 
 **Additional flag in h2 branch:**
 
