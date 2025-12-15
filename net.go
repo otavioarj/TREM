@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// send - creates new connection and sends request
+// send - creates new connection and sends HTTP/1.1 request
 func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, logger LogWriter, threadID int) (resp, status string, err error) {
 	conn, err := dialWithProxy(addr, proxyURL)
 	if err != nil {
@@ -24,7 +24,7 @@ func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Durati
 	host, port, _ := net.SplitHostPort(addr)
 
 	if port == "443" {
-		tlsConn, err := tlsHandshake(conn, host, cliMode, tlsTimeout, logger, threadID)
+		tlsConn, err := tlsHandshakeDo(conn, host, cliMode, tlsTimeout, logger, threadID, false)
 		if err != nil {
 			conn.Close()
 			return "", "", err
@@ -36,9 +36,16 @@ func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Durati
 	return sendOnConn(raw, conn, threadID)
 }
 
+// sendAuto - routes to HTTP/1 or HTTP/2 based on httpVer
+func sendAuto(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, logger LogWriter, threadID int, httpVer int) (resp, status string, err error) {
+	if httpVer == 2 {
+		return sendH2(raw, addr, proxyURL, cliMode, tlsTimeout, logger, threadID)
+	}
+	return send(raw, addr, proxyURL, cliMode, tlsTimeout, logger, threadID)
+}
+
 // sendOnConn - sends request on existing connection, reports metrics
 func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, err error) {
-	// Only measure latency in verbose mode
 	var startTime time.Time
 	if verbose {
 		startTime = time.Now()
@@ -67,13 +74,11 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 		status = parts[1]
 	}
 
-	// Check for HTTP error
 	statusCode, _ := strconv.Atoi(status)
 	if statusCode >= 400 {
 		stats.ReportHTTPError(threadID, statusCode)
 	}
 
-	// Parse headers
 	var bytesIn int
 	bytesIn += len(line)
 
@@ -112,7 +117,6 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 		}
 	}
 
-	// Read body
 	body := &bytes.Buffer{}
 
 	if chunked {
@@ -160,7 +164,6 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 		}
 	}
 
-	// Decode compressed body
 	switch encoding {
 	case "", "identity":
 		decodedBody = *body
@@ -190,7 +193,6 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 
 	sb.Write(decodedBody.Bytes())
 
-	// Report metrics (latency only if verbose)
 	var latencyUs uint32
 	if verbose {
 		latencyUs = uint32(time.Since(startTime).Microseconds())
@@ -244,7 +246,7 @@ func dialWithProxy(addr, proxyURL string) (net.Conn, error) {
 	return proxyConn, nil
 }
 
-// closeWorkerConn - safely close worker connection
+// closeWorkerConn - safely close worker connection (HTTP/1 and HTTP/2)
 func (o *Orch) closeWorkerConn(w *monkey) {
 	w.connMu.Lock()
 	defer w.connMu.Unlock()
@@ -252,12 +254,17 @@ func (o *Orch) closeWorkerConn(w *monkey) {
 		w.conn.Close()
 		w.conn = nil
 	}
+	if w.h2conn != nil {
+		w.h2conn.conn.Close()
+		w.h2conn = nil
+	}
 }
 
-// dialWithRetry - dial with exponential backoff
-func (o *Orch) dialWithRetry(w *monkey, addr string) (net.Conn, error) {
+// dialWithRetry - dial with retry, populates w.conn or w.h2conn based on o.httpVer
+func (o *Orch) dialWithRetry(w *monkey, addr string) error {
 	var lastErr error
 	backoff := 100 * time.Millisecond
+	h2 := o.httpVer == 2
 
 	for attempt := 0; attempt < o.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -280,22 +287,42 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) (net.Conn, error) {
 
 		host, port, _ := net.SplitHostPort(addr)
 		if port == "443" {
-			tlsConn, err := tlsHandshake(conn, host, o.clientHelloID, o.tlsTimeout, w.logger, w.id)
+			tlsConn, err := tlsHandshakeDo(conn, host, o.clientHelloID, o.tlsTimeout, w.logger, w.id, h2)
 			if err != nil {
 				conn.Close()
 				lastErr = err
 				continue
 			}
-			return tlsConn, nil
+			conn = tlsConn
 		}
 
-		return conn, nil
+		// HTTP/2: wrap in H2Conn and handshake
+		if h2 {
+			h2c := newH2Conn(conn)
+			if err := h2c.handshake(); err != nil {
+				conn.Close()
+				lastErr = err
+				continue
+			}
+			w.connMu.Lock()
+			w.h2conn = h2c
+			w.connAddr = addr
+			w.connMu.Unlock()
+			return nil
+		}
+
+		// HTTP/1.1
+		w.connMu.Lock()
+		w.conn = conn
+		w.connAddr = addr
+		w.connMu.Unlock()
+		return nil
 	}
 
-	return nil, fmt.Errorf("dial failed after %d retries: %v", o.maxRetries, lastErr)
+	return fmt.Errorf("dial failed after %d retries: %v", o.maxRetries, lastErr)
 }
 
-// sendWithRetry - send with retry on error
+// sendWithRetry - send with retry on error (routes by httpVer)
 func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string, error) {
 	var lastErr error
 	backoff := 100 * time.Millisecond
@@ -313,7 +340,7 @@ func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string
 			}
 		}
 
-		resp, status, err := send(raw, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, w.logger, w.id)
+		resp, status, err := sendAuto(raw, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, w.logger, w.id, o.httpVer)
 		if err == nil {
 			return resp, status, nil
 		}
@@ -324,31 +351,50 @@ func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string
 }
 
 // sendWithReconnect - send on existing conn, reconnect on error
-func (o *Orch) sendWithReconnect(w *monkey, raw []byte, conn net.Conn, addr string) (string, string, error) {
-	if conn == nil {
-		return o.sendWithRetry(w, raw, addr)
-	}
+func (o *Orch) sendWithReconnect(w *monkey, raw []byte, addr string) (string, string, error) {
+	var resp, status string
+	var err error
 
-	resp, status, err := sendOnConn(raw, conn, w.id)
-	if err != nil {
-		if verbose {
-			w.logger.Write(fmt.Sprintf("[V] send on conn failed: %v, reconnecting\n", err))
-		}
-
-		o.closeWorkerConn(w)
-
-		newConn, dialErr := o.dialWithRetry(w, addr)
-		if dialErr != nil {
-			return "", "", fmt.Errorf("reconnect failed: %v (original: %v)", dialErr, err)
-		}
-
+	// Try existing connection
+	if o.httpVer == 2 {
 		w.connMu.Lock()
-		w.conn = newConn
-		w.connAddr = addr
+		h2 := w.h2conn
 		w.connMu.Unlock()
 
-		return sendOnConn(raw, newConn, w.id)
+		if h2 != nil {
+			resp, status, err = sendOnConnH2(raw, h2, w.id)
+			if err == nil {
+				return resp, status, nil
+			}
+			if verbose {
+				w.logger.Write(fmt.Sprintf("[V] h2 send failed: %v, reconnecting\n", err))
+			}
+		}
+	} else {
+		w.connMu.Lock()
+		conn := w.conn
+		w.connMu.Unlock()
+
+		if conn != nil {
+			resp, status, err = sendOnConn(raw, conn, w.id)
+			if err == nil {
+				return resp, status, nil
+			}
+			if verbose {
+				w.logger.Write(fmt.Sprintf("[V] send failed: %v, reconnecting\n", err))
+			}
+		}
 	}
 
-	return resp, status, nil
+	// Reconnect
+	o.closeWorkerConn(w)
+	if dialErr := o.dialWithRetry(w, addr); dialErr != nil {
+		return "", "", fmt.Errorf("reconnect failed: %v (original: %v)", dialErr, err)
+	}
+
+	// Retry on new connection
+	if o.httpVer == 2 {
+		return sendOnConnH2(raw, w.h2conn, w.id)
+	}
+	return sendOnConn(raw, w.conn, w.id)
 }

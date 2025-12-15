@@ -10,7 +10,7 @@ import (
 
 // ClientHello names for verbose output
 var clientHelloNames = map[int]string{
-	0: "RandomNoALPN",
+	0: "Random(No)ALPN",
 	1: "Chrome_Auto",
 	2: "Firefox_Auto",
 	3: "iOS_Auto",
@@ -19,7 +19,7 @@ var clientHelloNames = map[int]string{
 }
 
 // getClientHelloID - returns utls ClientHelloID for given mode
-func getClientHelloID(cliMode int) utls.ClientHelloID {
+func getClientHelloID(cliMode int, h2 bool) utls.ClientHelloID {
 	switch cliMode {
 	case 1:
 		return utls.HelloChrome_Auto
@@ -32,21 +32,29 @@ func getClientHelloID(cliMode int) utls.ClientHelloID {
 	case 5:
 		return utls.HelloSafari_Auto
 	default:
-		return utls.HelloRandomizedNoALPN
+		if h2 {
+			return utls.HelloRandomizedALPN
+		}
+		return utls.HelloRandomizedNoALPN // HTTP/1.1 no ALPN
 	}
 }
 
-// tlsHandshake - performs TLS handshake, reports metrics in verbose mode
-// Note: Does NOT retry - caller must create new TCP conn for each retry
-func tlsHandshake(conn net.Conn, host string, cliMode int, timeout time.Duration, logger LogWriter, threadID int) (*utls.UConn, error) {
+// tlsHandshakeDo - TLS handshake with ALPN based on h2 flag
+// h2=false: ALPN http/1.1 | h2=true: ALPN h2
+func tlsHandshakeDo(conn net.Conn, host string, cliMode int, timeout time.Duration, logger LogWriter, threadID int, h2 bool) (*utls.UConn, error) {
+	alpn := []string{"http/1.1"}
+	if h2 {
+		alpn = []string{"h2"}
+	}
+
 	var startTime time.Time
 	if verbose {
 		startTime = time.Now()
 		helloName := clientHelloNames[cliMode]
-		logger.Write(fmt.Sprintf("[V] TLS handshake: host=%s, hello=%s\n", host, helloName))
+		logger.Write(fmt.Sprintf("[V] TLS: host=%s, hello=%s, alpn=%v\n", host, helloName, alpn))
 	}
 
-	helloID := getClientHelloID(cliMode)
+	helloID := getClientHelloID(cliMode, h2)
 
 	conn.SetDeadline(time.Now().Add(timeout))
 	defer conn.SetDeadline(time.Time{})
@@ -54,7 +62,7 @@ func tlsHandshake(conn net.Conn, host string, cliMode int, timeout time.Duration
 	tlsConf := &utls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         host,
-		NextProtos:         []string{"http/1.1"},
+		NextProtos:         alpn,
 	}
 
 	tlsConn := utls.UClient(conn, tlsConf, helloID)
@@ -62,20 +70,19 @@ func tlsHandshake(conn net.Conn, host string, cliMode int, timeout time.Duration
 
 	if err != nil {
 		if verbose {
-			logger.Write(fmt.Sprintf("[V] TLS handshake failed: %v\n", err))
+			logger.Write(fmt.Sprintf("[V] TLS failed: %v\n", err))
 			stats.ReportTLSRetry(threadID)
 		}
 		return nil, err
 	}
 
-	// Report successful handshake (verbose only)
 	if verbose {
 		latencyUs := uint32(time.Since(startTime).Microseconds())
 		stats.ReportTLS(threadID, latencyUs, 1)
 
 		state := tlsConn.ConnectionState()
-		logger.Write(fmt.Sprintf("[V] TLS handshake ok: version=0x%04x, cipher=0x%04x\n",
-			state.Version, state.CipherSuite))
+		logger.Write(fmt.Sprintf("[V] TLS ok: ver=0x%04x, cipher=0x%04x, alpn=%s\n",
+			state.Version, state.CipherSuite, state.NegotiatedProtocol))
 	}
 
 	return tlsConn, nil

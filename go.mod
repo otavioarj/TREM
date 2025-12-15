@@ -8,6 +8,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.9.0
 	github.com/refraction-networking/utls v1.8.1
 	github.com/rivo/tview v0.42.0
+	golang.org/x/net v0.38.0
 )
 
 require (

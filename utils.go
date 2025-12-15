@@ -55,12 +55,9 @@ func (o *Orch) processReq(w *monkey, idx int, addr string) error {
 	}
 
 	var resp, status string
-	if o.keepAlive && w.conn != nil {
+	if o.keepAlive {
 		// Reuse connection with reconnect on error
-		w.connMu.Lock()
-		conn := w.conn
-		w.connMu.Unlock()
-		resp, status, err = o.sendWithReconnect(w, []byte(req), conn, addr)
+		resp, status, err = o.sendWithReconnect(w, []byte(req), addr)
 	} else {
 		// New connection per req with retry
 		resp, status, err = o.sendWithRetry(w, []byte(req), addr)
@@ -237,9 +234,9 @@ func normalizeRequest(req string) string {
 
 func FormatConfig(threads int, mode string, delay int, keepAlive bool,
 	loopStart, loopTimes int, cliHello int, tlsTimeout int, verbose bool,
-	proxy string, host string) string {
+	proxy string, host string, httpVer int) string {
 	var lines []string
-	lines = append(lines, fmt.Sprintf("Verbose: %v   Threads: %d  TLS t.o: %dms\n", verbose, threads, tlsTimeout))
+	lines = append(lines, fmt.Sprintf("HTTP/%d Verbose: %v Threads: %d TLS t.o: %dms\n", httpVer, verbose, threads, tlsTimeout))
 	lines = append(lines, fmt.Sprintf("Keep-alive: %v Delay: %dms  Mode: %s\n", keepAlive, delay, mode))
 	loopTimesStr := "∞"
 

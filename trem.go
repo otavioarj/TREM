@@ -14,7 +14,7 @@ import (
 )
 
 // Release :)
-var version = "v1.1"
+var version = "v1.2"
 
 // Verbose mode flag
 var verbose bool
@@ -36,7 +36,8 @@ type LogWriter interface {
 type monkey struct {
 	id       int
 	logger   LogWriter
-	conn     net.Conn   // persistent connection (keepalive)
+	conn     net.Conn   // HTTP/1.1 persistent connection
+	h2conn   *H2Conn    // HTTP/2 connection wrapper
 	connAddr string     // current connection address
 	connMu   sync.Mutex // connection mutex
 	prevResp string
@@ -70,6 +71,7 @@ type Orch struct {
 	clientHelloID int
 	tlsTimeout    time.Duration
 	maxRetries    int
+	httpVer       int // 1 or 2
 	// Sync barrier
 	barrierMu    sync.Mutex
 	barrierCount int
@@ -94,16 +96,17 @@ func main() {
 	kaFlag := flag.Bool("k", true, "Keep-alive connections.")
 	loopStartFlag := flag.Int("x", 1, "Loop start index (1-based).")
 	loopTimesFlag := flag.Int("xt", 1, "Loop count (0=infinite).")
-	cliFlag := flag.Int("cli", 0, "ClientHello ID: 0=RandomNoALPN, 1=Chrome, 2=Firefox, 3=iOS, 4=Edge, 5=Safari")
+	cliFlag := flag.Int("cli", 0, "ClientHello ID: 0=Random, 1=Chrome, 2=Firefox, 3=iOS, 4=Edge, 5=Safari")
 	touFlag := flag.Int("tou", 500, "TLS timeout in ms.")
 	retryFlag := flag.Int("retry", 3, "Max retries on errors.")
 	verboseFlag := flag.Bool("v", false, "Verbose output.")
 	swFlag := flag.Int("sw", 0, "Stats window size (0=auto: 10 normal, 50 verbose).")
+	httpFlag := flag.Int("http", 1, "HTTP version: 1 or 2.")
 	flag.Parse()
 
 	configBanner = FormatConfig(*thrFlag, *modeFlag, *delayFlag, *kaFlag,
 		*loopStartFlag, *loopTimesFlag, *cliFlag, *touFlag,
-		*verboseFlag, *proxyFlag, *hostFlag)
+		*verboseFlag, *proxyFlag, *hostFlag, *httpFlag)
 	verbose = *verboseFlag
 
 	// Stats window size
@@ -187,6 +190,7 @@ func main() {
 		clientHelloID: *cliFlag,
 		tlsTimeout:    time.Duration(*touFlag) * time.Millisecond,
 		maxRetries:    *retryFlag,
+		httpVer:       *httpFlag,
 	}
 
 	monkeysFinished := false
@@ -314,17 +318,11 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 
 		w.logger.Write(fmt.Sprintf("Connecting: %s\n", addr))
-		conn, err := o.dialWithRetry(w, addr)
-		if err != nil {
+
+		// Dial and populate w.conn or w.h2conn based on o.httpVer
+		if err := o.dialWithRetry(w, addr); err != nil {
 			w.logger.Write(fmt.Sprintf("ERR: dial: %v\n", err))
 			return
-		}
-
-		if o.keepAlive {
-			w.connMu.Lock()
-			w.conn = conn
-			w.connAddr = addr
-			w.connMu.Unlock()
 		}
 
 		o.readyChan <- w.id
@@ -333,19 +331,17 @@ func (o *Orch) runWorker(w *monkey) {
 		<-o.startChan
 		w.logger.Write("Sync start!\n")
 
-		resp, status, err := o.sendWithReconnect(w, []byte(req), conn, addr)
+		resp, status, err := o.sendWithReconnect(w, []byte(req), addr)
 		if err != nil {
 			w.logger.Write(fmt.Sprintf("ERR: send: %v\n", err))
-			if !o.keepAlive {
-				conn.Close()
-			}
 			return
 		}
 		w.logger.Write(fmt.Sprintf("HTTP %s\n", status))
 		w.prevResp = resp
 
-		if !o.keepAlive {
-			conn.Close()
+		// Close if not keepalive (HTTP/1.1 only, H2 always reuses)
+		if !o.keepAlive && o.httpVer == 1 {
+			o.closeWorkerConn(w)
 		}
 
 		for i := 1; i < len(w.reqFiles); i++ {
@@ -379,11 +375,7 @@ func (o *Orch) runWorker(w *monkey) {
 						w.logger.Write(fmt.Sprintf("\n[Loop %d/%d]\n", loopCount, o.loopTimes))
 					}
 
-					w.connMu.Lock()
-					conn := w.conn
-					w.connMu.Unlock()
-
-					resp, status, err := o.sendWithReconnect(w, []byte(w.loopStartReq), conn, w.loopStartAddr)
+					resp, status, err := o.sendWithReconnect(w, []byte(w.loopStartReq), w.loopStartAddr)
 					if err != nil {
 						w.logger.Write(fmt.Sprintf("ERR: loop send: %v\n", err))
 						return
