@@ -52,7 +52,7 @@ go build -ldflags="-s -w"
 
 | Value | Fingerprint |
 |-------|-------------|
-| 0 | RandomizedNoALPN (default) |
+| 0 | Randomized(NoALPN in HTTP/1.1) (default) |
 | 1 | Chrome_Auto |
 | 2 | Firefox_Auto |
 | 3 | iOS_Auto |
