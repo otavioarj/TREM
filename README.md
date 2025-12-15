@@ -1,13 +1,18 @@
 # TREM - Transactional Racing Executor Monkey
 
-HTTP/1.1 race condition testing tool with request chaining support. Allows sequential requests where request N can extract values from response N-1 using regex patterns.
+HTTP/1.1 and HTTP/2.0 (experimental) race condition testing tool with request chaining support. Allows sequential requests where request N can extract values from response N-1 using regex patterns.
 
 ## Build
 
 ```bash
 #Init 
 git clone https://github.com/otavioarj/TREM.git
+cd TREM
 go mod tidy
+
+#Test HTTP2 mode
+cd TREM
+git checkout h2
 
 # Debugging build
 go build 
@@ -33,32 +38,70 @@ go build -ldflags="-s -w"
 | `-l` | *required* | Comma-separated list of raw HTTP/1.1 request files |
 | `-re` | *required* | Regex patterns file for value extraction between requests |
 | `-h` | | Host:port override (default: extracted from Host header) |
-| `-th` | 1 | Thread count |
+| `-th` | 5 | Thread count |
 | `-d` | 0 | Delay in milliseconds between requests |
 | `-o` | false | Save last response per thread as `out_<time>_t<id>.txt` |
 | `-u` | | Universal replacement `key=val` applied to all requests |
 | `-px` | | HTTP proxy URL (e.g., `http://127.0.0.1:8080`) |
 | `-mode` | async | Execution mode: `sync` or `async` |
-| `-k` | false | Keep-alive: persist TLS connections across requests |
-| `-x` | -1 | Loop start index (1-based), -1 disables looping |
-| `-xt` | 0 | Loop count (0 = infinite, -1 = no loops) |
+| `-k` | true | Keep-alive: persist TLS connections across requests |
+| `-x` | 1 | Loop start index (1-based) |
+| `-xt` | 1 | Loop count (0 = infinite) |
 | `-cli` | 0 | TLS ClientHello fingerprint (see table below) |
-| `-tou` | 1000 | TLS handshake timeout in milliseconds |
+| `-tou` | 500 | TLS handshake timeout in milliseconds |
 | `-retry` | 3 | Max retries on connection/TLS errors |
 | `-v` | false | Verbose debug output |
+| `-sw` | 0 | Stats window size (0 = auto: 10 normal, 50 verbose) |
 
 ## ClientHello Fingerprints (`-cli`)
 
 | Value | Fingerprint |
 |-------|-------------|
-| 0 | RandomizedNoALPN (default, recommended) |
+| 0 | Randomized(NoALPN in HTTP/1.1) (default) |
 | 1 | Chrome_Auto |
 | 2 | Firefox_Auto |
 | 3 | iOS_Auto |
 | 4 | Edge_Auto |
 | 5 | Safari_Auto |
 
-> **Note**: Modes 1-5 negotiate ALPN which may cause issues with servers expecting HTTP/2. Mode 0 works best for HTTP/1.1 raw requests.
+> **Note**: Modes 1-5 negotiate ALPN which may cause issues with HTTP/1.1 servers expecting no ALPN. 
+Mode 0 (RandomizedNoALPN) works best for HTTP/1.1 raw requests. 
+For proper ALPN support with modes 1-5, use the experimental `h2` branch which handles ALPN negotiation correctly for both HTTP/1.1 and HTTP/2.
+
+## Branch H2 (HTTP/2.0)
+
+The `h2` branch adds experimental HTTP/2 support. Request files remain in HTTP/1.1 raw format. 
+TREM automatically converts them to HTTP/2 frames when `-http 2` is specified.
+
+**Additional flag in h2 branch:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-http` | 1 | HTTP version: `1` for HTTP/1.1, `2` for HTTP/2 |
+
+**Usage:**
+```bash
+./trem -l "req1.txt,req2.txt" -re patterns.txt -http 2 -th 10
+```
+
+**How it works:**
+- Request files are always written as raw HTTP/1.1
+- When `-http 2`, TREM parses the raw request and converts to HTTP/2:
+  - `Host` header → `:authority` pseudo-header
+  - Connection-specific headers (`Connection`, `Keep-Alive`, etc.) are stripped
+  - Headers are HPACK encoded
+  - Body is sent as DATA frames
+- TLS ALPN is set to `h2` instead of `http/1.1`
+- In h2 branch, `-cli 0` uses `RandomizedALPN` for HTTP/2 and `RandomizedNoALPN` for HTTP/1.1
+
+**Limitations:**
+- Flow control ignored: assumes server window ≥ 64KB (bodies > 64KB may stall)
+- Server push ignored: PUSH_PROMISE frames are discarded
+
+**When to use HTTP/2:**
+- Target server only accepts HTTP/2
+- Testing HTTP/2-specific race conditions
+- Need multiplexed streams on single connection
 
 ## Operation Modes
 
@@ -199,10 +242,25 @@ Debug connection and TLS issues:
 ```
 
 Outputs:
-- TLS handshake details (ClientHello type, cipher suite)
+- TLS handshake details (ClientHello type, cipher suite, ALPN)
 - Retry attempts with backoff timing
 - Connection state changes
 - Regex match failures
+- Jitter and TLS latency metrics
+
+## Stats Panel
+
+The UI includes a stats panel showing real-time metrics:
+
+**Normal mode:**
+- Req/s: requests per second
+- TotalReq: total requests sent
+- HTTP Errs: errors by thread and status code (e.g., `T1(400)x2`)
+
+**Verbose mode (`-v`):** adds:
+- Avg Jitter: latency variance
+- TLS latency and retry averages
+- I/O totals (bytes in/out)
 
 ## UI Controls
 
@@ -232,4 +290,9 @@ Outputs:
 **Via Burp proxy:**
 ```bash
 ./trem -l "req1.txt,req2.txt" -re patterns.txt -px http://127.0.0.1:8080
+```
+
+**HTTP/2 (h2 branch only):**
+```bash
+./trem -l "req1.txt,req2.txt" -re patterns.txt -http 2 -th 10 -mode sync
 ```
