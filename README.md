@@ -1,6 +1,6 @@
 # TREM - Transactional Racing Executor Monkey
 
-HTTP/1.1 race condition testing tool with request chaining support. Allows sequential requests where request N can extract values from response N-1 using regex patterns.
+HTTP/1.1 and HTTP/2.0 (experimental) race condition testing tool with request chaining support. Allows sequential requests where request N can extract values from response N-1 using regex patterns.
 
 ## Build
 
