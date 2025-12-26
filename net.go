@@ -12,10 +12,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
-// sendH2 - creates new conn and sends request
-func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, logger LogWriter, threadID int, httpVer int) (resp, status string, err error) {
+// send - creates new conn and sends request
+func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, tlsCert *utls.Certificate, logger LogWriter,
+	threadID int, httpH2 bool) (resp, status string, err error) {
 	conn, err := dialWithProxy(addr, proxyURL)
 	if err != nil {
 		return "", "", err
@@ -23,7 +26,7 @@ func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Durati
 
 	host, port, _ := net.SplitHostPort(addr)
 	if port == "443" {
-		tlsConn, err := tlsHandshakeDo(conn, host, cliMode, tlsTimeout, logger, threadID, true)
+		tlsConn, err := tlsHandshakeDo(conn, host, cliMode, tlsTimeout, logger, threadID, tlsCert, httpH2)
 		if err != nil {
 			conn.Close()
 			return "", "", err
@@ -37,7 +40,7 @@ func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Durati
 		return "", "", fmt.Errorf("failed to parse request")
 	}
 
-	if httpVer == 1 {
+	if !httpH2 {
 		return sendOnConn(raw, conn, threadID)
 	} else {
 		h2 := newH2Conn(conn)
@@ -261,11 +264,11 @@ func (o *Orch) closeWorkerConn(w *monkey) {
 	}
 }
 
-// dialWithRetry - dial with retry, populates w.conn or w.h2conn based on o.httpVer
+// dialWithRetry - dial with retry, populates w.conn or w.h2conn based on o.httpH2
 func (o *Orch) dialWithRetry(w *monkey, addr string) error {
 	var lastErr error
 	backoff := 100 * time.Millisecond
-	h2 := o.httpVer == 2
+	h2 := o.httpH2
 
 	for attempt := 0; attempt < o.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -288,7 +291,7 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) error {
 
 		host, port, _ := net.SplitHostPort(addr)
 		if port == "443" {
-			tlsConn, err := tlsHandshakeDo(conn, host, o.clientHelloID, o.tlsTimeout, w.logger, w.id, h2)
+			tlsConn, err := tlsHandshakeDo(conn, host, o.clientHelloID, o.tlsTimeout, w.logger, w.id, o.tlsCert, h2)
 			if err != nil {
 				conn.Close()
 				lastErr = err
@@ -323,7 +326,7 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) error {
 	return fmt.Errorf("dial failed after %d retries: %v", o.maxRetries, lastErr)
 }
 
-// sendWithRetry - send with retry on error (routes by httpVer)
+// sendWithRetry - send with retry on error (routes by httpH2)
 func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string, error) {
 	var lastErr error
 	backoff := 100 * time.Millisecond
@@ -341,7 +344,7 @@ func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string
 			}
 		}
 
-		resp, status, err := send(raw, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, w.logger, w.id, o.httpVer)
+		resp, status, err := send(raw, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, o.tlsCert, w.logger, w.id, o.httpH2)
 		if err == nil {
 			return resp, status, nil
 		}
@@ -357,7 +360,7 @@ func (o *Orch) sendWithReconnect(w *monkey, raw []byte, addr string) (string, st
 	var err error
 
 	// Try existing connection
-	if o.httpVer == 2 {
+	if o.httpH2 {
 		w.connMu.Lock()
 		h2 := w.h2conn
 		w.connMu.Unlock()
@@ -394,7 +397,7 @@ func (o *Orch) sendWithReconnect(w *monkey, raw []byte, addr string) (string, st
 	}
 
 	// Retry on new connection
-	if o.httpVer == 2 {
+	if o.httpH2 {
 		return sendOnConnH2(raw, w.h2conn, w.id)
 	}
 	return sendOnConn(raw, w.conn, w.id)

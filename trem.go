@@ -11,10 +11,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // Release :)
-var version = "v1.2"
+var version = "v1.4"
 
 // Verbose mode flag
 var verbose bool
@@ -43,8 +45,6 @@ type monkey struct {
 	prevResp string
 	reqFiles []string
 	patterns [][]pattern
-	univKey  string
-	univVal  string
 
 	// Cache for loop optimization
 	reqCache      []string
@@ -70,8 +70,10 @@ type Orch struct {
 	quitChan      chan struct{}
 	clientHelloID int
 	tlsTimeout    time.Duration
+	tlsCert       *utls.Certificate
 	maxRetries    int
-	httpVer       int // 1 or 2
+	httpH2        bool // HTTP is HTTP2?
+	valDist       *ValDist
 	// Sync barrier
 	barrierMu    sync.Mutex
 	barrierCount int
@@ -102,6 +104,7 @@ func main() {
 	verboseFlag := flag.Bool("v", false, "Verbose output.")
 	swFlag := flag.Int("sw", 0, "Stats window size (0=auto: 10 normal, 50 verbose).")
 	httpFlag := flag.Int("http", 1, "HTTP version: 1 or 2.")
+	fwFlag := flag.Bool("fw", false, "FIFO wait: block until first value written.")
 	flag.Parse()
 
 	configBanner = FormatConfig(*thrFlag, *modeFlag, *delayFlag, *kaFlag,
@@ -146,21 +149,44 @@ func main() {
 		exitErr(fmt.Sprintf("regex file must have %d lines, got %d", len(reqFiles)-1, len(allPatterns)))
 	}
 
-	var univKey, univVal string
+	// Setup value distributor (FIFO or static k=v)
+	var valDist *ValDist
 	if *univFlag != "" {
-		parts := strings.Split(*univFlag, "=")
-		if len(parts) != 2 {
-			exitErr("Universal must be key=val")
+		// Check if flag contains =, indicating key=value mode
+		if !strings.Contains(*univFlag, "=") {
+			valDist = NewValDist(*univFlag)
+			if err := valDist.EnsureFifo(); err != nil {
+				exitErr(fmt.Sprintf("FIFO error: %v", err))
+			}
+			valDist.Start()
+			// FIFO mode forces infinite loops
+			*loopTimesFlag = 0
+		} else {
+			// Static k=v
+			parts := strings.SplitN(*univFlag, "=", 2)
+			if len(parts) != 2 {
+				exitErr("Universal must be key=val or FIFO path")
+			}
+			// key=value mode created just one entry for map[string]string
+			valDist = NewValDistStatic(parts[0], parts[1])
 		}
-		univKey, univVal = parts[0], parts[1]
+	} else {
+		valDist = NewValDist("") // empty, no replacements
 	}
-
 	// Init stats collector
 	stats = NewStatsCollector(windowSize, verbose)
+	stats.SetValDist(valDist) // for FIFO status display
 
 	// Init UI
 	ui := NewUIManager(*thrFlag)
 	ui.StartStatsConsumer(stats.OutputChan())
+
+	// Wait for first FIFO value if -fw enabled
+	if *fwFlag && valDist.IsFifo() {
+		stats.SetFifoWaiting(true)
+		valDist.WaitFirst()
+		stats.SetFifoWaiting(false)
+	}
 
 	// Create monkeys
 	monkeys := make([]*monkey, *thrFlag)
@@ -170,8 +196,6 @@ func main() {
 			logger:   ui.GetLogger(i),
 			reqFiles: reqFiles,
 			patterns: allPatterns,
-			univKey:  univKey,
-			univVal:  univVal,
 		}
 	}
 
@@ -190,7 +214,11 @@ func main() {
 		clientHelloID: *cliFlag,
 		tlsTimeout:    time.Duration(*touFlag) * time.Millisecond,
 		maxRetries:    *retryFlag,
-		httpVer:       *httpFlag,
+		httpH2:        false,
+		valDist:       valDist,
+	}
+	if *httpFlag == 2 {
+		orch.httpH2 = true
 	}
 
 	monkeysFinished := false
@@ -271,6 +299,7 @@ func main() {
 		orch.wg.Wait()
 		monkeysFinished = true
 		stats.Stop()
+		valDist.Stop()
 		ui.BroadcastMessage("\n=== All requests completed ===\n")
 		ui.BroadcastMessage("Press Q to quit, Tab/Shift+Tab to navigate\n")
 	}()
@@ -306,9 +335,12 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 		req := normalizeRequest(string(raw))
 
-		if w.univKey != "" {
-			req = strings.ReplaceAll(req, w.univKey, w.univVal)
-			w.logger.Write(fmt.Sprintf("Univ %s: %s\n", w.univKey, w.univVal))
+		// Apply values from FIFO or static
+		vals := o.valDist.Get()
+		if len(vals) > 0 {
+			req = applyVals(req, vals)
+			k, v := o.valDist.LastKV()
+			w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, v))
 		}
 
 		addr, err := parseHost(req, o.hostFlag)
@@ -340,7 +372,7 @@ func (o *Orch) runWorker(w *monkey) {
 		w.prevResp = resp
 
 		// Close if not keepalive (HTTP/1.1 only, H2 always reuses)
-		if !o.keepAlive && o.httpVer == 1 {
+		if !o.keepAlive && !o.httpH2 {
 			o.closeWorkerConn(w)
 		}
 
@@ -395,7 +427,11 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 	} else {
 		// Async mode
-		w.logger.Write(fmt.Sprintf("Univ %s: %s\n", w.univKey, w.univVal))
+		vals := o.valDist.Get()
+		if len(vals) > 0 {
+			k, v := o.valDist.LastKV()
+			w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, v))
+		}
 		for i := 0; i < len(w.reqFiles); i++ {
 			if o.loopStart > 0 && i == o.loopStart-1 {
 				w.loopStartReq = ""

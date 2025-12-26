@@ -42,9 +42,10 @@ func (o *Orch) processReq(w *monkey, idx int, addr string) error {
 		w.logger.Write(fmt.Sprintf("Matched %s: %s\n", p.keyword, m[1]))
 	}
 
-	// Universal replace
-	if w.univKey != "" {
-		req = strings.ReplaceAll(req, w.univKey, w.univVal)
+	// Apply values from FIFO or static
+	vals := o.valDist.Get()
+	if len(vals) > 0 {
+		req = applyVals(req, vals)
 	}
 
 	req = normalizeRequest(req)
@@ -109,10 +110,10 @@ func (o *Orch) processReqAsync(w *monkey, idx int) error {
 		}
 	}
 
-	// Universal replace
-	if w.univKey != "" {
-		req = strings.ReplaceAll(req, w.univKey, w.univVal)
-		//w.logger.Write(fmt.Sprintf("Univ %s: %s\n", w.univKey, w.univVal))
+	// Apply values from FIFO or static
+	vals := o.valDist.Get()
+	if len(vals) > 0 {
+		req = applyVals(req, vals)
 	}
 
 	addr, err := parseHost(req, o.hostFlag)

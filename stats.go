@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -63,6 +64,10 @@ type StatsCollector struct {
 	// HTTP errors - map["tid:status"] -> count
 	httpErrors map[string]int
 	errorOrder []string // insertion order for display
+
+	// FIFO status
+	valDist     *ValDist
+	fifoWaiting atomic.Bool
 
 	// Output
 	outputCh chan string
@@ -150,6 +155,18 @@ func (sc *StatsCollector) OutputChan() <-chan string {
 // Stop - signals worker to stop
 func (sc *StatsCollector) Stop() {
 	close(sc.quitCh)
+}
+
+// SetValDist - sets value distributor for FIFO status display
+func (sc *StatsCollector) SetValDist(vd *ValDist) {
+	sc.mu.Lock()
+	sc.valDist = vd
+	sc.mu.Unlock()
+}
+
+// SetFifoWaiting - sets FIFO waiting state
+func (sc *StatsCollector) SetFifoWaiting(waiting bool) {
+	sc.fifoWaiting.Store(waiting)
 }
 
 // worker - consumes events and updates UI periodically
@@ -246,6 +263,26 @@ func (sc *StatsCollector) pushUpdate() {
 	var lines []string
 	// Append config summit banner
 	lines = append(lines, configBanner)
+
+	// FIFO status line
+	if sc.valDist != nil && sc.valDist.IsFifo() {
+		if sc.fifoWaiting.Load() {
+			lines = append(lines, fmt.Sprintf("FIFO: %s [waiting first write...]", sc.valDist.Path()))
+		} else {
+			k, v := sc.valDist.LastKV()
+			if k != "" {
+				// Truncate value if too long
+				dispV := v
+				if len(dispV) > 20 {
+					dispV = dispV[:17] + "..."
+				}
+				lines = append(lines, fmt.Sprintf("FIFO: %s=%s", k, dispV))
+			} else {
+				lines = append(lines, fmt.Sprintf("FIFO: %s [no data]", sc.valDist.Path()))
+			}
+		}
+	}
+
 	// Line 1: Req/s and total count (normal mode) or with jitter (verbose)
 	reqPerSec := sc.calcReqPerSec()
 	if sc.verbose {

@@ -3,9 +3,11 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/crypto/pkcs12"
 )
 
 // ClientHello names for verbose output
@@ -39,9 +41,32 @@ func getClientHelloID(cliMode int, h2 bool) utls.ClientHelloID {
 	}
 }
 
+// loadPKCS12Certificate - Loads clientTLS/mTLS Certificate
+// used for tlsHandshakeDo as "Certificates" chain
+func loadPKCS12Certificate(certPath, password string) (utls.Certificate, error) {
+	fileData, err := os.ReadFile(certPath)
+	if err != nil {
+		return utls.Certificate{}, fmt.Errorf("cannot read PKCS#12: %v", err)
+	}
+
+	privateKey, certData, err := pkcs12.Decode(fileData, password)
+	if err != nil {
+		return utls.Certificate{}, fmt.Errorf("cannot decode PKCS#12: %v", err)
+	}
+
+	certDer := certData.Raw
+	tlsCert := utls.Certificate{
+		Certificate: [][]byte{certDer},
+		PrivateKey:  privateKey,
+	}
+
+	return tlsCert, nil
+}
+
 // tlsHandshakeDo - TLS handshake with ALPN based on h2 flag
 // h2=false: ALPN http/1.1 | h2=true: ALPN h2
-func tlsHandshakeDo(conn net.Conn, host string, cliMode int, timeout time.Duration, logger LogWriter, threadID int, h2 bool) (*utls.UConn, error) {
+func tlsHandshakeDo(conn net.Conn, host string, cliMode int, timeout time.Duration, logger LogWriter, threadID int, tlsCert *utls.Certificate,
+	h2 bool) (*utls.UConn, error) {
 	alpn := []string{"http/1.1"}
 	if h2 {
 		alpn = []string{"h2"}
@@ -63,6 +88,7 @@ func tlsHandshakeDo(conn net.Conn, host string, cliMode int, timeout time.Durati
 		InsecureSkipVerify: true,
 		ServerName:         host,
 		NextProtos:         alpn,
+		Certificates:       []utls.Certificate{*tlsCert}, // ClientCertificate || mTLS cert
 	}
 
 	tlsConn := utls.UClient(conn, tlsConf, helloID)
