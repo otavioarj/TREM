@@ -233,11 +233,11 @@ func normalizeRequest(req string) string {
 	return strings.Join(normalized, "\r\n")
 }
 
-func FormatConfig(threads int, mode string, delay int, keepAlive bool,
-	loopStart, loopTimes int, cliHello int, tlsTimeout int, verbose bool,
-	proxy string, host string, httpVer int) string {
+func FormatConfig(threads, delay, loopStart, loopTimes, cliHello, tlsTimeout int,
+	keepAlive, verbose, httpVer bool,
+	proxy, host, mtls, mode, univ string) string {
 	var lines []string
-	lines = append(lines, fmt.Sprintf("HTTP/%d Verbose: %v Threads: %d TLS t.o: %dms\n", httpVer, verbose, threads, tlsTimeout))
+	lines = append(lines, fmt.Sprintf("HTTP/%v Verbose: %v Threads: %d TLS t.o: %dms\n", httpVer, verbose, threads, tlsTimeout))
 	lines = append(lines, fmt.Sprintf("Keep-alive: %v Delay: %dms  Mode: %s\n", keepAlive, delay, mode))
 	loopTimesStr := "∞"
 
@@ -247,13 +247,19 @@ func FormatConfig(threads int, mode string, delay int, keepAlive bool,
 	lines = append(lines, fmt.Sprintf("LoopStart: %d LoopTimes: %s CliHello: %s\n", loopStart, loopTimesStr,
 		clientHelloNames[cliHello]))
 
+	if mtls != "" {
+		lines = append(lines, fmt.Sprintf("ClientCert: %s ", mtls))
+	}
 	if proxy != "" {
-		lines = append(lines, fmt.Sprintf("Proxy: %s\n", proxy))
+		lines = append(lines, fmt.Sprintf("Proxy: %s ", proxy))
 	}
-
 	if host != "" {
-		lines = append(lines, fmt.Sprintf("Forced Host: %s\n", host))
+		lines = append(lines, fmt.Sprintf("Forced Host: %s ", host))
 	}
+	if univ != "" {
+		lines = append(lines, fmt.Sprintf("Univ.: %s ", univ))
+	}
+	lines = append(lines, "\n")
 	return strings.Join(lines, "")
 }
 

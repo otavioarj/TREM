@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.4"
+var version = "v1.4.2"
 
 // Verbose mode flag
 var verbose bool
@@ -92,7 +92,13 @@ func main() {
 	thrFlag := flag.Int("th", 5, "Thread count.")
 	delayFlag := flag.Int("d", 0, "Delay ms between requests.")
 	outFlag := flag.Bool("o", false, "Save last response per thread.")
-	univFlag := flag.String("u", "", "Universal replace key=val.")
+	univFlag := flag.String("u", "", "Universaly replaces key=val.\nIf key=value, ie., $num$=179, will match/replace every"+
+		" $num$ (requests) to 179.\nIf a path. ie., /tmp/fifo, will create a named-pipe where other program can write key=value"+
+		"\n|-> Example of a password-spray racer: ./trem <params> -u /tmp/fifo || cat pass-spray.txt > /tmp/fifo\n"+
+		"    With pass-spray.txt as: $pass$=21938712\n"+
+		"                            32847832\n"+
+		"                            32473872\n"+
+		"                            ...")
 	proxyFlag := flag.String("px", "", "HTTP proxy; http://ip:port")
 	modeFlag := flag.String("mode", "async", "Mode: sync or async.")
 	kaFlag := flag.Bool("k", true, "Keep-alive connections.")
@@ -103,16 +109,17 @@ func main() {
 	retryFlag := flag.Int("retry", 3, "Max retries on errors.")
 	verboseFlag := flag.Bool("v", false, "Verbose output.")
 	swFlag := flag.Int("sw", 0, "Stats window size (0=auto: 10 normal, 50 verbose).")
-	httpFlag := flag.Int("http", 1, "HTTP version: 1 or 2.")
-	fwFlag := flag.Bool("fw", false, "FIFO wait: block until first value written.")
+	httpFlag := flag.Bool("http2", false, "Use HTTP2, default false uses HTTP 1.1.")
+	fwFlag := flag.Bool("fw", true, "Creates named-pipe file (i.e., -u /tmp/fifo) and *wait* until first value written.")
+	mtlsFlag := flag.String("mtls", "", "Client Certificate (mTLS) for TLS, format /path/file.pk12:pass .")
 	flag.Parse()
 
-	configBanner = FormatConfig(*thrFlag, *modeFlag, *delayFlag, *kaFlag,
-		*loopStartFlag, *loopTimesFlag, *cliFlag, *touFlag,
-		*verboseFlag, *proxyFlag, *hostFlag, *httpFlag)
+	configBanner = FormatConfig(*thrFlag, *delayFlag, *loopStartFlag, *loopTimesFlag, *cliFlag, *touFlag,
+		*kaFlag, *verboseFlag, *httpFlag,
+		*proxyFlag, *hostFlag, *mtlsFlag, *modeFlag, *univFlag)
 	verbose = *verboseFlag
 
-	// Stats window size
+	// Stats collection window size, ie., how many request/packs counted to generated delay/jitter etc.
 	windowSize := *swFlag
 	if windowSize <= 0 {
 		if verbose {
@@ -163,9 +170,9 @@ func main() {
 			*loopTimesFlag = 0
 		} else {
 			// Static k=v
-			parts := strings.SplitN(*univFlag, "=", 2)
+			parts := strings.Split(*univFlag, "=")
 			if len(parts) != 2 {
-				exitErr("Universal must be key=val or FIFO path")
+				exitErr("Universal must be key=val or file (FIFO) path")
 			}
 			// key=value mode created just one entry for map[string]string
 			valDist = NewValDistStatic(parts[0], parts[1])
@@ -214,11 +221,19 @@ func main() {
 		clientHelloID: *cliFlag,
 		tlsTimeout:    time.Duration(*touFlag) * time.Millisecond,
 		maxRetries:    *retryFlag,
-		httpH2:        false,
+		httpH2:        *httpFlag,
 		valDist:       valDist,
 	}
-	if *httpFlag == 2 {
-		orch.httpH2 = true
+
+	if *mtlsFlag != "" {
+		certAndPass := strings.Split(*mtlsFlag, ":")
+		if len(certAndPass) != 2 {
+			exitErr("Client Certificate (mTLS) must be file:pass!")
+		}
+		*orch.tlsCert, err = loadPKCS12Certificate(certAndPass[0], certAndPass[1])
+		if err != nil {
+			exitErr(err.Error())
+		}
 	}
 
 	monkeysFinished := false

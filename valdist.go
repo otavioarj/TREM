@@ -88,7 +88,7 @@ func (d *ValDist) reader() {
 
 	cur := make(map[string]string)
 	scanner := bufio.NewScanner(fifo)
-
+	var lastKey string
 	for scanner.Scan() {
 		select {
 		case <-d.done:
@@ -101,13 +101,21 @@ func (d *ValDist) reader() {
 			continue
 		}
 
-		k, v, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
+		var k, v string
+		if idx := strings.Index(line, "="); idx > 0 {
+			// key=value format
+			k = strings.TrimSpace(line[:idx])
+			v = strings.TrimSpace(line[idx+1:])
+			lastKey = k
+		} else {
+			// value only - use lastKey
+			if lastKey == "" {
+				continue // no key defined yet, skip
+			}
+			k = lastKey
+			v = line
 		}
 
-		k = strings.TrimSpace(k)
-		v = strings.TrimSpace(v)
 		if k == "" {
 			continue
 		}
@@ -117,7 +125,6 @@ func (d *ValDist) reader() {
 		cur[k] = v
 		snapshot := copyMap(cur)
 		d.mu.Unlock()
-
 		d.current.Store(&snapshot)
 		kv := [2]string{k, v}
 		d.lastKV.Store(&kv)
