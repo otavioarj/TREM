@@ -8,8 +8,12 @@ import (
 	"strings"
 )
 
-// processReq - handles single req in chain (reuses connection if keepalive)
-func (o *Orch) processReq(w *monkey, idx int, addr string) error {
+// Pre-compiled regex for parseHost
+var hostHeaderRe = regexp.MustCompile(`(?im)^Host:\s*([^:\r\n]+)(?::(\d+))?`)
+
+// prepareReq - common logic for loading and preparing request
+// Returns prepared request string ready for sending
+func (o *Orch) prepareReq(w *monkey, idx int) (string, error) {
 	var raw []byte
 	var err error
 
@@ -19,33 +23,46 @@ func (o *Orch) processReq(w *monkey, idx int, addr string) error {
 	} else {
 		raw, err = os.ReadFile(w.reqFiles[idx])
 		if err != nil {
-			return err
+			return "", err
 		}
 	}
 	req := string(raw)
 
-	// Apply pattern replacements
-	keyCount := countKeys(req)
-	if len(w.patterns[idx-1]) != keyCount {
-		return fmt.Errorf("file %s: expected %d keys, got %d patterns", w.reqFiles[idx], keyCount, len(w.patterns[idx-1]))
-	}
-
-	for _, p := range w.patterns[idx-1] {
-		m := p.re.FindStringSubmatch(w.prevResp)
-		if m == nil {
-			if verbose {
-				w.logger.Write(fmt.Sprintf("[V] regex no match, pattern: %s\n", p.keyword))
-			}
-			return fmt.Errorf("regex did not match for: %s", p.keyword)
+	// Apply pattern replacements (skip for first request)
+	if idx > 0 {
+		keyCount := countKeys(req)
+		if len(w.patterns[idx-1]) != keyCount {
+			return "", fmt.Errorf("file %s: expected %d keys, got %d patterns", w.reqFiles[idx], keyCount, len(w.patterns[idx-1]))
 		}
-		req = strings.ReplaceAll(req, "$"+p.keyword+"$", m[1])
-		w.logger.Write(fmt.Sprintf("Matched %s: %s\n", p.keyword, m[1]))
+
+		for _, p := range w.patterns[idx-1] {
+			m := p.re.FindStringSubmatch(w.prevResp)
+			if m == nil {
+				if verbose {
+					w.logger.Write(fmt.Sprintf("[V] regex no match, pattern: %s\n", p.keyword))
+				}
+				return "", fmt.Errorf("regex did not match for: %s", p.keyword)
+			}
+			req = strings.ReplaceAll(req, "$"+p.keyword+"$", m[1])
+			w.logger.Write(fmt.Sprintf("Matched %s: %s\n", p.keyword, m[1]))
+		}
 	}
 
 	// Apply values from FIFO or static
 	vals := o.valDist.Get()
 	if len(vals) > 0 {
 		req = applyVals(req, vals)
+	}
+
+	return req, nil
+}
+
+// processReq - sync mode: handles single req in chain (reuses connection if keepalive)
+// Uses prepareReq for common logic, adds sync-specific sending behavior
+func (o *Orch) processReq(w *monkey, idx int, addr string) error {
+	req, err := o.prepareReq(w, idx)
+	if err != nil {
+		return err
 	}
 
 	req = normalizeRequest(req)
@@ -57,10 +74,8 @@ func (o *Orch) processReq(w *monkey, idx int, addr string) error {
 
 	var resp, status string
 	if o.keepAlive {
-		// Reuse connection with reconnect on error
 		resp, status, err = o.sendWithReconnect(w, []byte(req), addr)
 	} else {
-		// New connection per req with retry
 		resp, status, err = o.sendWithRetry(w, []byte(req), addr)
 	}
 
@@ -73,47 +88,12 @@ func (o *Orch) processReq(w *monkey, idx int, addr string) error {
 	return nil
 }
 
-// processReqAsync - async mode: process req with new connection
+// processReqAsync - async mode: process req with new connection each time
+// Uses prepareReq for common logic, adds async-specific host parsing and sending
 func (o *Orch) processReqAsync(w *monkey, idx int) error {
-	var raw []byte
-	var err error
-
-	// Use cache if available
-	if len(w.reqCache) > 0 {
-		raw = []byte(w.reqCache[idx])
-	} else {
-		raw, err = os.ReadFile(w.reqFiles[idx])
-		if err != nil {
-			return err
-		}
-	}
-	req := string(raw)
-
-	// Apply patterns if not first req
-	if idx > 0 {
-		keyCount := countKeys(req)
-		if len(w.patterns[idx-1]) != keyCount {
-			return fmt.Errorf("file %s: expected %d keys, got %d patterns", w.reqFiles[idx], keyCount, len(w.patterns[idx-1]))
-		}
-
-		for _, p := range w.patterns[idx-1] {
-			m := p.re.FindStringSubmatch(w.prevResp)
-			if m == nil {
-				if verbose {
-					w.logger.Write(fmt.Sprintf("[V] regex no match, pattern: %s\n", p.keyword))
-				}
-				//w.logger.Write(w.prevResp+"\n")
-				return fmt.Errorf("regex did not match for: %s", p.keyword)
-			}
-			req = strings.ReplaceAll(req, "$"+p.keyword+"$", m[1])
-			w.logger.Write(fmt.Sprintf("Matched %s: %s\n", p.keyword, m[1]))
-		}
-	}
-
-	// Apply values from FIFO or static
-	vals := o.valDist.Get()
-	if len(vals) > 0 {
-		req = applyVals(req, vals)
+	req, err := o.prepareReq(w, idx)
+	if err != nil {
+		return err
 	}
 
 	addr, err := parseHost(req, o.hostFlag)
@@ -131,7 +111,6 @@ func (o *Orch) processReqAsync(w *monkey, idx int) error {
 
 	w.logger.Write(fmt.Sprintf("Conn: %s\n", addr))
 
-	// Send with retry
 	resp, status, err := o.sendWithRetry(w, []byte(req), addr)
 	if err != nil {
 		return err
@@ -256,9 +235,7 @@ func FormatConfig(threads, delay, loopStart, loopTimes, cliHello, tlsTimeout int
 	if host != "" {
 		lines = append(lines, fmt.Sprintf("Forced Host: %s ", host))
 	}
-	if univ != "" {
-		lines = append(lines, fmt.Sprintf("Univ.: %s ", univ))
-	}
+	// Note: Univ/FIFO status is now shown dynamically in stats.go
 	lines = append(lines, "\n")
 	return strings.Join(lines, "")
 }
@@ -268,9 +245,8 @@ func parseHost(req, override string) (string, error) {
 		return override, nil
 	}
 
-	re := regexp.MustCompile(`(?im)^Host:\s*([^:\r\n]+)(?::(\d+))?`)
 	for _, line := range strings.Split(req, "\n") {
-		if m := re.FindStringSubmatch(line); m != nil {
+		if m := hostHeaderRe.FindStringSubmatch(line); m != nil {
 			h := m[1]
 			port := m[2]
 			if port == "" {

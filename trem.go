@@ -74,6 +74,7 @@ type Orch struct {
 	maxRetries    int
 	httpH2        bool // HTTP is HTTP2?
 	valDist       *ValDist
+	fifoWait      bool // wait for first FIFO data before starting workers
 	// Sync barrier
 	barrierMu    sync.Mutex
 	barrierCount int
@@ -86,6 +87,11 @@ var httpVersionRe = regexp.MustCompile(`HTTP/\d+\.\d+`)
 var configBanner string
 
 func main() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s -l req1,...,reqn -re regex [options]\n\nOptions:\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nNote: boolean flags require -flag or -flag=true/false syntax (e.g., -http2=true, not -http2 true)\n")
+	}
 	hostFlag := flag.String("h", "", "Host:port override; default from Host header.")
 	listFlag := flag.String("l", "", "Comma-separated request RAW HTTP/1.1 files.")
 	reFlag := flag.String("re", "", "Regex definitions file. Format: regex`:key per line.")
@@ -110,7 +116,7 @@ func main() {
 	verboseFlag := flag.Bool("v", false, "Verbose output.")
 	swFlag := flag.Int("sw", 0, "Stats window size (0=auto: 10 normal, 50 verbose).")
 	httpFlag := flag.Bool("http2", false, "Use HTTP2, default false uses HTTP 1.1.")
-	fwFlag := flag.Bool("fw", true, "Creates named-pipe file (i.e., -u /tmp/fifo) and *wait* until first value written.")
+	fwFlag := flag.Bool("fw", true, "FIFO wait: block until first value is written to the named-pipe.")
 	mtlsFlag := flag.String("mtls", "", "Client Certificate (mTLS) for TLS, format /path/file.pk12:pass .")
 	flag.Parse()
 
@@ -130,9 +136,13 @@ func main() {
 	}
 
 	PrintLogo()
+	// Check for unexpected positional arguments (common mistake: -flag value instead of -flag=value for bool flags)
+	if flag.NArg() > 0 {
+		exitErr(fmt.Sprintf("Warning: unexpected argument(s): %v\n", flag.Args()))
+	}
 
 	if *listFlag == "" || *reFlag == "" {
-		flag.PrintDefaults()
+		flag.Usage()
 		os.Exit(1)
 	}
 
@@ -188,12 +198,8 @@ func main() {
 	ui := NewUIManager(*thrFlag)
 	ui.StartStatsConsumer(stats.OutputChan())
 
-	// Wait for first FIFO value if -fw enabled
-	if *fwFlag && valDist.IsFifo() {
-		stats.SetFifoWaiting(true)
-		valDist.WaitFirst()
-		stats.SetFifoWaiting(false)
-	}
+	// Note: FIFO wait (-fw) is handled in worker startup goroutine below
+	// This allows UI to render while waiting for first FIFO data
 
 	// Create monkeys
 	monkeys := make([]*monkey, *thrFlag)
@@ -223,6 +229,7 @@ func main() {
 		maxRetries:    *retryFlag,
 		httpH2:        *httpFlag,
 		valDist:       valDist,
+		fifoWait:      *fwFlag && valDist.IsFifo(),
 	}
 
 	if *mtlsFlag != "" {
@@ -230,10 +237,11 @@ func main() {
 		if len(certAndPass) != 2 {
 			exitErr("Client Certificate (mTLS) must be file:pass!")
 		}
-		*orch.tlsCert, err = loadPKCS12Certificate(certAndPass[0], certAndPass[1])
+		cert, err := loadPKCS12Certificate(certAndPass[0], certAndPass[1])
 		if err != nil {
 			exitErr(err.Error())
 		}
+		orch.tlsCert = &cert
 	}
 
 	monkeysFinished := false
@@ -247,24 +255,37 @@ func main() {
 		}
 	}
 
-	// Start workers
-	for _, w := range monkeys {
+	// Add workers to WaitGroup BEFORE starting goroutine
+	// This prevents wg.Wait() from returning immediately
+	for range monkeys {
 		orch.wg.Add(1)
-		go orch.runWorker(w)
 	}
 
-	// Sync barrier orchestration
-	if orch.mode == "sync" {
-		go func() {
+	// Start workers in goroutine (allows UI to render while waiting for FIFO)
+	go func() {
+		// Wait for first FIFO value if -fw enabled
+		if orch.fifoWait {
+			stats.SetFifoWaiting(true)
+			orch.valDist.WaitFirst()
+			stats.SetFifoWaiting(false)
+		}
+
+		// Start workers (wg.Add already done above)
+		for _, w := range orch.monkeys {
+			go orch.runWorker(w)
+		}
+
+		// Sync barrier orchestration
+		if orch.mode == "sync" {
 			readyCount := 0
 			for range orch.readyChan {
 				orch.barrierMu.Lock()
 				readyCount++
 				orch.barrierCount = readyCount
 				if verbose {
-					fmt.Printf("[V] barrier: %d/%d ready\n", readyCount, len(monkeys))
+					fmt.Printf("[V] barrier: %d/%d ready\n", readyCount, len(orch.monkeys))
 				}
-				if readyCount == len(monkeys) {
+				if readyCount == len(orch.monkeys) {
 					orch.barrierMu.Unlock()
 					close(orch.startChan)
 					break
@@ -286,7 +307,7 @@ func main() {
 					}
 
 					orch.barrierMu.Lock()
-					orch.readyChan = make(chan int, len(monkeys))
+					orch.readyChan = make(chan int, len(orch.monkeys))
 					orch.startChan = make(chan struct{})
 					oldLoopChan := orch.loopChan
 					orch.loopChan = make(chan struct{})
@@ -297,7 +318,7 @@ func main() {
 					readyCount = 0
 					for range orch.readyChan {
 						readyCount++
-						if readyCount == len(monkeys) {
+						if readyCount == len(orch.monkeys) {
 							break
 						}
 					}
@@ -306,8 +327,8 @@ func main() {
 					loopCount++
 				}
 			}
-		}()
-	}
+		}
+	}()
 
 	// Wait completion
 	go func() {

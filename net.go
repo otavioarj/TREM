@@ -35,17 +35,17 @@ func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Durati
 	}
 	defer conn.Close()
 
+	// Route by protocol - parse only when needed for H2
+	if !httpH2 {
+		return sendOnConn(raw, conn, threadID)
+	}
+
 	req := parseRawReq2H2(string(raw))
 	if req == nil {
 		return "", "", fmt.Errorf("failed to parse request")
 	}
-
-	if !httpH2 {
-		return sendOnConn(raw, conn, threadID)
-	} else {
-		h2 := newH2Conn(conn)
-		return h2.sendReqH2(req, threadID)
-	}
+	h2 := newH2Conn(conn)
+	return h2.sendReqH2(req, threadID)
 }
 
 // sendOnConn - sends request on existing connection, reports metrics

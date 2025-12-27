@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 )
 
 // ValDist - distributes key=value pairs from FIFO to all threads
+// Uses copy-on-write for lock-free reads and writes
 type ValDist struct {
 	fifoPath  string
 	current   atomic.Pointer[map[string]string]
@@ -16,7 +16,6 @@ type ValDist struct {
 	hasData   atomic.Bool
 	firstData chan struct{}
 	done      chan struct{}
-	mu        sync.Mutex
 }
 
 // NewValDist - creates new distributor
@@ -78,17 +77,20 @@ func (d *ValDist) Start() {
 	go d.reader()
 }
 
-// reader - goroutine that reads FIFO and updates values
+// reader - goroutine that reads FIFO and updates values using copy-on-write
 func (d *ValDist) reader() {
-	fifo, err := os.OpenFile(d.fifoPath, os.O_RDONLY, os.ModeNamedPipe)
+	// Open FIFO - on Unix, O_RDONLY blocks until writer opens
+	// We use O_RDWR to avoid blocking (acts as both reader and writer)
+	// This is a common trick for non-blocking FIFO open
+	fifo, err := os.OpenFile(d.fifoPath, os.O_RDWR, os.ModeNamedPipe)
 	if err != nil {
 		return
 	}
 	defer fifo.Close()
 
-	cur := make(map[string]string)
 	scanner := bufio.NewScanner(fifo)
 	var lastKey string
+
 	for scanner.Scan() {
 		select {
 		case <-d.done:
@@ -120,12 +122,15 @@ func (d *ValDist) reader() {
 			continue
 		}
 
-		// Update map
-		d.mu.Lock()
-		cur[k] = v
-		snapshot := copyMap(cur)
-		d.mu.Unlock()
-		d.current.Store(&snapshot)
+		// Copy-on-write: load current, copy, modify, store
+		old := d.current.Load()
+		newMap := make(map[string]string, len(*old)+1)
+		for ok, ov := range *old {
+			newMap[ok] = ov
+		}
+		newMap[k] = v
+		d.current.Store(&newMap)
+
 		kv := [2]string{k, v}
 		d.lastKV.Store(&kv)
 
@@ -146,9 +151,7 @@ func (d *ValDist) Stop() {
 	}
 }
 
-// Get - returns current values, no lock used here :)
-//
-//	Whom races the racer? \o/
+// Get - returns current values (lock-free via atomic pointer)
 func (d *ValDist) Get() map[string]string {
 	p := d.current.Load()
 	if p == nil {
@@ -184,15 +187,6 @@ func (d *ValDist) IsFifo() bool {
 // Path - returns FIFO path
 func (d *ValDist) Path() string {
 	return d.fifoPath
-}
-
-// copyMap - creates shallow copy of map
-func copyMap(m map[string]string) map[string]string {
-	c := make(map[string]string, len(m))
-	for k, v := range m {
-		c[k] = v
-	}
-	return c
 }
 
 // applyVals - replaces all keys in req with values from map

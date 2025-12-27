@@ -199,8 +199,10 @@ func (h *H2Conn) readResponse(streamID uint32) (resp, status string, bytesIn int
 	var body bytes.Buffer
 	var encoding string
 
+	// Reuse header buffer across frame reads
+	hdr := make([]byte, 9)
+
 	for {
-		hdr := make([]byte, 9)
 		n, err := io.ReadFull(h.conn, hdr)
 		bytesIn += n
 		if err != nil {

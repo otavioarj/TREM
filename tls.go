@@ -88,7 +88,11 @@ func tlsHandshakeDo(conn net.Conn, host string, cliMode int, timeout time.Durati
 		InsecureSkipVerify: true,
 		ServerName:         host,
 		NextProtos:         alpn,
-		Certificates:       []utls.Certificate{*tlsCert}, // ClientCertificate || mTLS cert
+	}
+
+	// ClientCertificate (mTLS) if provided
+	if tlsCert != nil {
+		tlsConf.Certificates = []utls.Certificate{*tlsCert}
 	}
 
 	tlsConn := utls.UClient(conn, tlsConf, helloID)

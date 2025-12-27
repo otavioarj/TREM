@@ -171,7 +171,7 @@ func (sc *StatsCollector) SetFifoWaiting(waiting bool) {
 
 // worker - consumes events and updates UI periodically
 func (sc *StatsCollector) worker() {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(500 * time.Microsecond)
 	defer ticker.Stop()
 
 	for {
@@ -264,21 +264,33 @@ func (sc *StatsCollector) pushUpdate() {
 	// Append config summit banner
 	lines = append(lines, configBanner)
 
-	// FIFO status line
-	if sc.valDist != nil && sc.valDist.IsFifo() {
-		if sc.fifoWaiting.Load() {
-			lines = append(lines, fmt.Sprintf("FIFO: %s [waiting first write...]", sc.valDist.Path()))
-		} else {
+	// Univ/FIFO status line (unified)
+	if sc.valDist != nil {
+		if sc.valDist.IsFifo() {
+			// FIFO mode
+			if sc.fifoWaiting.Load() {
+				lines = append(lines, fmt.Sprintf("Univ.: %s [waiting write...]", sc.valDist.Path()))
+			} else {
+				k, v := sc.valDist.LastKV()
+				if k != "" {
+					dispV := v
+					if len(dispV) > 20 {
+						dispV = dispV[:17] + "..."
+					}
+					lines = append(lines, fmt.Sprintf("Univ.: %s [%s=%s]", sc.valDist.Path(), k, dispV))
+				} else {
+					lines = append(lines, fmt.Sprintf("Univ.: %s [no data]", sc.valDist.Path()))
+				}
+			}
+		} else if sc.valDist.HasData() {
+			// Static k=v mode
 			k, v := sc.valDist.LastKV()
 			if k != "" {
-				// Truncate value if too long
 				dispV := v
 				if len(dispV) > 20 {
 					dispV = dispV[:17] + "..."
 				}
-				lines = append(lines, fmt.Sprintf("FIFO: %s=%s", k, dispV))
-			} else {
-				lines = append(lines, fmt.Sprintf("FIFO: %s [no data]", sc.valDist.Path()))
+				lines = append(lines, fmt.Sprintf("Univ.: %s=%s", k, dispV))
 			}
 		}
 	}
