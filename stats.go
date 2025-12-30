@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -63,6 +64,10 @@ type StatsCollector struct {
 	// HTTP errors - map["tid:status"] -> count
 	httpErrors map[string]int
 	errorOrder []string // insertion order for display
+
+	// FIFO status
+	valDist     *ValDist
+	fifoWaiting atomic.Bool
 
 	// Output
 	outputCh chan string
@@ -152,21 +157,37 @@ func (sc *StatsCollector) Stop() {
 	close(sc.quitCh)
 }
 
+// SetValDist - sets value distributor for FIFO status display
+func (sc *StatsCollector) SetValDist(vd *ValDist) {
+	sc.mu.Lock()
+	sc.valDist = vd
+	sc.mu.Unlock()
+}
+
+// SetFifoWaiting - sets FIFO waiting state
+func (sc *StatsCollector) SetFifoWaiting(waiting bool) {
+	sc.fifoWaiting.Store(waiting)
+}
+
 // worker - consumes events and updates UI periodically
 func (sc *StatsCollector) worker() {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+
+	ticks := 0
 
 	for {
 		select {
 		case <-sc.quitCh:
 			return
-
 		case event := <-sc.eventCh:
 			sc.processEvent(event)
-
 		case <-ticker.C:
 			sc.pushUpdate()
+			ticks++
+			if ticks == 10 { // after 1 second of execution, increase the tick
+				ticker.Reset(500 * time.Millisecond)
+			}
 		}
 	}
 }
@@ -246,6 +267,38 @@ func (sc *StatsCollector) pushUpdate() {
 	var lines []string
 	// Append config summit banner
 	lines = append(lines, configBanner)
+
+	// Univ/FIFO status line (unified)
+	if sc.valDist != nil {
+		if sc.valDist.IsFifo() {
+			// FIFO mode
+			if sc.fifoWaiting.Load() {
+				lines = append(lines, fmt.Sprintf("Univ.: %s [waiting write...]", sc.valDist.Path()))
+			} else {
+				k, v := sc.valDist.LastKV()
+				if k != "" {
+					dispV := v
+					if len(dispV) > 20 {
+						dispV = dispV[:17] + "..."
+					}
+					lines = append(lines, fmt.Sprintf("Univ.: %s [%s=%s]", sc.valDist.Path(), k, dispV))
+				} else {
+					lines = append(lines, fmt.Sprintf("Univ.: %s [no data]", sc.valDist.Path()))
+				}
+			}
+		} else if sc.valDist.HasData() {
+			// Static k=v mode
+			k, v := sc.valDist.LastKV()
+			if k != "" {
+				dispV := v
+				if len(dispV) > 20 {
+					dispV = dispV[:17] + "..."
+				}
+				lines = append(lines, fmt.Sprintf("Univ.: %s=%s", k, dispV))
+			}
+		}
+	}
+
 	// Line 1: Req/s and total count (normal mode) or with jitter (verbose)
 	reqPerSec := sc.calcReqPerSec()
 	if sc.verbose {
