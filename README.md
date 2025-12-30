@@ -4,16 +4,25 @@ A high-performance HTTP/1.1 and HTTP/2 race condition testing tool designed for 
 
 ## Overview
 
-Race conditions occur when multiple operations access shared resources without proper synchronization, leading to unexpected behavior. TREM exploits these vulnerabilities by orchestrating multiple concurrent HTTP request chains with nanosecond-level timing precision.
+Race conditions occur when multiple operations access shared resources without proper synchronization, leading to unexpected behavior. TREM exploits these vulnerabilities by orchestrating multiple concurrent HTTP request chains with nanosecond-level timing precision. TREM uses a handcrafted HTTP2 and TLS state machines, by using TLS ClientHello randomization or HTTP2 server to client sync datagram ignores, it allows TLS fingerprint evasions and special HTTP2 race scenarios.
 
 ### Attack Scenarios
 
 **Classic Race Conditions (Sync Mode)**
-Multiple threads establish connections, synchronize at a barrier, then fire requests simultaneously. Exploits TOCTOU (Time-of-Check to Time-of-Use) vulnerabilities in:
+Multiple threads establish connections, synchronize at a barrier, then fire requests simultaneously. Exploiting classical TOCTOU (Time-of-Check to Time-of-Use) vulnerabilities in:
 - Double-spend in financial transactions
 - Coupon/voucher redemption bypass
 - Inventory manipulation (overselling)
 - Privilege escalation via concurrent role assignment
+
+**Havoc Race Conditions (Async Mode)**
+
+Default mode, it abuses in high-throughput race conditions, aiming to cause havoc (_ad absurdum_) in target state machine, where each thread processes requests independently without synchronization. For instance:
+
+- Session puzzling: Rapid sequential requests exploiting session state inconsistencies
+- Cache poisoning: Flooding requests to poison CDN/cache before legitimate traffic
+- Racer Resource exhaustion: Sustained high-volume requests depleting server connection pools, leading to lost of concurrency managing
+- Business logic abuse: High-speed coupon redemption, inventory manipulation without sync timing, leading to corruption of state status at any coupon/inventory manipulation
 
 **Rate Limiter & WAF Bypass**
 Abuse the timing window between request arrival and counter increment. When N requests arrive within the same processing window, the rate limiter may count them as fewer attempts than actual, allowing:
@@ -31,14 +40,14 @@ TREM is engineered for minimal overhead and maximum throughput:
 | Component | Strategy | Complexity |
 |-----------|----------|------------|
 | Value Distribution | Lock-free reads via `atomic.Pointer` | O(1) |
-| Thread Communication | Buffered channels (1000 capacity) | O(1) amortized |
+| Thread Communication | Buffered channels (1000 capacity) | O(1)  |
 | FIFO Reader | Non-blocking I/O with 100ms timeout | O(n) per batch |
-| Batch Processing | 4KB buffer / 64 lines per dispatch | O(n) |
-| Key Extraction | Regex with linear dedup | O(n) |
-| Cartesian Product | In-place combination generation | O(k^m) for k values, m keys |
-| Connection Pooling | Keep-alive with TLS session reuse | O(1) per request |
+| Batch Processing | 4KB buffer / 64 lines per dispatch | O(n) amortized |
+| Key Extraction | Regex with linear dedup | O(n) amortized|
+| Key combination & seek | In-place combination generation | O(log<sub>k</sub>v) for v values, k keys |
+| Connection Pooling | Keep-alive with TLS session reuse | O(1) |
 
-The architecture eliminates mutex contention through copy-on-write semantics and atomic operations, enabling thousands of concurrent requests with sub-millisecond coordination overhead.
+The architecture eliminates mutex contention through **copy-on-write semantics** and atomic operations, enabling thousands of concurrent requests with sub-millisecond coordination overhead.
 
 ## Build
 
@@ -51,7 +60,7 @@ go mod tidy
 # Debug build
 go build
 
-# Release build (smaller binary)
+# Release build :)
 go build -ldflags="-s -w"
 ```
 
@@ -89,7 +98,7 @@ go build -ldflags="-s -w"
 | `-fw` | true | FIFO wait: block until first value written to named pipe |
 | `-fmode` | 2 | FIFO distribution: 1=Broadcast (all threads), 2=Round-robin |
 | `-mtls` | | Client certificate for mTLS: `/path/cert.p12:password` |
-| `-dump` | false | Dump thread output to files (`thr<ID>_<H-M>.txt`) |
+| `-dump` | false | Dump thread tab(TUI) output to files (`thr<ID>_<H-M>.txt`) |
 
 ## ClientHello Fingerprints (`-cli`)
 
@@ -119,7 +128,7 @@ TREM supports HTTP/2 natively. Request files remain in HTTP/1.1 raw format - TRE
 - Body sent as DATA frames
 - TLS ALPN set to `h2`
 
-**Limitations:**
+**Intented Limitations:**
 - Flow control assumes server window ≥ 64KB
 - Server push (PUSH_PROMISE) frames discarded
 
@@ -217,7 +226,7 @@ Replace a placeholder across all requests:
 
 ### FIFO Mode (Dynamic Injection)
 
-For dynamic value injection (password spraying, token rotation), use a named pipe:
+For dynamic value injection (password spraying, token rotation etc.), use a named pipe. It works on any Unix that Golang supports, e.g. Linux, macOS, BSD, Android, etc. Windows named pipes aren't implemented yet :(. Each entry on FIFO generates an individual request, example:
 
 ```bash
 # Terminal 1: Start TREM with FIFO
@@ -236,13 +245,13 @@ qwerty
 123456
 ```
 
-The first line defines the key (`$pass$`), subsequent lines are values for that key.
+The first line defines the key (`$pass$`), subsequent lines are values for that key. Each value of $pass$ generates a new request when matching and replacing the key in a given request.
 
 ### FIFO Distribution Modes (`-fmode`)
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
-| 1 | Broadcast: all threads receive all values | Testing same credentials across threads |
+| 1 | Broadcast: all threads receive all values | Testing same token across threads |
 | 2 | Round-robin: each value goes to one thread | Password spraying (default) |
 
 **Round-robin example with 3 threads:**
@@ -253,7 +262,7 @@ Thread 1: pass2, pass5
 Thread 2: pass3, pass6
 ```
 
-### Persistent Keys (`$_key$`)
+### Round-robin Persistent Keys (`$_key$`)
 
 Keys starting with underscore are never consumed and persist across all loops:
 
@@ -267,11 +276,19 @@ $pin$=1234
 - `$_bearer$` is set once and used in every request
 - `$pin$` values are consumed normally (one per request)
 
-This enables scenarios like: authenticate once, then spray PINs.
+This enables scenarios like: authenticate once, then spray PINs. The `$_key$` can still be updated later:
+```
+$_bearer$=eyJhbGciOiJIUzI1NiIs...
+$pin$=1234
+5678
+9012
+....
+$_bearer$=eyJhbGciOiJSUzI1NiIsIn...
+```
 
-### Cartesian Product
+### Key combinations 
 
-When multiple keys have multiple values, TREM generates all combinations:
+When multiple keys have multiple values in the same batch (64 lines), TREM generates all combinations:
 
 ```
 $user$=admin
