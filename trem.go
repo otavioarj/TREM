@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.4.2"
+var version = "v1.4.4"
 
 // Verbose mode flag
 var verbose bool
@@ -50,6 +50,10 @@ type monkey struct {
 	reqCache      []string
 	loopStartReq  string
 	loopStartAddr string
+
+	// FIFO value distribution
+	valChan     chan map[string]string // receives values from ValDist
+	localBuffer map[string][]string    // accumulated values for consumption
 }
 
 // Orch - orchestrator for sync/async modes
@@ -117,7 +121,10 @@ func main() {
 	swFlag := flag.Int("sw", 0, "Stats window size (0=auto: 10 normal, 50 verbose).")
 	httpFlag := flag.Bool("http2", false, "Use HTTP2, default false uses HTTP 1.1.")
 	fwFlag := flag.Bool("fw", true, "FIFO wait: block until first value is written to the named-pipe.")
+	fmodeFlag := flag.Int("fmode", 2, "FIFO mode: \n1. Broadcast, all threads receives same values from FIFO. \n2. Round-robin "+
+		"Queue, each value is sent sequentially per thread, i.e, as in a ring.")
 	mtlsFlag := flag.String("mtls", "", "Client Certificate (mTLS) for TLS, format /path/file.pk12:pass .")
+	dumpFlag := flag.Bool("dump", false, "Dump thread output to files (thr<ID>_<H-M>.txt).")
 	flag.Parse()
 
 	configBanner = FormatConfig(*thrFlag, *delayFlag, *loopStartFlag, *loopTimesFlag, *cliFlag, *touFlag,
@@ -136,7 +143,7 @@ func main() {
 	}
 
 	PrintLogo()
-	// Check for unexpected positional arguments (common mistake: -flag value instead of -flag=value for bool flags)
+	// Check for unexpected positional arguments: -flag value instead of -flag=value for bool flags)
 	if flag.NArg() > 0 {
 		exitErr(fmt.Sprintf("Warning: unexpected argument(s): %v\n", flag.Args()))
 	}
@@ -166,18 +173,19 @@ func main() {
 		exitErr(fmt.Sprintf("regex file must have %d lines, got %d", len(reqFiles)-1, len(allPatterns)))
 	}
 
+	// Init UI
+	ui := NewUIManager(*thrFlag, *dumpFlag)
+
 	// Setup value distributor (FIFO or static k=v)
 	var valDist *ValDist
 	if *univFlag != "" {
 		// Check if flag contains =, indicating key=value mode
 		if !strings.Contains(*univFlag, "=") {
-			valDist = NewValDist(*univFlag)
+			valDist = NewValDist(*univFlag, *fmodeFlag, *thrFlag)
 			if err := valDist.EnsureFifo(); err != nil {
 				exitErr(fmt.Sprintf("FIFO error: %v", err))
 			}
-			valDist.Start()
-			// FIFO mode forces infinite loops
-			*loopTimesFlag = 0
+			valDist.Start(ui.GetLogger(0))
 		} else {
 			// Static k=v
 			parts := strings.Split(*univFlag, "=")
@@ -188,14 +196,11 @@ func main() {
 			valDist = NewValDistStatic(parts[0], parts[1])
 		}
 	} else {
-		valDist = NewValDist("") // empty, no replacements
+		valDist = NewValDist("", 1, *thrFlag) // empty, no replacements
 	}
 	// Init stats collector
 	stats = NewStatsCollector(windowSize, verbose)
 	stats.SetValDist(valDist) // for FIFO status display
-
-	// Init UI
-	ui := NewUIManager(*thrFlag)
 	ui.StartStatsConsumer(stats.OutputChan())
 
 	// Note: FIFO wait (-fw) is handled in worker startup goroutine below
@@ -205,10 +210,12 @@ func main() {
 	monkeys := make([]*monkey, *thrFlag)
 	for i := 0; i < *thrFlag; i++ {
 		monkeys[i] = &monkey{
-			id:       i,
-			logger:   ui.GetLogger(i),
-			reqFiles: reqFiles,
-			patterns: allPatterns,
+			id:          i,
+			logger:      ui.GetLogger(i),
+			reqFiles:    reqFiles,
+			patterns:    allPatterns,
+			valChan:     valDist.GetThreadChan(i),
+			localBuffer: make(map[string][]string),
 		}
 	}
 
@@ -339,10 +346,10 @@ func main() {
 		ui.BroadcastMessage("\n=== All requests completed ===\n")
 		ui.BroadcastMessage("Press Q to quit, Tab/Shift+Tab to navigate\n")
 	}()
-
 	if err := ui.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "TView error: %v\n", err)
 	}
+	defer ui.app.Stop()
 }
 
 // runWorker - executes request chain for single monkey
@@ -369,15 +376,35 @@ func (o *Orch) runWorker(w *monkey) {
 			w.logger.Write(fmt.Sprintf("ERR: read file: %v\n", err))
 			return
 		}
-		req := normalizeRequest(string(raw))
+		baseReq := string(raw)
 
-		// Apply values from FIFO or static
-		vals := o.valDist.Get()
-		if len(vals) > 0 {
-			req = applyVals(req, vals)
-			k, v := o.valDist.LastKV()
-			w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, v))
+		// Handle FIFO values for first request
+		var req string
+		if o.valDist.IsStatic() {
+			k, v := o.valDist.StaticKV()
+			req = strings.ReplaceAll(baseReq, k, v)
+		} else if o.valDist.IsFifo() {
+			drainChannel(w)
+			keys := extractKeys(baseReq)
+			if len(keys) > 0 && o.fifoWait {
+				if !waitForKeys(w, keys, o.quitChan) {
+					w.logger.Write("ERR: FIFO closed while waiting\n")
+					return
+				}
+			}
+			// Apply first available values
+			req = baseReq
+			for _, k := range keys {
+				if len(w.localBuffer[k]) > 0 {
+					req = strings.ReplaceAll(req, k, w.localBuffer[k][0])
+					w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, w.localBuffer[k][0]))
+				}
+			}
+		} else {
+			req = baseReq
 		}
+
+		req = normalizeRequest(req)
 
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
@@ -463,11 +490,6 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 	} else {
 		// Async mode
-		vals := o.valDist.Get()
-		if len(vals) > 0 {
-			k, v := o.valDist.LastKV()
-			w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, v))
-		}
 		for i := 0; i < len(w.reqFiles); i++ {
 			if o.loopStart > 0 && i == o.loopStart-1 {
 				w.loopStartReq = ""

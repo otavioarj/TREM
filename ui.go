@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -70,23 +72,32 @@ func (a *AsyncLogWriter) Close() {
 
 // UIManager - manages tview app, thread tabs, and stats panel
 type UIManager struct {
-	app        *tview.Application
-	pages      *tview.Pages
-	statsPanel *tview.TextView
-	mainFlex   *tview.Flex
-	tabNames   []string
-	loggers    []*AsyncLogWriter
-	textViews  []*tview.TextView
+	app         *tview.Application
+	pages       *tview.Pages
+	statsPanel  *tview.TextView
+	mainFlex    *tview.Flex
+	tabNames    []string
+	loggers     []*AsyncLogWriter
+	textViews   []*tview.TextView
+	dumpEnabled bool
+	dumpFiles   []*os.File
+	dumpChans   []chan string
 }
 
 // NewUIManager - creates UI with thread tabs and stats panel
-func NewUIManager(threadCount int) *UIManager {
+func NewUIManager(threadCount int, dumpEnabled bool) *UIManager {
 	ui := &UIManager{
-		app:       tview.NewApplication(),
-		pages:     tview.NewPages(),
-		tabNames:  make([]string, threadCount),
-		loggers:   make([]*AsyncLogWriter, threadCount),
-		textViews: make([]*tview.TextView, threadCount),
+		app:         tview.NewApplication(),
+		pages:       tview.NewPages(),
+		tabNames:    make([]string, threadCount),
+		loggers:     make([]*AsyncLogWriter, threadCount),
+		textViews:   make([]*tview.TextView, threadCount),
+		dumpEnabled: dumpEnabled,
+	}
+
+	if dumpEnabled {
+		ui.dumpFiles = make([]*os.File, threadCount)
+		ui.dumpChans = make([]chan string, threadCount)
 	}
 
 	// Create thread tabs
@@ -122,8 +133,26 @@ func (ui *UIManager) createThreadTab(idx int) {
 		ch: make(chan string, logBufferSize),
 	}
 
+	// Setup dump file and goroutine if enabled
+	if ui.dumpEnabled {
+		filename := fmt.Sprintf("thr%d_%s.txt", idx, time.Now().Format("15-04"))
+		f, err := os.Create(filename)
+		if err != nil {
+			exitErr(fmt.Sprintf("Failed to create dump file %s: %v", filename, err))
+		}
+		ui.dumpFiles[idx] = f
+		ui.dumpChans[idx] = make(chan string, logBufferSize)
+
+		// Dump writer goroutine
+		go func(f *os.File, ch <-chan string) {
+			for msg := range ch {
+				f.WriteString(msg)
+			}
+		}(f, ui.dumpChans[idx])
+	}
+
 	// Start consumer goroutine
-	go ui.logConsumer(tv, logger.ch)
+	go ui.logConsumer(idx, tv, logger.ch)
 
 	tabName := fmt.Sprintf("t%d", idx+1)
 	ui.tabNames[idx] = tabName
@@ -137,7 +166,7 @@ func (ui *UIManager) createThreadTab(idx int) {
 }
 
 // logConsumer - consumes log messages and batch-updates TextView
-func (ui *UIManager) logConsumer(tv *tview.TextView, ch <-chan string) {
+func (ui *UIManager) logConsumer(idx int, tv *tview.TextView, ch <-chan string) {
 	var batch strings.Builder
 	batchSize := 0
 	maxBatch := 10
@@ -149,6 +178,14 @@ func (ui *UIManager) logConsumer(tv *tview.TextView, ch <-chan string) {
 				fmt.Fprint(tv, content)
 				tv.ScrollToEnd()
 			})
+			// Send to dump goroutine if enabled
+			if ui.dumpEnabled && ui.dumpChans[idx] != nil {
+				select {
+				case ui.dumpChans[idx] <- content:
+				default:
+					// buffer full, skip
+				}
+			}
 			batch.Reset()
 			batchSize = 0
 		}
@@ -210,6 +247,9 @@ func (ui *UIManager) SetupInputCapture(orch *Orch, monkeysFinished *bool) {
 			ui.pages.SwitchToPage(ui.tabNames[currentTab])
 			return nil
 		} else if event.Rune() == 'q' || event.Rune() == 'Q' {
+			// Close dump files and channels
+			ui.closeDumpFiles()
+
 			if *monkeysFinished {
 				ui.app.Stop()
 			} else {
@@ -224,6 +264,21 @@ func (ui *UIManager) SetupInputCapture(orch *Orch, monkeysFinished *bool) {
 		}
 		return event
 	})
+}
+
+// closeDumpFiles - closes dump channels and files
+func (ui *UIManager) closeDumpFiles() {
+	if !ui.dumpEnabled {
+		return
+	}
+	for i, ch := range ui.dumpChans {
+		if ch != nil {
+			close(ch)
+		}
+		if ui.dumpFiles[i] != nil {
+			ui.dumpFiles[i].Close()
+		}
+	}
 }
 
 // Run - starts tview app (blocks until exit)

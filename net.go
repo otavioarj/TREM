@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -211,12 +210,12 @@ func dialWithProxy(addr, proxyURL string) (net.Conn, error) {
 		return net.DialTimeout("tcp", addr, 10*time.Second)
 	}
 
-	proxy, err := url.Parse(proxyURL)
+	proxy, err := parseProxyAddr(proxyURL)
 	if err != nil {
 		return nil, err
 	}
 
-	proxyConn, err := net.DialTimeout("tcp", proxy.Host, 10*time.Second)
+	proxyConn, err := net.DialTimeout("tcp", proxy, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}

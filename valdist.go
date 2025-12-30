@@ -1,32 +1,57 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"fmt"
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
-// ValDist - distributes key=value pairs from FIFO to all threads
-// Uses copy-on-write for lock-free reads and writes
+const batchSize = 64
+
+// kv - key-value pair for batching
+type kv struct {
+	k, v string
+}
+
+// ValDist - distributes key=value pairs from FIFO to threads
+// Supports two modes:
+//   - Get mode (popMode=false): broadcast to all threads
+//   - Pop mode (popMode=true): round-robin to threads
 type ValDist struct {
-	fifoPath  string
-	current   atomic.Pointer[map[string]string]
-	lastKV    atomic.Pointer[[2]string] // last key=value for display
+	fifoPath string
+	popMode  int
+
+	// Thread channels - one per thread
+	threadChans []chan map[string]string
+
+	// Round-robin index for Pop mode
+	rrIndex atomic.Uint64
+
+	// Status tracking
+	lastKV    atomic.Pointer[[2]string]
 	hasData   atomic.Bool
 	firstData chan struct{}
 	done      chan struct{}
 }
 
-// NewValDist - creates new distributor
-func NewValDist(path string) *ValDist {
+// NewValDist - creates new distributor for FIFO mode
+func NewValDist(path string, popMode int, numThreads int) *ValDist {
 	d := &ValDist{
-		fifoPath:  path,
-		firstData: make(chan struct{}),
-		done:      make(chan struct{}),
+		fifoPath:    path,
+		popMode:     popMode,
+		threadChans: make([]chan map[string]string, numThreads),
+		firstData:   make(chan struct{}),
+		done:        make(chan struct{}),
 	}
-	empty := make(map[string]string)
-	d.current.Store(&empty)
+
+	// Create buffered channel for each thread
+	for i := 0; i < numThreads; i++ {
+		d.threadChans[i] = make(chan map[string]string, 1000)
+	}
+
 	emptyKV := [2]string{"", ""}
 	d.lastKV.Store(&emptyKV)
 	return d
@@ -35,16 +60,23 @@ func NewValDist(path string) *ValDist {
 // NewValDistStatic - creates distributor with static k=v (no FIFO)
 func NewValDistStatic(key, val string) *ValDist {
 	d := &ValDist{
+		popMode:   2,
 		firstData: make(chan struct{}),
 		done:      make(chan struct{}),
 	}
-	m := map[string]string{key: val}
-	d.current.Store(&m)
 	kv := [2]string{key, val}
 	d.lastKV.Store(&kv)
 	d.hasData.Store(true)
 	close(d.firstData)
 	return d
+}
+
+// GetThreadChan - returns channel for specific thread
+func (d *ValDist) GetThreadChan(threadID int) chan map[string]string {
+	if d.threadChans == nil || threadID >= len(d.threadChans) {
+		return nil
+	}
+	return d.threadChans[threadID]
 }
 
 // EnsureFifo - creates FIFO if not exists
@@ -55,11 +87,10 @@ func (d *ValDist) EnsureFifo() error {
 
 	info, err := os.Stat(d.fifoPath)
 	if err == nil {
-		// Exists - check if named pipe
 		if info.Mode()&os.ModeNamedPipe != 0 {
 			return nil
 		}
-		return os.ErrExist // exists but not a FIFO
+		return os.ErrExist
 	}
 
 	if os.IsNotExist(err) {
@@ -70,74 +101,133 @@ func (d *ValDist) EnsureFifo() error {
 }
 
 // Start - begins reading from FIFO
-func (d *ValDist) Start() {
+func (d *ValDist) Start(logger LogWriter) {
 	if d.fifoPath == "" {
-		return
+		exitErr("FIFO path is NULL?!")
 	}
-	go d.reader()
-}
-
-// reader - goroutine that reads FIFO and updates values using copy-on-write
-func (d *ValDist) reader() {
-	// Open FIFO - on Unix, O_RDONLY blocks until writer opens
-	// We use O_RDWR to avoid blocking (acts as both reader and writer)
-	// This is a common trick for non-blocking FIFO open
 	fifo, err := os.OpenFile(d.fifoPath, os.O_RDWR, os.ModeNamedPipe)
 	if err != nil {
+		exitErr(fmt.Sprintf("FIFO open error: " + err.Error()))
+	}
+	go d.reader(fifo, logger)
+}
+
+// updateStatus - updates lastKV and signals first data
+func (d *ValDist) updateStatus(batch []kv) {
+	if len(batch) == 0 {
 		return
 	}
+	last := batch[len(batch)-1]
+	kvArr := [2]string{last.k, last.v}
+	d.lastKV.Store(&kvArr)
+
+	if !d.hasData.Load() {
+		d.hasData.Store(true)
+		close(d.firstData)
+	}
+}
+
+// reader - reads FIFO in batches and dispatches to thread channels
+func (d *ValDist) reader(fifo *os.File, logger LogWriter) {
 	defer fifo.Close()
-
-	scanner := bufio.NewScanner(fifo)
 	var lastKey string
+	buf := make([]byte, 4096)
+	var leftover []byte
 
-	for scanner.Scan() {
+	for {
 		select {
 		case <-d.done:
 			return
 		default:
 		}
-
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		var k, v string
-		if idx := strings.Index(line, "="); idx > 0 {
-			// key=value format
-			k = strings.TrimSpace(line[:idx])
-			v = strings.TrimSpace(line[idx+1:])
-			lastKey = k
-		} else {
-			// value only - use lastKey
-			if lastKey == "" {
-				continue // no key defined yet, skip
+		// Set read deadline for non-blocking behavior
+		fifo.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, err := fifo.Read(buf)
+		if err != nil {
+			if os.IsTimeout(err) {
+				continue
 			}
-			k = lastKey
-			v = line
+			// real read error!
+			logger.Write(fmt.Sprintf("Error at FIFO reader: " + err.Error()))
+			return
 		}
 
-		if k == "" {
-			continue
+		data := append(leftover, buf[:n]...)
+		// Read is non-blocking 4KB b-size, which is them split into 64 lines block
+		//  OR what was read until timeout err, this is one batch :)
+		leftover = nil
+		batch := make([]kv, 0, batchSize)
+		for {
+			idx := bytes.IndexByte(data, '\n')
+			if idx < 0 {
+				leftover = data
+				break
+			}
+
+			line := strings.TrimSpace(string(data[:idx]))
+			data = data[idx+1:]
+			if line == "" {
+				continue
+			}
+
+			var k, v string
+			if eqIdx := strings.Index(line, "="); eqIdx > 0 {
+				k = strings.TrimSpace(line[:eqIdx])
+				v = strings.TrimSpace(line[eqIdx+1:])
+				lastKey = k
+			} else {
+				if lastKey == "" {
+					continue
+				}
+				k = lastKey
+				v = line
+			}
+
+			if k != "" {
+				batch = append(batch, kv{k, v})
+			}
 		}
 
-		// Copy-on-write: load current, copy, modify, store
-		old := d.current.Load()
-		newMap := make(map[string]string, len(*old)+1)
-		for ok, ov := range *old {
-			newMap[ok] = ov
+		if len(batch) > 0 {
+			d.dispatchBatch(batch)
+			d.updateStatus(batch)
 		}
-		newMap[k] = v
-		d.current.Store(&newMap)
+	}
+}
 
-		kv := [2]string{k, v}
-		d.lastKV.Store(&kv)
+func (d *ValDist) dispatchThread(key, value string, thrchan chan map[string]string) {
+	select {
+	case thrchan <- map[string]string{key: value}:
+	case <-d.done:
+		return
+	}
+}
 
-		// Signal first data
-		if !d.hasData.Load() {
-			d.hasData.Store(true)
-			close(d.firstData)
+// dispatchBatch - sends batch to thread channels based on mode
+func (d *ValDist) dispatchBatch(batch []kv) {
+	var threadIdx int
+	if d.popMode == 2 {
+		// Round-robin: each kv goes to one thread
+		// Except if the key starts with '_', ie., $_key$
+		// Keys with this format are always broadcasted to threads and never consumed
+		// Its value can be updated as normal key, although.
+		for _, item := range batch {
+			if item.k[1] == '_' {
+				for threadIdx = range len(d.threadChans) {
+					d.dispatchThread(item.k, item.v, d.threadChans[threadIdx])
+				}
+			} else {
+				idx := d.rrIndex.Add(1) - 1
+				threadIdx = int(idx % uint64(len(d.threadChans)))
+				d.dispatchThread(item.k, item.v, d.threadChans[threadIdx])
+			}
+		}
+	} else {
+		// Broadcast: each kv goes to ALL threads
+		for _, item := range batch {
+			for threadIdx = range len(d.threadChans) {
+				d.dispatchThread(item.k, item.v, d.threadChans[threadIdx])
+			}
 		}
 	}
 }
@@ -151,14 +241,8 @@ func (d *ValDist) Stop() {
 	}
 }
 
-// Get - returns current values (lock-free via atomic pointer)
-func (d *ValDist) Get() map[string]string {
-	p := d.current.Load()
-	if p == nil {
-		return nil
-	}
-	return *p
-}
+// Bunch of functions as one line for simplicity for multiples uses
+//  golang will inline it :)
 
 // WaitFirst - blocks until first valid k=v received
 func (d *ValDist) WaitFirst() {
@@ -184,15 +268,20 @@ func (d *ValDist) IsFifo() bool {
 	return d.fifoPath != ""
 }
 
+// IsStatic - returns true if static k=v mode (no FIFO)
+func (d *ValDist) IsStatic() bool {
+	return d.fifoPath == "" && d.threadChans == nil
+}
+
+// StaticKV - returns static k=v if in static mode
+func (d *ValDist) StaticKV() (string, string) {
+	if !d.IsStatic() {
+		return "", ""
+	}
+	return d.LastKV()
+}
+
 // Path - returns FIFO path
 func (d *ValDist) Path() string {
 	return d.fifoPath
-}
-
-// applyVals - replaces all keys in req with values from map
-func applyVals(req string, vals map[string]string) string {
-	for k, v := range vals {
-		req = strings.ReplaceAll(req, k, v)
-	}
-	return req
 }

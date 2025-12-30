@@ -171,19 +171,23 @@ func (sc *StatsCollector) SetFifoWaiting(waiting bool) {
 
 // worker - consumes events and updates UI periodically
 func (sc *StatsCollector) worker() {
-	ticker := time.NewTicker(500 * time.Microsecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+
+	ticks := 0
 
 	for {
 		select {
 		case <-sc.quitCh:
 			return
-
 		case event := <-sc.eventCh:
 			sc.processEvent(event)
-
 		case <-ticker.C:
 			sc.pushUpdate()
+			ticks++
+			if ticks == 10 { // after 1 second of execution, increase the tick
+				ticker.Reset(500 * time.Millisecond)
+			}
 		}
 	}
 }
