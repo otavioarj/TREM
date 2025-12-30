@@ -170,8 +170,8 @@ Threads synchronize at a barrier before sending the first request simultaneously
 
 Each line extracts values from response N to use in request N+1, using Golang valid Regular Expressions, example:
 ```
-regex1`:key1 $ regex2`:key2
-regex3`:key3
+proof%3D([a-zA-Z0-9%._\-]+?)%26`:proof $ location%3Dhttps%3A%2F%2F([A-Za-z0-9.\-]+)%2F`:host $ location%3Dhttps%3A%2F%2F[A-Za-z0-9.\-]+(%2F.+)"`:url
+"access_token":"([^"]+)"`:bearer
 ```
 
 - Use backtick (`) before colon
