@@ -118,7 +118,7 @@ func main() {
 	touFlag := flag.Int("tou", 500, "TLS timeout in ms.")
 	retryFlag := flag.Int("retry", 3, "Max retries on errors.")
 	verboseFlag := flag.Bool("v", false, "Verbose output.")
-	swFlag := flag.Int("sw", 0, "Stats window size (0=auto: 10 normal, 50 verbose).")
+	swFlag := flag.Int("sw", 10, "Stats window size (0=auto: 10 normal, 50 verbose).")
 	httpFlag := flag.Bool("http2", false, "Use HTTP2, default false uses HTTP 1.1.")
 	fwFlag := flag.Bool("fw", true, "FIFO wait: block until first value is written to the named-pipe.")
 	fmodeFlag := flag.Int("fmode", 2, "FIFO mode: \n1. Broadcast, all threads receives same values from FIFO. \n2. Round-robin "+
@@ -134,12 +134,11 @@ func main() {
 
 	// Stats collection window size, ie., how many request/packs counted to generated delay/jitter etc.
 	windowSize := *swFlag
-	if windowSize <= 0 {
-		if verbose {
-			windowSize = 50
-		} else {
-			windowSize = 10
-		}
+
+	if verbose && windowSize < 50 {
+		windowSize = 50
+	} else if windowSize < 1 {
+		windowSize = 10
 	}
 
 	PrintLogo()

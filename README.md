@@ -9,6 +9,7 @@ Race conditions occur when multiple operations access shared resources without p
 ### Attack Scenarios
 
 **Classic Race Conditions (Sync Mode)**
+
 Multiple threads establish connections, synchronize at a barrier, then fire requests simultaneously. Exploiting classical TOCTOU (Time-of-Check to Time-of-Use) vulnerabilities in:
 - Double-spend in financial transactions
 - Coupon/voucher redemption bypass
@@ -25,12 +26,14 @@ Default mode, it abuses in high-throughput race conditions, aiming to cause havo
 - Business logic abuse: High-speed coupon redemption, inventory manipulation without sync timing, leading to corruption of state status at any coupon/inventory manipulation
 
 **Rate Limiter & WAF Bypass**
+
 Abuse the timing window between request arrival and counter increment. When N requests arrive within the same processing window, the rate limiter may count them as fewer attempts than actual, allowing:
 - Bypass of login attempt limits
 - Circumvention of API throttling
 - Evasion of brute-force protections
 
 **Password Spray & Brute-Force Racing**
+
 Via FIFO-based value distribution, TREM injects credentials at wire speed while exploiting race windows in authentication systems. A WAF configured for "5 attempts per minute" may allow 50+ attempts if requests arrive faster than the counter synchronization interval.
 
 ### Computational Efficiency
@@ -61,7 +64,7 @@ go mod tidy
 go build
 
 # Release build :)
-go build -ldflags="-s -w"
+go build -ldflags="-s -w" -trimpath
 ```
 
 ## Usage
@@ -128,7 +131,7 @@ TREM supports HTTP/2 natively. Request files remain in HTTP/1.1 raw format - TRE
 - Body sent as DATA frames
 - TLS ALPN set to `h2`
 
-**Intented Limitations:**
+**Intended Limitations:**
 - Flow control assumes server window ≥ 64KB
 - Server push (PUSH_PROMISE) frames discarded
 
@@ -141,7 +144,7 @@ TREM supports HTTP/2 natively. Request files remain in HTTP/1.1 raw format - TRE
 
 ### Async Mode (default)
 
-Each thread processes requests independently without synchronization. Best for high-throughput testing.
+Each thread processes requests independently without synchronization. Best for high-throughput race condition exploitation.
 
 ```bash
 ./trem -l "login.txt,action.txt" -re patterns.txt -th 5 -mode async
@@ -149,7 +152,7 @@ Each thread processes requests independently without synchronization. Best for h
 
 ### Sync Mode
 
-Threads synchronize at a barrier before sending the first request simultaneously. Essential for race condition exploitation.
+Threads synchronize at a barrier before sending the first request simultaneously. Essential for classical race condition exploitation.
 
 ```bash
 ./trem -l "login.txt,race.txt" -re patterns.txt -th 10 -mode sync
@@ -165,7 +168,7 @@ Threads synchronize at a barrier before sending the first request simultaneously
 
 ### Pattern File Format
 
-Each line extracts values from response N to use in request N+1:
+Each line extracts values from response N to use in request N+1, using Golang valid Regular Expressions, example:
 ```
 regex1`:key1 $ regex2`:key2
 regex3`:key3
@@ -245,7 +248,7 @@ qwerty
 123456
 ```
 
-The first line defines the key (`$pass$`), subsequent lines are values for that key. Each value of $pass$ generates a new request when matching and replacing the key in a given request.
+The first line defines the key (`$pass$`), subsequent lines are values for that key. Each value of `$pass$` generates a new request when matching and replacing the key in a given request.
 
 ### FIFO Distribution Modes (`-fmode`)
 
@@ -344,12 +347,12 @@ Route traffic through HTTP proxy (e.g., Burp Suite):
 ./trem -l "req1.txt,req2.txt" -re patterns.txt -px http://127.0.0.1:8080
 ```
 
-## Thread Output Dump
+## Thread Tabs Output Dump
 
-Save all thread output to files for post-analysis:
+Save all thread Tabs output (TUI) to files for post-analysis:
 
 ```bash
-./trem -l "req1.txt,req2.txt" -re patterns.txt -dump
+./trem -l "req1.txt,req2.txt" -re patterns.txt -th 2 -dump
 ```
 
 Creates files: `thr0_15-30.txt`, `thr1_15-30.txt`, etc.
@@ -371,7 +374,7 @@ Outputs:
 
 ## Stats Panel
 
-Real-time metrics in the UI:
+Real-time metrics in the UI, it uses a windows of events (-sw) to control how many events are collected to display metrics, e.g., `-sw 25` will use 25 events (i.e., request sent) to display, default is 10, normal mode, although it can be increased to better granularity if needed. When using verbose mode (`-v`) windows size is set to 50 if `-sw` is lower than 50.
 
 **Normal mode:**
 - Req/s: requests per second
