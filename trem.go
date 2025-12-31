@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.4.4"
+var version = "v1.4.5"
 
 // Verbose mode flag
 var verbose bool
