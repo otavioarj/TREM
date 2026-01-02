@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,7 +17,7 @@ import (
 )
 
 // Release :)
-var version = "v1.4.5"
+var version = "v1.5.0"
 
 // Verbose mode flag
 var verbose bool
@@ -56,7 +57,9 @@ type monkey struct {
 	localBuffer map[string][]string    // accumulated values for consumption
 }
 
-// Orch - orchestrator for sync/async modes
+// Orch - orchestrator for sync/async modes: most of this are just flags passed as struct
+//
+//	avoiding long call params or globals
 type Orch struct {
 	mode          string
 	monkeys       []*monkey
@@ -76,10 +79,11 @@ type Orch struct {
 	tlsTimeout    time.Duration
 	tlsCert       *utls.Certificate
 	maxRetries    int
-	httpH2        bool // HTTP is HTTP2?
-	valDist       *ValDist
-	fifoWait      bool // wait for first FIFO data before starting workers
+	httpH2        bool     // HTTP is HTTP2?
+	valDist       *ValDist // FIFO Value distributor struct
+	fifoWait      bool     // wait for first FIFO data before starting workers
 	// Sync barrier
+	syncBarriers map[int]bool // request indices that trigger barrier (0-based)
 	barrierMu    sync.Mutex
 	barrierCount int
 }
@@ -89,6 +93,25 @@ var httpVersionRe = regexp.MustCompile(`HTTP/\d+\.\d+`)
 
 // Config summit banner for stats window
 var configBanner string
+
+// parseSyncBarriers - parses "-sb 1,2,3" into map[int]bool (0-based indices)
+func parseSyncBarriers(sb string) map[int]bool {
+	barriers := make(map[int]bool)
+	if sb == "" {
+		return barriers
+	}
+	parts := strings.Split(sb, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if idx, err := strconv.Atoi(p); err == nil {
+			if idx == 0 {
+				idx = 1
+			}
+			barriers[idx-1] = true // convert to 0-based
+		}
+	}
+	return barriers
+}
 
 func main() {
 	flag.Usage = func() {
@@ -125,6 +148,7 @@ func main() {
 		"Queue, each value is sent sequentially per thread, i.e, as in a ring.")
 	mtlsFlag := flag.String("mtls", "", "Client Certificate (mTLS) for TLS, format /path/file.pk12:pass .")
 	dumpFlag := flag.Bool("dump", false, "Dump thread output to files (thr<ID>_<H-M>.txt).")
+	sbFlag := flag.String("sb", "1", "Sync barrier: comma-separated request indices (1-based) for synchronization in sync mode.")
 	flag.Parse()
 
 	configBanner = FormatConfig(*thrFlag, *delayFlag, *loopStartFlag, *loopTimesFlag, *cliFlag, *touFlag,
@@ -171,6 +195,9 @@ func main() {
 	if len(allPatterns) < len(reqFiles)-1 {
 		exitErr(fmt.Sprintf("regex file must have %d lines, got %d", len(reqFiles)-1, len(allPatterns)))
 	}
+
+	// Parse sync barriers
+	syncBarriers := parseSyncBarriers(*sbFlag)
 
 	// Init UI
 	ui := NewUIManager(*thrFlag, *dumpFlag)
@@ -236,6 +263,7 @@ func main() {
 		httpH2:        *httpFlag,
 		valDist:       valDist,
 		fifoWait:      *fwFlag && valDist.IsFifo(),
+		syncBarriers:  syncBarriers,
 	}
 
 	if *mtlsFlag != "" {
@@ -351,7 +379,7 @@ func main() {
 	defer ui.app.Stop()
 }
 
-// runWorker - executes request chain for single monkey
+// runWorker - executes request chain for single monkey (unified sync/async)
 func (o *Orch) runWorker(w *monkey) {
 	defer o.wg.Done()
 	defer o.closeWorkerConn(w)
@@ -369,176 +397,54 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 	}
 
-	if o.mode == "sync" {
-		raw, err := os.ReadFile(w.reqFiles[0])
-		if err != nil {
-			w.logger.Write(fmt.Sprintf("ERR: read file: %v\n", err))
+	// Execute request chain
+	for i := 0; i < len(w.reqFiles); i++ {
+		if err := o.processReq(w, i); err != nil {
+			w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
 			return
 		}
-		baseReq := string(raw)
+		time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
+	}
 
-		// Handle FIFO values for first request
-		var req string
-		if o.valDist.IsStatic() {
-			k, v := o.valDist.StaticKV()
-			req = strings.ReplaceAll(baseReq, k, v)
-		} else if o.valDist.IsFifo() {
-			drainChannel(w)
-			keys := extractKeys(baseReq)
-			if len(keys) > 0 && o.fifoWait {
-				if !waitForKeys(w, keys, o.quitChan) {
-					w.logger.Write("ERR: FIFO closed while waiting\n")
-					return
-				}
-			}
-			// Apply first available values
-			req = baseReq
-			for _, k := range keys {
-				if len(w.localBuffer[k]) > 0 {
-					req = strings.ReplaceAll(req, k, w.localBuffer[k][0])
-					w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, w.localBuffer[k][0]))
-				}
-			}
-		} else {
-			req = baseReq
-		}
-
-		req = normalizeRequest(req)
-
-		addr, err := parseHost(req, o.hostFlag)
-		if err != nil {
-			w.logger.Write(fmt.Sprintf("ERR: parse host: %v\n", err))
-			return
-		}
-
-		w.logger.Write(fmt.Sprintf("Connecting: %s\n", addr))
-
-		// Dial and populate w.conn or w.h2conn based on o.httpVer
-		if err := o.dialWithRetry(w, addr); err != nil {
-			w.logger.Write(fmt.Sprintf("ERR: dial: %v\n", err))
-			return
-		}
-
-		o.readyChan <- w.id
-		w.logger.Write("Ready, waiting for sync...\n")
-
-		<-o.startChan
-		w.logger.Write("Sync start!\n")
-
-		resp, status, err := o.sendWithReconnect(w, []byte(req), addr)
-		if err != nil {
-			w.logger.Write(fmt.Sprintf("ERR: send: %v\n", err))
-			return
-		}
-		w.logger.Write(fmt.Sprintf("HTTP %s\n", status))
-		w.prevResp = resp
-
-		// Close if not keepalive (HTTP/1.1 only, H2 always reuses)
-		if !o.keepAlive && !o.httpH2 {
-			o.closeWorkerConn(w)
-		}
-
-		for i := 1; i < len(w.reqFiles); i++ {
-			if o.loopStart > 0 && i == o.loopStart-1 {
-				w.loopStartReq = ""
-				w.loopStartAddr = addr
+	// Loop handling
+	if o.loopStart > 0 {
+		loopCount := 0
+		for {
+			if o.loopTimes > 0 && loopCount >= o.loopTimes {
+				break
 			}
 
-			if err := o.processReq(w, i, addr); err != nil {
-				w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
+			select {
+			case <-o.quitChan:
 				return
+			default:
 			}
-			time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
-		}
 
-		if o.loopStart > 0 {
-			loopCount := 0
-			for {
+			// Sync mode: wait for loop signal
+			if o.mode == "sync" {
 				select {
 				case <-o.quitChan:
 					return
 				case <-o.loopChan:
-					w.prevResp = ""
-					o.readyChan <- w.id
-					<-o.startChan
-
-					loopCount++
-					if o.loopTimes == 0 {
-						w.logger.Write(fmt.Sprintf("\n[Loop %d]\n", loopCount))
-					} else {
-						w.logger.Write(fmt.Sprintf("\n[Loop %d/%d]\n", loopCount, o.loopTimes))
-					}
-
-					resp, status, err := o.sendWithReconnect(w, []byte(w.loopStartReq), w.loopStartAddr)
-					if err != nil {
-						w.logger.Write(fmt.Sprintf("ERR: loop send: %v\n", err))
-						return
-					}
-					w.logger.Write(fmt.Sprintf("HTTP %s\n", status))
-					w.prevResp = resp
-
-					for i := o.loopStart; i < len(w.reqFiles); i++ {
-						if err := o.processReq(w, i, w.loopStartAddr); err != nil {
-							w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
-							return
-						}
-						time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
-					}
 				}
 			}
-		}
-	} else {
-		// Async mode
-		for i := 0; i < len(w.reqFiles); i++ {
-			if o.loopStart > 0 && i == o.loopStart-1 {
-				w.loopStartReq = ""
-				w.loopStartAddr = ""
+
+			loopCount++
+			if o.loopTimes == 0 {
+				w.logger.Write(fmt.Sprintf("\n[Loop %d]\n", loopCount))
+			} else {
+				w.logger.Write(fmt.Sprintf("\n[Loop %d/%d]\n", loopCount, o.loopTimes))
 			}
 
-			if err := o.processReqAsync(w, i); err != nil {
-				w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
-				return
-			}
-			time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
-		}
+			w.prevResp = ""
 
-		if o.loopStart > 0 {
-			loopCount := 0
-			for {
-				if o.loopTimes > 0 && loopCount >= o.loopTimes {
-					break
-				}
-
-				select {
-				case <-o.quitChan:
-					return
-				default:
-				}
-
-				loopCount++
-				if o.loopTimes == 0 {
-					w.logger.Write(fmt.Sprintf("\n[Loop %d]\n", loopCount))
-				} else {
-					w.logger.Write(fmt.Sprintf("\n[Loop %d/%d]\n", loopCount, o.loopTimes))
-				}
-
-				w.prevResp = ""
-
-				resp, status, err := o.sendWithRetry(w, []byte(w.loopStartReq), w.loopStartAddr)
-				if err != nil {
-					w.logger.Write(fmt.Sprintf("ERR: loop send: %v\n", err))
+			// Execute loop requests
+			for i := o.loopStart - 1; i < len(w.reqFiles); i++ {
+				if err := o.processReq(w, i); err != nil {
+					w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
 					return
 				}
-				w.logger.Write(fmt.Sprintf("HTTP %s\n", status))
-				w.prevResp = resp
-
-				for i := o.loopStart; i < len(w.reqFiles); i++ {
-					if err := o.processReqAsync(w, i); err != nil {
-						w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
-						return
-					}
-					time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
-				}
+				time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
 			}
 		}
 	}

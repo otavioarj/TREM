@@ -113,8 +113,35 @@ func (o *Orch) prepareReqBase(w *monkey, idx int) (string, error) {
 	return req, nil
 }
 
-// processReq - sync mode: handles single req in chain with FIFO combinations
-func (o *Orch) processReq(w *monkey, idx int, addr string) error {
+// doBarrier - handles sync barrier: dial and wait for all threads
+// Returns addr for subsequent sends
+func (o *Orch) doBarrier(w *monkey, idx int, addr string) error {
+	// Dial if not connected or addr changed
+	if w.conn == nil && w.h2conn == nil {
+		w.logger.Write(fmt.Sprintf("Connecting: %s\n", addr))
+		if err := o.dialWithRetry(w, addr); err != nil {
+			return fmt.Errorf("dial: %v", err)
+		}
+	} else if addr != w.connAddr {
+		// Address changed, reconnect
+		o.closeWorkerConn(w)
+		w.logger.Write(fmt.Sprintf("Reconnecting: %s\n", addr))
+		if err := o.dialWithRetry(w, addr); err != nil {
+			return fmt.Errorf("dial: %v", err)
+		}
+	}
+
+	// Signal ready and wait for barrier release
+	o.readyChan <- w.id
+	w.logger.Write("Ready, waiting sync...\n")
+	<-o.startChan
+	w.logger.Write("Sync!\n")
+
+	return nil
+}
+
+// processReq - unified request processor for sync/async modes with FIFO combinations
+func (o *Orch) processReq(w *monkey, idx int) error {
 	baseReq, err := o.prepareReqBase(w, idx)
 	if err != nil {
 		return err
@@ -124,44 +151,75 @@ func (o *Orch) processReq(w *monkey, idx int, addr string) error {
 	if o.valDist.IsStatic() {
 		k, v := o.valDist.StaticKV()
 		req := strings.ReplaceAll(baseReq, k, v)
-		return o.sendSyncReq(w, idx, req, addr)
+		addr, err := parseHost(req, o.hostFlag)
+		if err != nil {
+			return err
+		}
+		// Barrier if sync mode and this idx triggers it
+		if o.mode == "sync" && o.syncBarriers[idx] {
+			if err := o.doBarrier(w, idx, addr); err != nil {
+				return err
+			}
+		}
+		return o.sendReq(w, idx, req, addr)
 	}
-	// Handle FIFO mode
-	// Drain channel first
+
+	// Handle FIFO mode - drain channel first
 	drainChannel(w)
 
 	// Extract keys needed from request
 	keys := extractKeys(baseReq)
 	if len(keys) == 0 {
 		// No FIFO keys, just send
-		return o.sendSyncReq(w, idx, baseReq, addr)
+		addr, err := parseHost(baseReq, o.hostFlag)
+		if err != nil {
+			return err
+		}
+		if o.mode == "sync" && o.syncBarriers[idx] {
+			if err := o.doBarrier(w, idx, addr); err != nil {
+				return err
+			}
+		}
+		return o.sendReq(w, idx, baseReq, addr)
 	}
-	// Check for missing keys now
-	missing := checkMissingKeys(w.localBuffer, keys)
 
+	// Check for missing keys
+	missing := checkMissingKeys(w.localBuffer, keys)
 	if len(missing) > 0 {
 		if o.fifoWait {
 			// Block waiting, waitForKeys will emit periodic messages
 			if !waitForKeys(w, keys, o.quitChan) {
-				w.logger.Write("FIFO closed while waiting for keys")
+				w.logger.Write("FIFO closed while waiting for keys\n")
 				return nil
 			}
 		} else {
 			// Warn and continue without substitution
 			for _, k := range missing {
-				w.logger.Write(fmt.Sprintf("Key %s not found in FIFO, sending anyway!!\n", k))
+				w.logger.Write(fmt.Sprintf("Key %s not found in FIFO, sending anyway!\n", k))
 			}
 		}
 	}
 
-	// Generate combinations: each key creates=value a new request
-	//  PER original requestN.txt file!
+	// Generate combinations: each key=value creates a new request
+	// PER original requestN.txt file!
 	combinations := generateCombinations(w.localBuffer, keys)
 	if len(combinations) == 0 {
 		// No values available, send as-is (will likely fail regex check)
-		return o.sendSyncReq(w, idx, baseReq, addr)
+		addr, err := parseHost(baseReq, o.hostFlag)
+		if err != nil {
+			return err
+		}
+		if o.mode == "sync" && o.syncBarriers[idx] {
+			if err := o.doBarrier(w, idx, addr); err != nil {
+				return err
+			}
+		}
+		return o.sendReq(w, idx, baseReq, addr)
 	}
+
 	// Send request for each combination
+	// Barrier triggers on FIRST combination only
+	firstReq := true
 	for _, combo := range combinations {
 		req := baseReq
 		for k, v := range combo {
@@ -169,28 +227,55 @@ func (o *Orch) processReq(w *monkey, idx int, addr string) error {
 			w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, v))
 		}
 
-		if err := o.sendSyncReq(w, idx, req, addr); err != nil {
+		addr, err := parseHost(req, o.hostFlag)
+		if err != nil {
+			return err
+		}
+
+		// Barrier only on first request of combinations
+		if firstReq && o.mode == "sync" && o.syncBarriers[idx] {
+			if err := o.doBarrier(w, idx, addr); err != nil {
+				return err
+			}
+			firstReq = false
+		}
+
+		if err := o.sendReq(w, idx, req, addr); err != nil {
 			return err
 		}
 	}
+
 	// Consume used values
 	consumeValues(w.localBuffer, keys)
 	return nil
 }
 
-// sendSyncReq - sends single request in sync mode
-func (o *Orch) sendSyncReq(w *monkey, idx int, req string, addr string) error {
+// sendReq - unified request sender for both sync/async modes
+func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 	req = normalizeRequest(req)
-	// Save loop start req if this is the loop start point
+
+	// Save loop start req and addr if this is the loop start point
 	if o.loopStart > 0 && idx == o.loopStart-1 {
 		w.loopStartReq = req
+		w.loopStartAddr = addr
 	}
 
 	var resp, status string
 	var err error
-	if o.keepAlive {
+
+	if o.keepAlive || o.httpH2 {
+		// Keep-alive: reconnect if addr changed or not connected
+		if addr != w.connAddr || (w.conn == nil && w.h2conn == nil) {
+			o.closeWorkerConn(w)
+			w.logger.Write(fmt.Sprintf("Conn: %s\n", addr))
+			if err := o.dialWithRetry(w, addr); err != nil {
+				return fmt.Errorf("dial: %v", err)
+			}
+		}
 		resp, status, err = o.sendWithReconnect(w, []byte(req), addr)
 	} else {
+		// No keep-alive: new connection each request
+		w.logger.Write(fmt.Sprintf("Conn: %s\n", addr))
 		resp, status, err = o.sendWithRetry(w, []byte(req), addr)
 	}
 
@@ -200,99 +285,12 @@ func (o *Orch) sendSyncReq(w *monkey, idx int, req string, addr string) error {
 
 	w.logger.Write(fmt.Sprintf("HTTP %s\n", status))
 	w.prevResp = resp
-	return nil
-}
 
-// processReqAsync - async mode: process req with FIFO combinations
-func (o *Orch) processReqAsync(w *monkey, idx int) error {
-	baseReq, err := o.prepareReqBase(w, idx)
-	if err != nil {
-		return err
+	// Close if not keepalive (HTTP/1.1 only, H2 always reuses)
+	if !o.keepAlive && !o.httpH2 {
+		o.closeWorkerConn(w)
 	}
 
-	// Handle static mode
-	if o.valDist.IsStatic() {
-		k, v := o.valDist.StaticKV()
-		req := strings.ReplaceAll(baseReq, k, v)
-		return o.sendAsyncReq(w, idx, req)
-	}
-	// Handle FIFO mode
-	// Drain channel first
-	drainChannel(w)
-
-	// Extract keys needed from request
-	keys := extractKeys(baseReq)
-	if len(keys) == 0 {
-		// No FIFO keys, just send
-		return o.sendAsyncReq(w, idx, baseReq)
-	}
-
-	// Check for missing keys
-	missing := checkMissingKeys(w.localBuffer, keys)
-	if len(missing) > 0 {
-		if o.fifoWait {
-			// Block waiting, waitForKeys will emit periodic messages
-			if !waitForKeys(w, keys, o.quitChan) {
-				w.logger.Write("FIFO closed while waiting for keys")
-				return nil
-			}
-		} else {
-			// Warn and continue without substitution
-			for _, k := range missing {
-				w.logger.Write(fmt.Sprintf("Key %s not found in FIFO, sending anyway\n", k))
-			}
-		}
-	}
-	// Generate combinations: each key creates=value a new request
-	//  PER original requestN.txt file!
-	combinations := generateCombinations(w.localBuffer, keys)
-	if len(combinations) == 0 {
-		// No values available, send as-is (will likely fail regex check)
-		return o.sendAsyncReq(w, idx, baseReq)
-	}
-
-	// Send request for each combination
-	for _, combo := range combinations {
-		req := baseReq
-		for k, v := range combo {
-			req = strings.ReplaceAll(req, k, v)
-			w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, v))
-		}
-
-		if err := o.sendAsyncReq(w, idx, req); err != nil {
-			return err
-		}
-	}
-
-	// Consume used values
-	consumeValues(w.localBuffer, keys)
-	return nil
-}
-
-// sendAsyncReq - sends single request in async mode
-func (o *Orch) sendAsyncReq(w *monkey, idx int, req string) error {
-	addr, err := parseHost(req, o.hostFlag)
-	if err != nil {
-		return err
-	}
-
-	req = normalizeRequest(req)
-
-	// Save loop start req and addr if this is the loop start point
-	if o.loopStart > 0 && idx == o.loopStart-1 {
-		w.loopStartReq = req
-		w.loopStartAddr = addr
-	}
-
-	w.logger.Write(fmt.Sprintf("Conn: %s\n", addr))
-
-	resp, status, err := o.sendWithRetry(w, []byte(req), addr)
-	if err != nil {
-		return err
-	}
-
-	w.logger.Write(fmt.Sprintf("HTTP %s\n", status))
-	w.prevResp = resp
 	return nil
 }
 
@@ -309,12 +307,10 @@ func loadPatterns(path string) ([][]pattern, error) {
 		patterns[i] = make([]pattern, len(parts))
 		for j, part := range parts {
 			bef, aft, found := strings.Cut(part, "`:")
-			//fmt.Print(bef+" "+ aft+" "+part+"\n")
 			if !found {
 				return nil, errors.New("invalid regex line: " + line)
 			}
 			r, err := regexp.Compile(bef)
-			//fmt.Println(r)
 			if err != nil {
 				return nil, err
 			}
