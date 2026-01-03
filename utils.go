@@ -3,10 +3,32 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// Action types for response actions
+const (
+	ActionPrintThread = iota // pt - print + pause thread
+	ActionPrintAll           // pa - print all + pause all
+	ActionSaveReq            // sre - save request + pause thread
+	ActionSaveResp           // srp - save response + pause thread
+	ActionSaveAll            // sa - save both + pause thread
+	ActionExit               // e - graceful exit
+)
+
+type respAction struct {
+	actionType int
+	arg        string // msg or path (empty for 'e')
+}
+
+type actionPattern struct {
+	re      *regexp.Regexp
+	actions []respAction
+}
 
 // Pre-compiled regex for parseHost
 var hostHeaderRe = regexp.MustCompile(`(?im)^Host:\s*([^:\r\n]+)(?::(\d+))?`)
@@ -404,4 +426,231 @@ func parseProxyAddr(proxy string) (string, error) {
 		proxy = proxy[:idx]
 	}
 	return proxy, nil
+}
+
+// parseIndexList - parses "1,2,4" into map[int]bool (0-based indices)
+// Returns error if empty or invalid
+func parseIndexList(s string) (map[int]bool, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, errors.New("index list cannot be empty")
+	}
+	indices := make(map[int]bool)
+	parts := strings.Split(s, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		idx, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid index: %s", p)
+		}
+		if idx < 1 {
+			return nil, fmt.Errorf("index must be >= 1: %d", idx)
+		}
+		indices[idx-1] = true // convert to 0-based
+	}
+	if len(indices) == 0 {
+		return nil, errors.New("index list cannot be empty")
+	}
+	return indices, nil
+}
+
+// loadActionPatterns - loads and parses -ra file
+// Format per line: 1,2,4`regex`:action1,action2
+// Returns map[idx]*actionPattern (one pattern per idx)
+func loadActionPatterns(path string) (map[int]*actionPattern, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read action file: %v", err)
+	}
+
+	result := make(map[int]*actionPattern)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+
+	for lineNum, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Parse: indices`regex`:actions
+		// Find first backtick for indices
+		btIdx := strings.IndexByte(line, '`')
+		if btIdx < 1 {
+			return nil, fmt.Errorf("line %d: missing indices before regex", lineNum+1)
+		}
+
+		// Parse indices
+		indices, err := parseIndexList(line[:btIdx])
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %v", lineNum+1, err)
+		}
+
+		// Find closing backtick and colon
+		rest := line[btIdx+1:]
+		btEnd := strings.IndexByte(rest, '`')
+		if btEnd < 1 {
+			return nil, fmt.Errorf("line %d: missing closing backtick for regex", lineNum+1)
+		}
+
+		regexStr := rest[:btEnd]
+		rest = rest[btEnd+1:]
+
+		if len(rest) < 2 || rest[0] != ':' {
+			return nil, fmt.Errorf("line %d: missing ':' after regex", lineNum+1)
+		}
+		rest = rest[1:] // skip ':'
+
+		// Compile regex
+		re, err := regexp.Compile(regexStr)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: invalid regex: %v", lineNum+1, err)
+		}
+
+		// Parse actions
+		actions, err := parseActions(rest)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %v", lineNum+1, err)
+		}
+
+		// Create pattern
+		ap := &actionPattern{
+			re:      re,
+			actions: actions,
+		}
+
+		// Assign to each index (error if duplicate)
+		for idx := range indices {
+			if result[idx] != nil {
+				return nil, fmt.Errorf("line %d: duplicate action for index %d", lineNum+1, idx+1)
+			}
+			result[idx] = ap
+		}
+	}
+
+	return result, nil
+}
+
+// parseActions - parses "pt("msg"),sre("/path"),e" into []respAction
+func parseActions(s string) ([]respAction, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, errors.New("actions cannot be empty")
+	}
+
+	var actions []respAction
+	// Split by comma, but careful with commas inside quotes
+	// Use state machine approach
+	i := 0
+	for i < len(s) {
+		// Skip whitespace
+		for i < len(s) && s[i] == ' ' {
+			i++
+		}
+		if i >= len(s) {
+			break
+		}
+
+		// Find action type
+		var actionType int
+		var needsArg bool
+		var consumed int
+
+		switch {
+		case strings.HasPrefix(s[i:], "pt("):
+			actionType = ActionPrintThread
+			needsArg = true
+			consumed = 3
+		case strings.HasPrefix(s[i:], "pa("):
+			actionType = ActionPrintAll
+			needsArg = true
+			consumed = 3
+		case strings.HasPrefix(s[i:], "sre("):
+			actionType = ActionSaveReq
+			needsArg = true
+			consumed = 4
+		case strings.HasPrefix(s[i:], "srp("):
+			actionType = ActionSaveResp
+			needsArg = true
+			consumed = 4
+		case strings.HasPrefix(s[i:], "sa("):
+			actionType = ActionSaveAll
+			needsArg = true
+			consumed = 3
+		case s[i] == 'e':
+			actionType = ActionExit
+			needsArg = false
+			consumed = 1
+		default:
+			return nil, fmt.Errorf("unknown action at position %d: %s", i, s[i:])
+		}
+
+		i += consumed
+
+		var arg string
+		if needsArg {
+			// Expect ("...")
+			if i >= len(s) || s[i] != '"' {
+				return nil, fmt.Errorf("expected '\"' after action at position %d", i)
+			}
+			i++ // skip opening "
+
+			// Find closing ")
+			endQuote := strings.Index(s[i:], "\")")
+			if endQuote < 0 {
+				return nil, fmt.Errorf("missing closing \"\") for action")
+			}
+			arg = s[i : i+endQuote]
+			i += endQuote + 2 // skip content + ")
+		}
+
+		actions = append(actions, respAction{
+			actionType: actionType,
+			arg:        arg,
+		})
+
+		// Skip whitespace and comma
+		for i < len(s) && s[i] == ' ' {
+			i++
+		}
+		if i < len(s) && s[i] == ',' {
+			i++
+		}
+	}
+
+	if len(actions) == 0 {
+		return nil, errors.New("no valid actions found")
+	}
+
+	return actions, nil
+}
+
+// saveToFile - saves content to file with _idx_epoch suffix
+func saveToFile(basePath string, idx int, content string) error {
+	epoch := time.Now().Unix()
+	var finalPath string
+
+	dotIdx := strings.LastIndexByte(basePath, '.')
+	if dotIdx > 0 {
+		// Insert before extension: /path/file.txt -> /path/file_idx_epoch.txt
+		finalPath = fmt.Sprintf("%s_%d_%d%s", basePath[:dotIdx], idx, epoch, basePath[dotIdx:])
+	} else {
+		// No extension: /path/file -> /path/file_idx_epoch
+		finalPath = fmt.Sprintf("%s_%d_%d", basePath, idx, epoch)
+	}
+
+	return os.WriteFile(finalPath, []byte(content), 0644)
+}
+
+// formatH2ResponseAsH1 - converts H2 response headers to HTTP/1.1 format
+func formatH2ResponseAsH1(resp string, status string) string {
+	// H2 response from readResponse is already: "header: value\r\n...\r\n\r\nbody"
+	// Just prepend HTTP/1.1 status line
+	return fmt.Sprintf("HTTP/1.1 %s OK\r\n%s", status, resp)
 }

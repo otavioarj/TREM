@@ -286,6 +286,13 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 	w.logger.Write(fmt.Sprintf("HTTP %s\n", status))
 	w.prevResp = resp
 
+	// Apply response actions if pattern matches
+	if w.actionPatterns != nil {
+		if err := o.applyResponseActions(w, idx, req, resp, status); err != nil {
+			return err
+		}
+	}
+
 	// Close if not keepalive (HTTP/1.1 only, H2 always reuses)
 	if !o.keepAlive && !o.httpH2 {
 		o.closeWorkerConn(w)
@@ -318,4 +325,77 @@ func loadPatterns(path string) ([][]pattern, error) {
 		}
 	}
 	return patterns, nil
+}
+
+// applyResponseActions - applies response actions if pattern matches
+// Returns error on exit action or save failure
+func (o *Orch) applyResponseActions(w *monkey, idx int, req, resp, status string) error {
+	ap := w.actionPatterns[idx]
+	if ap == nil {
+		return nil
+	}
+
+	// Check if regex matches response
+	if !ap.re.MatchString(resp) {
+		return nil
+	}
+
+	w.logger.Write(fmt.Sprintf("Action match at idx %d\n", idx+1))
+
+	// Execute actions in order
+	for _, action := range ap.actions {
+		switch action.actionType {
+		case ActionPrintThread:
+			o.pauseThread(w, action.arg)
+
+		case ActionPrintAll:
+			o.pauseAllThreads(action.arg)
+
+		case ActionSaveReq:
+			if err := saveToFile(action.arg, idx, req); err != nil {
+				w.logger.Write(fmt.Sprintf("Save req error: %v\n", err))
+				return err
+			}
+			w.logger.Write(fmt.Sprintf("Saved request to %s\n", action.arg))
+			o.pauseThread(w, "Request saved")
+
+		case ActionSaveResp:
+			respToSave := resp
+			if o.httpH2 {
+				respToSave = formatH2ResponseAsH1(resp, status)
+			}
+			if err := saveToFile(action.arg, idx, respToSave); err != nil {
+				w.logger.Write(fmt.Sprintf("Save resp error: %v\n", err))
+				return err
+			}
+			w.logger.Write(fmt.Sprintf("Saved response to %s\n", action.arg))
+			o.pauseThread(w, "Response saved")
+
+		case ActionSaveAll:
+			respToSave := resp
+			if o.httpH2 {
+				respToSave = formatH2ResponseAsH1(resp, status)
+			}
+			content := req + " " + respToSave
+			if err := saveToFile(action.arg, idx, content); err != nil {
+				w.logger.Write(fmt.Sprintf("Save all error: %v\n", err))
+				return err
+			}
+			w.logger.Write(fmt.Sprintf("Saved req+resp to %s\n", action.arg))
+			o.pauseThread(w, "Request and response saved")
+
+		case ActionExit:
+			w.logger.Write("Exit action triggered\n")
+			// Graceful exit - close quitChan
+			select {
+			case <-o.quitChan:
+				// Already closed
+			default:
+				close(o.quitChan)
+			}
+			return fmt.Errorf("exit action")
+		}
+	}
+
+	return nil
 }

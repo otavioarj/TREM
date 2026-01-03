@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +45,9 @@ type monkey struct {
 	prevResp string
 	reqFiles []string
 	patterns [][]pattern
+
+	// Response action patterns (shared reference, read-only)
+	actionPatterns map[int]*actionPattern
 
 	// Cache for loop optimization
 	reqCache      []string
@@ -86,6 +88,12 @@ type Orch struct {
 	syncBarriers map[int]bool // request indices that trigger barrier (0-based)
 	barrierMu    sync.Mutex
 	barrierCount int
+	// Response action pause mechanism
+	pauseMu      sync.Mutex
+	pauseCond    *sync.Cond
+	pauseAll     bool
+	pauseThreads map[int]bool
+	uiManager    *UIManager // reference for pa broadcast
 }
 
 // Pre-compiled regex
@@ -93,25 +101,6 @@ var httpVersionRe = regexp.MustCompile(`HTTP/\d+\.\d+`)
 
 // Config summit banner for stats window
 var configBanner string
-
-// parseSyncBarriers - parses "-sb 1,2,3" into map[int]bool (0-based indices)
-func parseSyncBarriers(sb string) map[int]bool {
-	barriers := make(map[int]bool)
-	if sb == "" {
-		return barriers
-	}
-	parts := strings.Split(sb, ",")
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if idx, err := strconv.Atoi(p); err == nil {
-			if idx == 0 {
-				idx = 1
-			}
-			barriers[idx-1] = true // convert to 0-based
-		}
-	}
-	return barriers
-}
 
 func main() {
 	flag.Usage = func() {
@@ -149,6 +138,7 @@ func main() {
 	mtlsFlag := flag.String("mtls", "", "Client Certificate (mTLS) for TLS, format /path/file.pk12:pass .")
 	dumpFlag := flag.Bool("dump", false, "Dump thread output to files (thr<ID>_<H-M>.txt).")
 	sbFlag := flag.String("sb", "1", "Sync barrier: comma-separated request indices (1-based) for synchronization in sync mode.")
+	raFlag := flag.String("ra", "", "Response action file. Format per line: indices`regex`:actions")
 	flag.Parse()
 
 	configBanner = FormatConfig(*thrFlag, *delayFlag, *loopStartFlag, *loopTimesFlag, *cliFlag, *touFlag,
@@ -197,7 +187,21 @@ func main() {
 	}
 
 	// Parse sync barriers
-	syncBarriers := parseSyncBarriers(*sbFlag)
+	var syncBarriers map[int]bool
+	if *sbFlag != "" {
+		syncBarriers, err = parseIndexList(*sbFlag)
+		if err != nil {
+			exitErr(fmt.Sprintf("invalid -sb: %v", err))
+		}
+	} else {
+		syncBarriers = make(map[int]bool)
+	}
+
+	// Load response action patterns
+	actionPatterns, err := loadActionPatterns(*raFlag)
+	if err != nil {
+		exitErr(fmt.Sprintf("invalid -ra: %v", err))
+	}
 
 	// Init UI
 	ui := NewUIManager(*thrFlag, *dumpFlag)
@@ -236,12 +240,13 @@ func main() {
 	monkeys := make([]*monkey, *thrFlag)
 	for i := 0; i < *thrFlag; i++ {
 		monkeys[i] = &monkey{
-			id:          i,
-			logger:      ui.GetLogger(i),
-			reqFiles:    reqFiles,
-			patterns:    allPatterns,
-			valChan:     valDist.GetThreadChan(i),
-			localBuffer: make(map[string][]string),
+			id:             i,
+			logger:         ui.GetLogger(i),
+			reqFiles:       reqFiles,
+			patterns:       allPatterns,
+			actionPatterns: actionPatterns,
+			valChan:        valDist.GetThreadChan(i),
+			localBuffer:    make(map[string][]string),
 		}
 	}
 
@@ -264,7 +269,10 @@ func main() {
 		valDist:       valDist,
 		fifoWait:      *fwFlag && valDist.IsFifo(),
 		syncBarriers:  syncBarriers,
+		pauseThreads:  make(map[int]bool),
+		uiManager:     ui,
 	}
+	orch.pauseCond = sync.NewCond(&orch.pauseMu)
 
 	if *mtlsFlag != "" {
 		certAndPass := strings.Split(*mtlsFlag, ":")
@@ -454,6 +462,57 @@ func (o *Orch) runWorker(w *monkey) {
 		os.WriteFile(filename, []byte(w.prevResp), 0666)
 		w.logger.Write(fmt.Sprintf("Saved: %s\n", filename))
 	}
+}
+
+// checkPause - checks if thread should pause (called at strategic points)
+func (o *Orch) checkPause(w *monkey) {
+	o.pauseMu.Lock()
+	for o.pauseAll || o.pauseThreads[w.id] {
+		o.pauseCond.Wait()
+	}
+	o.pauseMu.Unlock()
+}
+
+// pauseThread - pauses single thread
+func (o *Orch) pauseThread(w *monkey, msg string) {
+	o.pauseMu.Lock()
+	o.pauseThreads[w.id] = true
+	o.pauseMu.Unlock()
+
+	w.logger.Write(fmt.Sprintf("%s\n[Pause Action - Press Enter to continue]\n", msg))
+
+	o.pauseMu.Lock()
+	for o.pauseThreads[w.id] {
+		o.pauseCond.Wait()
+	}
+	o.pauseMu.Unlock()
+}
+
+// pauseAllThreads - pauses all threads
+func (o *Orch) pauseAllThreads(msg string) {
+	o.pauseMu.Lock()
+	o.pauseAll = true
+	o.pauseMu.Unlock()
+
+	// Broadcast message to all threads
+	o.uiManager.BroadcastMessage(fmt.Sprintf("%s\n[Pause Action - Press Enter to continue]\n", msg))
+
+	o.pauseMu.Lock()
+	for o.pauseAll {
+		o.pauseCond.Wait()
+	}
+	o.pauseMu.Unlock()
+}
+
+// resumeAll - resumes all paused threads (called from UI on Enter)
+func (o *Orch) resumeAll() {
+	o.pauseMu.Lock()
+	o.pauseAll = false
+	for k := range o.pauseThreads {
+		delete(o.pauseThreads, k)
+	}
+	o.pauseCond.Broadcast()
+	o.pauseMu.Unlock()
 }
 
 func exitErr(msg string) {

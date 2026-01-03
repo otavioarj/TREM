@@ -246,6 +246,10 @@ func (ui *UIManager) SetupInputCapture(orch *Orch, monkeysFinished *bool) {
 			currentTab = (currentTab - 1 + len(ui.tabNames)) % len(ui.tabNames)
 			ui.pages.SwitchToPage(ui.tabNames[currentTab])
 			return nil
+		} else if event.Key() == tcell.KeyEnter {
+			// Resume all paused threads
+			orch.resumeAll()
+			return nil
 		} else if event.Rune() == 'q' || event.Rune() == 'Q' {
 			// Close dump files and channels
 			ui.closeDumpFiles()
