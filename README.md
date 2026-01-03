@@ -4,19 +4,19 @@ A high-performance HTTP/1.1 and HTTP/2 race condition testing tool designed for 
 
 ## Overview
 
-Race conditions occur when multiple operations access shared resources without proper synchronization, leading to unexpected behavior. TREM exploits these vulnerabilities by orchestrating multiple concurrent HTTP request chains with nanosecond-level timing precision. TREM uses a handcrafted HTTP2 and TLS state machines, by using TLS ClientHello randomization or HTTP2 server to client sync datagram ignores, it allows TLS fingerprint evasions and special HTTP2 race scenarios.
+Race conditions occur when multiple operations access shared resources without proper synchronization, leading to unexpected behavior. TREM exploits these vulnerabilities by orchestrating multiple concurrent HTTP request chains with nanosecond-level timing precision. TREM uses handcrafted [HTTP/2](#http2-support) and [TLS](#clienthello-fingerprints--cli) state machines, by using TLS ClientHello randomization or HTTP/2 server to client sync datagram ignores, it allows TLS fingerprint evasions and special HTTP/2 race scenarios.
 
 ### Attack Scenarios
 
-**Classic Race Conditions (Sync Mode)**
+**Classic Race Conditions ([Sync Mode](#sync-mode))**
 
-Multiple threads establish connections, synchronize at a barrier, then fire requests simultaneously. Exploiting classical TOCTOU (Time-of-Check to Time-of-Use) vulnerabilities in:
+Multiple threads establish connections, synchronize at a [barrier](#sync-barriers--sb), then fire requests simultaneously. Exploiting classical TOCTOU (Time-of-Check to Time-of-Use) vulnerabilities in:
 - Double-spend in financial transactions
 - Coupon/voucher redemption bypass
 - Inventory manipulation (overselling)
 - Privilege escalation via concurrent role assignment
 
-**Havoc Race Conditions (Async Mode)**
+**Havoc Race Conditions ([Async Mode](#async-mode-default))**
 
 Default mode, it abuses in high-throughput race conditions, aiming to cause havoc (_ad absurdum_) in target state machine, where each thread processes requests independently without synchronization. For instance:
 
@@ -34,7 +34,7 @@ Abuse the timing window between request arrival and counter increment. When N re
 
 **Password Spray & Brute-Force Racing**
 
-Via FIFO-based value distribution, TREM injects credentials at wire speed while exploiting race windows in authentication systems. A WAF configured for "5 attempts per minute" may allow 50+ attempts if requests arrive faster than the counter synchronization interval.
+Via [FIFO-based value distribution](#fifo-mode-dynamic-injection), TREM injects credentials at wire speed while exploiting race windows in authentication systems. A WAF configured for "5 attempts per minute" may allow 50+ attempts if requests arrive faster than the counter synchronization interval.
 
 ### Computational Efficiency
 
@@ -86,22 +86,24 @@ go build -ldflags="-s -w" -trimpath
 | `-th` | 5 | Thread count |
 | `-d` | 0 | Delay in milliseconds between requests |
 | `-o` | false | Save last response per thread as `out_<time>_t<id>.txt` |
-| `-u` | | Universal replacement: `key=val` or FIFO path (see below) |
+| `-u` | | Universal replacement: `key=val` or FIFO path (see [Universal Replacement](#universal-replacement--u)) |
 | `-px` | | HTTP proxy URL (e.g., `http://127.0.0.1:8080`) |
-| `-mode` | async | Execution mode: `sync` or `async` |
+| `-mode` | async | Execution mode: `sync` or `async` (see [Operation Modes](#operation-modes)) |
 | `-k` | true | Keep-alive: persist TLS connections across requests |
-| `-x` | 1 | Loop start index (1-based) |
+| `-x` | 1 | Loop start index (1-based, see [Looping](#looping)) |
 | `-xt` | 1 | Loop count (0 = infinite) |
-| `-cli` | 0 | TLS ClientHello fingerprint (see table below) |
+| `-cli` | 0 | TLS ClientHello fingerprint (see [table below](#clienthello-fingerprints--cli)) |
 | `-tou` | 500 | TLS handshake timeout in milliseconds |
 | `-retry` | 3 | Max retries on connection/TLS errors |
-| `-v` | false | Verbose debug output |
-| `-sw` | 0 | Stats window size (0 = auto: 10 normal, 50 verbose) |
-| `-http2` | false | Use HTTP/2 (default: HTTP/1.1) |
+| `-v` | false | Verbose debug output (see [Verbose Mode](#verbose-mode)) |
+| `-sw` | 10 | Stats window size (0 = auto: 10 normal, 50 verbose) |
+| `-http2` | false | Use HTTP/2 (default: HTTP/1.1, see [HTTP/2 Support](#http2-support)) |
 | `-fw` | true | FIFO wait: block until first value written to named pipe |
 | `-fmode` | 2 | FIFO distribution: 1=Broadcast (all threads), 2=Round-robin |
 | `-mtls` | | Client certificate for mTLS: `/path/cert.p12:password` |
 | `-dump` | false | Dump thread tab(TUI) output to files (`thr<ID>_<H-M>.txt`) |
+| `-sb` | 1 | Sync barrier indices (1-based, comma-separated, see [Sync Barriers](#sync-barriers--sb)) |
+| `-ra` | | Response action file (see [Response Actions](#response-actions--ra)) |
 
 ## ClientHello Fingerprints (`-cli`)
 
@@ -152,17 +154,167 @@ Each thread processes requests independently without synchronization. Best for h
 
 ### Sync Mode
 
-Threads synchronize at a barrier before sending the first request simultaneously. Essential for classical race condition exploitation.
+Threads synchronize at [barrier points](#sync-barriers--sb) before sending requests simultaneously. Essential for classical race condition exploitation.
 
 ```bash
 ./trem -l "login.txt,race.txt" -re patterns.txt -th 10 -mode sync
 ```
 
-**Flow:**
+**Default Flow (barrier on first request):**
 1. All threads establish TLS connections
-2. All threads wait at barrier
+2. All threads wait at barrier (request 1)
 3. Barrier releases → simultaneous request transmission
 4. Remaining requests proceed normally
+
+### Sync Barriers (`-sb`)
+
+By default, sync mode places a barrier only on the first request. Use `-sb` to specify which requests should trigger synchronization barriers.
+
+**Format:** Comma-separated list of 1-based request indices.
+
+```bash
+# Barrier only on request 1 (default)
+./trem -l "r1.txt,r2.txt,r3.txt" -re patterns.txt -mode sync
+
+# Barrier on requests 1, 2, and 3
+./trem -l "r1.txt,r2.txt,r3.txt" -re patterns.txt -mode sync -sb 1,2,3
+
+# Barrier only on requests 2 and 4
+./trem -l "r1.txt,r2.txt,r3.txt,r4.txt" -re patterns.txt -mode sync -sb 2,4
+```
+
+**Use Cases:**
+
+| Scenario | `-sb` Value | Description |
+|----------|-------------|-------------|
+| Classic race | `1` (default) | Synchronize first request only |
+| Multi-step race | `1,3` | Sync login, then sync critical action |
+| Full synchronization | `1,2,3,...` | All requests synchronized |
+| Skip login sync | `2` | Login async, sync on second request |
+
+**Example: Two-phase race condition**
+
+Testing a scenario where you need to synchronize both authentication and the vulnerable action:
+
+```bash
+./trem -l "login.txt,setup.txt,transfer.txt" -re patterns.txt -th 20 -mode sync -sb 1,3
+```
+
+**Flow:**
+1. All threads sync → send `login.txt` simultaneously
+2. Each thread processes `setup.txt` independently (no barrier)
+3. All threads sync → send `transfer.txt` simultaneously
+
+This is useful when the race condition requires both authenticated sessions established at the same time AND the vulnerable action triggered simultaneously.
+
+## Response Actions (`-ra`)
+
+Response actions allow you to execute commands when a regex matches the response at specific request indices. This enables automated detection of successful exploitation, evidence collection, and controlled termination.
+
+**Format:** Each line in the action file follows:
+```
+indices:regex`:action1, action2, ...
+```
+
+Where:
+- `indices`: Comma-separated 1-based request indices where the regex will be checked
+- `regex`: Golang regular expression to match against response
+- `actions`: One or more actions to execute on match
+
+### Available Actions
+
+| Action | Description |
+|--------|-------------|
+| `pt("msg")` | Print message to the matching thread's tab and pause that thread |
+| `pa("msg")` | Print message to ALL thread tabs and pause ALL threads |
+| `sre("path")` | Save the request that generated the match to file and pause thread |
+| `srp("path")` | Save the response that generated the match to file and pause thread |
+| `sa("path")` | Save both request and response to file and pause thread |
+| `e` | Gracefully exit the application, if can be combined with other actions, use it at the end :). |
+
+> **Note:** All save actions (`sre`, `srp`, `sa`) automatically append `_idx_epoch` to filenames to prevent overwrites. For example, `/tmp/req.txt` becomes `/tmp/req_2_1704312000.txt`. 
+>
+> Paused threads generates a message on its tab, requiring pressing **Enter** to resume paused threads.
+
+### Action File Examples
+
+**actions.txt** - Basic match detection:
+```
+2`"success"\s*:\s*true`:pt("Exploitation successful!")
+```
+
+**actions.txt** - Save evidence and exit on match:
+```
+3`"balance"\s*:\s*[1-9]\d{6}`:sa("/tmp/evidence.txt"), e
+```
+
+**actions.txt** - Multiple conditions:
+```
+2`"token"\s*:\s*"[^"]+`:pt("Got token")
+3`"error"\s*:\s*false`:sre("/tmp/winning_request.txt"), e
+```
+
+**actions.txt** - Alert all threads on critical finding:
+```
+2,3,4`"admin"\s*:\s*true`:pa("ADMIN ACCESS ACHIEVED!"), sa("/tmp/admin_poc.txt"), e
+```
+
+### Usage Examples
+
+**Detect successful race condition and save evidence:**
+```bash
+./trem -l "login.txt,race.txt" -re patterns.txt -th 20 -mode sync -ra actions.txt
+```
+
+With `actions.txt`:
+```
+2`"quantity"\s*:\s*-`:sa("/tmp/oversold.txt"), e
+```
+
+This will: match responses where quantity went negative (overselling), save both request and response as evidence, then exit.
+
+**Password spray with success detection:**
+```bash
+./trem -l "login.txt,dashboard.txt" -re patterns.txt -u /tmp/creds -th 50 -ra actions.txt
+```
+
+With `actions.txt`:
+```
+2`"authenticated"\s*:\s*true`:sre("/tmp/valid_creds.txt"), pt("Valid credentials found!"), e
+```
+
+**Multi-stage exploitation monitoring:**
+```bash
+./trem -l "auth.txt,setup.txt,exploit.txt,verify.txt" -re patterns.txt -mode sync -sb 1,3 -ra actions.txt
+```
+
+With `actions.txt`:
+```
+3`"race_won"`:pt("Race condition triggered!")
+4`"balance"\s*>\s*1000000`:sa("/tmp/jackpot.txt"), pa("JACKPOT!"), e
+```
+
+### Combining with Other Features
+
+Response actions work seamlessly with other TREM features:
+
+**With [looping](#looping):**
+```bash
+./trem -l "login.txt,race.txt" -re patterns.txt -x 2 -xt 0 -ra actions.txt
+```
+Actions are checked on every loop iteration until a match triggers exit.
+
+**With [FIFO injection](#fifo-mode-dynamic-injection):**
+```bash
+./trem -l "login.txt,action.txt" -re patterns.txt -u /tmp/spray -ra actions.txt
+```
+Each injected value is tested, and actions trigger on first successful match.
+
+**With [HTTP/2](#http2-support):**
+```bash
+./trem -l "req1.txt,req2.txt" -re patterns.txt -http2 -ra actions.txt
+```
+Saved responses are automatically converted to HTTP/1.1 format for readability.
 
 ## Request Chaining
 
@@ -323,11 +475,17 @@ Execute a subset of requests repeatedly:
 
 - `-x 2`: Loop starts from request 2 (setup.txt)
 - `-xt 100`: Run 100 iterations
-- `-xt 0`: Infinite loops (stop with Q)
+- `-xt 0`: Infinite loops (stop with Q or via [response action](#response-actions--ra) exit)
 
 **Flow:**
 1. Execute requests 1 → 3
 2. Loop 100×: requests 2 → 3
+
+**Combined with response actions:**
+```bash
+./trem -l "login.txt,race.txt" -re patterns.txt -x 2 -xt 0 -ra actions.txt
+```
+Loops infinitely until a response action triggers exit.
 
 ## mTLS Support
 
@@ -374,7 +532,7 @@ Outputs:
 
 ## Stats Panel
 
-Real-time metrics in the UI, it uses a windows of events (-sw) to control how many events are collected to display metrics, e.g., `-sw 25` will use 25 events (i.e., request sent) to display, default is 10, normal mode, although it can be increased to better granularity if needed. When using verbose mode (`-v`) windows size is set to 50 if `-sw` is lower than 50.
+Real-time metrics in the UI, it uses a windows of events (`-sw`) to control how many events are collected to display metrics, e.g., `-sw 25` will use 25 events (i.e., request sent) to display, default is 10, normal mode, although it can be increased to better granularity if needed. When using [verbose mode](#verbose-mode) (`-v`) windows size is set to 50 if `-sw` is lower than 50.
 
 **Normal mode:**
 - Req/s: requests per second
@@ -393,6 +551,7 @@ Real-time metrics in the UI, it uses a windows of events (-sw) to control how ma
 |-----|--------|
 | Tab | Next thread tab |
 | Shift+Tab | Previous thread tab |
+| Enter | Resume paused threads (see [Response Actions](#response-actions--ra)) |
 | Q | Quit (stops all threads gracefully) |
 
 ## Examples
@@ -402,19 +561,24 @@ Real-time metrics in the UI, it uses a windows of events (-sw) to control how ma
 ./trem -l "auth.txt,race.txt" -re patterns.txt -th 20 -mode sync
 ```
 
-**Password spray with FIFO:**
+**Multi-barrier sync race:**
 ```bash
-./trem -l "login.txt,dashboard.txt" -re patterns.txt -u /tmp/creds -th 50 -fmode 2
+./trem -l "login.txt,setup.txt,race.txt" -re patterns.txt -th 20 -mode sync -sb 1,3
 ```
 
-**Sustained race with keep-alive:**
+**Password spray with FIFO and success detection:**
 ```bash
-./trem -l "login.txt,setup.txt,race.txt" -re patterns.txt -th 10 -mode sync -k -x 3 -xt 0
+./trem -l "login.txt,dashboard.txt" -re patterns.txt -u /tmp/creds -th 50 -fmode 2 -ra actions.txt
 ```
 
-**HTTP/2 race condition:**
+**Sustained race with keep-alive and auto-exit on success:**
 ```bash
-./trem -l "req1.txt,req2.txt" -re patterns.txt -http2 -th 10 -mode sync
+./trem -l "login.txt,setup.txt,race.txt" -re patterns.txt -th 10 -mode sync -k -x 3 -xt 0 -ra actions.txt
+```
+
+**HTTP/2 race condition with evidence collection:**
+```bash
+./trem -l "req1.txt,req2.txt" -re patterns.txt -http2 -th 10 -mode sync -ra actions.txt
 ```
 
 **mTLS with client certificate:**
@@ -432,7 +596,7 @@ Real-time metrics in the UI, it uses a windows of events (-sw) to control how ma
 ./trem -l "req1.txt,req2.txt" -re patterns.txt -px http://127.0.0.1:8080 -dump
 ```
 
-**Infinite spray with persistent auth token:**
+**Infinite spray with persistent auth token and auto-exit:**
 ```bash
 # passwords.txt:
 # $_token$=eyJhbG...
@@ -440,5 +604,24 @@ Real-time metrics in the UI, it uses a windows of events (-sw) to control how ma
 # password
 # admin123
 
-./trem -l "verify.txt" -re patterns.txt -u /tmp/spray -th 100 -xt 0 -fmode 2
+# actions.txt:
+# 1`"success"`:sre("/tmp/winner.txt"), e
+
+./trem -l "verify.txt" -re patterns.txt -u /tmp/spray -th 100 -xt 0 -fmode 2 -ra actions.txt
+```
+
+**Complete exploitation workflow:**
+```bash
+# 1. Sync login and critical action
+# 2. Loop the exploit infinitely  
+# 3. Auto-save evidence and exit on success
+
+./trem -l "login.txt,setup.txt,exploit.txt" -re patterns.txt \
+  -th 50 -mode sync -sb 1,3 -x 2 -xt 0 \
+  -ra actions.txt
+```
+
+With `actions.txt`:
+```
+3`"exploited"\s*:\s*true`:sa("/tmp/poc.txt"), pa("SUCCESS!"), e
 ```

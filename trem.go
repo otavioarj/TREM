@@ -45,10 +45,8 @@ type monkey struct {
 	prevResp string
 	reqFiles []string
 	patterns [][]pattern
-
-	// Response action patterns (shared reference, read-only)
+	// Response action patterns (read-only per thread)
 	actionPatterns map[int]*actionPattern
-
 	// Cache for loop optimization
 	reqCache      []string
 	loopStartReq  string
@@ -60,8 +58,7 @@ type monkey struct {
 }
 
 // Orch - orchestrator for sync/async modes: most of this are just flags passed as struct
-//
-//	avoiding long call params or globals
+// avoiding long call params or globals
 type Orch struct {
 	mode          string
 	monkeys       []*monkey
@@ -88,12 +85,12 @@ type Orch struct {
 	syncBarriers map[int]bool // request indices that trigger barrier (0-based)
 	barrierMu    sync.Mutex
 	barrierCount int
-	// Response action pause mechanism
+	// Response action and pause mechanism
 	pauseMu      sync.Mutex
 	pauseCond    *sync.Cond
 	pauseAll     bool
 	pauseThreads map[int]bool
-	uiManager    *UIManager // reference for pa broadcast
+	uiManager    *UIManager // reference for pa (printAll) broadcast
 }
 
 // Pre-compiled regex
@@ -116,7 +113,7 @@ func main() {
 	outFlag := flag.Bool("o", false, "Save last response per thread.")
 	univFlag := flag.String("u", "", "Universaly replaces key=val.\nIf key=value, ie., $num$=179, will match/replace every"+
 		" $num$ (requests) to 179.\nIf a path. ie., /tmp/fifo, will create a named-pipe where other program can write key=value"+
-		"\n|-> Example of a password-spray racer: ./trem <params> -u /tmp/fifo || cat pass-spray.txt > /tmp/fifo\n"+
+		"\nExample of a password-spray racer: ./trem <params> -u /tmp/fifo || cat pass-spray.txt > /tmp/fifo\n"+
 		"    With pass-spray.txt as: $pass$=21938712\n"+
 		"                            32847832\n"+
 		"                            32473872\n"+
@@ -137,8 +134,14 @@ func main() {
 		"Queue, each value is sent sequentially per thread, i.e, as in a ring.")
 	mtlsFlag := flag.String("mtls", "", "Client Certificate (mTLS) for TLS, format /path/file.pk12:pass .")
 	dumpFlag := flag.Bool("dump", false, "Dump thread output to files (thr<ID>_<H-M>.txt).")
-	sbFlag := flag.String("sb", "1", "Sync barrier: comma-separated request indices (1-based) for synchronization in sync mode.")
-	raFlag := flag.String("ra", "", "Response action file. Format per line: indices`regex`:actions")
+	sbFlag := flag.String("sb", "1", "Sync barrier: comma-separated request indices (1-based) for barrier in sync mode.\nExample: -l r1,r2,r3,r5"+
+		" -sb 1,2,5 will use barrier for r1, r2 and r5")
+	raFlag := flag.String("ra", "", "Response action file. Applies regex on response in a given request indexes (',' separated), and then, execute actions.\nExample: "+
+		"-l r1,r2,r3 -ra ra.txt. With ra.txt as:\n  2,3:token.*`:sre(\"/tmp/req.txt\"), e \n"+
+		"Will try to match in r2 and r3 responses \"token.*\", then save request that *first* generated the match to \"/tmp/req.txt\" and exit.\n"+
+		"The following actions, are implemented:\n pa(\"msg\") - print msg on match and pause ALL threads.\n pt(\"msg\") - print msg on match and pause the thread.\n"+
+		" sr  - save request that generated the match, and pause thread.\n sre - save response that generated the match, and pause thread.\n"+
+		" sa  - save request and response that generated the match, and pause thread.\n e   - gracefully exit on match, use as last action if combined with others!")
 	flag.Parse()
 
 	configBanner = FormatConfig(*thrFlag, *delayFlag, *loopStartFlag, *loopTimesFlag, *cliFlag, *touFlag,

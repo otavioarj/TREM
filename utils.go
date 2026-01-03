@@ -458,7 +458,7 @@ func parseIndexList(s string) (map[int]bool, error) {
 }
 
 // loadActionPatterns - loads and parses -ra file
-// Format per line: 1,2,4`regex`:action1,action2
+// Format per line: 1,2,4:regex`:action1,action2
 // Returns map[idx]*actionPattern (one pattern per idx)
 func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 	if path == "" {
@@ -481,7 +481,7 @@ func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 
 		// Parse: indices`regex`:actions
 		// Find first backtick for indices
-		btIdx := strings.IndexByte(line, '`')
+		btIdx := strings.IndexByte(line, ':')
 		if btIdx < 1 {
 			return nil, fmt.Errorf("line %d: missing indices before regex", lineNum+1)
 		}
