@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -69,19 +70,24 @@ func (h *H2Conn) handshake() error {
 	if h.handshook {
 		return nil
 	}
+	file, _ := os.OpenFile("log.txt", os.O_WRONLY|os.O_CREATE, 0644)
+	defer file.Close()
 
 	// Send preface
 	if _, err := h.conn.Write(h2Preface); err != nil {
+		file.WriteString(fmt.Sprintf("[V] H2 HandShake Preface err: %v\n", err))
 		return err
 	}
 
 	// Send empty SETTINGS
 	if _, err := h.conn.Write(h2SettingsFrame); err != nil {
+		file.WriteString(fmt.Sprintf("[V] H2 E-SETTINGS err: %v\n", err))
 		return err
 	}
 
 	// Read server SETTINGS (just consume, don't process)
 	if err := h.readAndAckSettings(); err != nil {
+		file.WriteString(fmt.Sprintf("[V] H2  R-SETTINGS err: %v\n", err))
 		return err
 	}
 
@@ -119,7 +125,7 @@ func (h *H2Conn) readAndAckSettings() error {
 }
 
 // sendReqH2 - sends HTTP/2 request, returns response
-func (h *H2Conn) sendReqH2(req *ParsedReq, threadID int) (resp, status string, err error) {
+func (h *H2Conn) sendReqH2(req *ParsedReq, threadID int, waitRsp bool) (resp, status string, err error) {
 	var startTime time.Time
 	if verbose {
 		startTime = time.Now()
@@ -171,6 +177,11 @@ func (h *H2Conn) sendReqH2(req *ParsedReq, threadID int) (resp, status string, e
 		if _, err := h.conn.Write(dataFrame); err != nil {
 			return "", "", err
 		}
+	}
+
+	// Request is marked as send and forget
+	if !waitRsp {
+		return "", "", err
 	}
 
 	// Read response
@@ -362,5 +373,5 @@ func sendOnConnH2(raw []byte, h2 *H2Conn, threadID int) (resp, status string, er
 	if req == nil {
 		return "", "", fmt.Errorf("failed to parse request")
 	}
-	return h2.sendReqH2(req, threadID)
+	return h2.sendReqH2(req, threadID, true)
 }

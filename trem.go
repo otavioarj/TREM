@@ -55,6 +55,10 @@ type monkey struct {
 	// FIFO value distribution
 	valChan     chan map[string]string // receives values from ValDist
 	localBuffer map[string][]string    // accumulated values for consumption
+
+	// Static values extracted from regex patterns (keys starting with _)
+	// These persist across all requests in the chain
+	staticVals map[string]string
 }
 
 // Orch - orchestrator for sync/async modes: most of this are just flags passed as struct
@@ -81,6 +85,7 @@ type Orch struct {
 	httpH2        bool     // HTTP is HTTP2?
 	valDist       *ValDist // FIFO Value distributor struct
 	fifoWait      bool     // wait for first FIFO data before starting workers
+	fifoBlockSize int      // FIFO block consumption limit
 	// Sync barrier
 	syncBarriers map[int]bool // request indices that trigger barrier (0-based)
 	barrierMu    sync.Mutex
@@ -107,7 +112,10 @@ func main() {
 	}
 	hostFlag := flag.String("h", "", "Host:port override; default from Host header.")
 	listFlag := flag.String("l", "", "Comma-separated request RAW HTTP/1.1 files.")
-	reFlag := flag.String("re", "", "Regex definitions file. Format: regex`:key per line.")
+	reFlag := flag.String("re", "", "Regex definitions file. Format for each line: regex`:key $ regex2`:key2 ... regexK`:keyK\n"+
+		"Where line N will apply regexes on response N to populate the request N+1 $key$ placeholder.\nNote: A blank line break (\\n)"+
+		" means the given request will not wait for the response! Example, -l r1,r2,r3 -re re.txt, with re.txt as:\n"+
+		" regex1`:key1\n\n regex3`:key3\nMeans request r2 is sent and then request r3, r2 response is never read.")
 	thrFlag := flag.Int("th", 5, "Thread count.")
 	delayFlag := flag.Int("d", 0, "Delay ms between requests.")
 	outFlag := flag.Bool("o", false, "Save last response per thread.")
@@ -142,6 +150,7 @@ func main() {
 		"The following actions, are implemented:\n pa(\"msg\") - print msg on match and pause ALL threads.\n pt(\"msg\") - print msg on match and pause the thread.\n"+
 		" sr  - save request that generated the match, and pause thread.\n sre - save response that generated the match, and pause thread.\n"+
 		" sa  - save request and response that generated the match, and pause thread.\n e   - gracefully exit on match, use as last action if combined with others!")
+	fbckFlag := flag.Int("fbck", 64, "FIFO block consumption: max values to drain per request (0=unlimited).")
 	flag.Parse()
 
 	configBanner = FormatConfig(*thrFlag, *delayFlag, *loopStartFlag, *loopTimesFlag, *cliFlag, *touFlag,
@@ -250,6 +259,7 @@ func main() {
 			actionPatterns: actionPatterns,
 			valChan:        valDist.GetThreadChan(i),
 			localBuffer:    make(map[string][]string),
+			staticVals:     make(map[string]string),
 		}
 	}
 
@@ -274,6 +284,7 @@ func main() {
 		syncBarriers:  syncBarriers,
 		pauseThreads:  make(map[int]bool),
 		uiManager:     ui,
+		fifoBlockSize: *fbckFlag,
 	}
 	orch.pauseCond = sync.NewCond(&orch.pauseMu)
 
@@ -448,6 +459,17 @@ func (o *Orch) runWorker(w *monkey) {
 			}
 
 			w.prevResp = ""
+
+			// Clear buffers for fresh loop iteration
+			// Preserve $_key$ values (keys starting with _) from FIFO
+			for k := range w.localBuffer {
+				if len(k) > 1 && k[1] != '_' {
+					delete(w.localBuffer, k)
+				}
+			}
+			for k := range w.staticVals {
+				delete(w.staticVals, k)
+			}
 
 			// Execute loop requests
 			for i := o.loopStart - 1; i < len(w.reqFiles); i++ {

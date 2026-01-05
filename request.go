@@ -107,6 +107,19 @@ func (o *Orch) prepareReqBase(w *monkey, idx int) (string, error) {
 			extracted := decodeExtracted(m[1])
 			req = strings.ReplaceAll(req, "$"+p.keyword+"$", extracted)
 			w.logger.Write(fmt.Sprintf("Matched %s: %s\n", p.keyword, extracted))
+
+			// Save static values (keys starting with _) for persistence across requests
+			if len(p.keyword) > 0 && p.keyword[0] == '_' {
+				w.staticVals["$"+p.keyword+"$"] = extracted
+			}
+		}
+	}
+
+	// Apply static values (extracted from previous requests with _ prefix)
+	for k, v := range w.staticVals {
+		if strings.Contains(req, k) {
+			req = strings.ReplaceAll(req, k, v)
+			w.logger.Write(fmt.Sprintf("Static %s: %s\n", k, v))
 		}
 	}
 
@@ -164,8 +177,8 @@ func (o *Orch) processReq(w *monkey, idx int) error {
 		return o.sendReq(w, idx, req, addr)
 	}
 
-	// Handle FIFO mode - drain channel first
-	drainChannel(w)
+	// Handle FIFO mode - drain channel first (limited by fifoBlockSize)
+	drainChannel(w, o.fifoBlockSize)
 
 	// Extract keys needed from request
 	keys := extractKeys(baseReq)
@@ -190,7 +203,7 @@ func (o *Orch) processReq(w *monkey, idx int) error {
 			// Block waiting, waitForKeys will emit periodic messages
 			if !waitForKeys(w, keys, o.quitChan) {
 				w.logger.Write("FIFO closed while waiting for keys\n")
-				return nil
+				return fmt.Errorf("FIFO timeout waiting for keys: %v", missing)
 			}
 		} else {
 			// Warn and continue without substitution
@@ -250,6 +263,57 @@ func (o *Orch) processReq(w *monkey, idx int) error {
 	return nil
 }
 
+func normalizeRequest(req string) string {
+	lines := strings.Split(req, "\n")
+	var normalized []string
+	var bodyStartIndex int = -1
+	var hasEmptyLine bool
+
+	for i, line := range lines {
+		line = strings.TrimRight(line, "\r")
+		if i == 0 && !strings.Contains(line, "HTTP/") {
+			line = line + " HTTP/1.1"
+		} else if i == 0 && strings.Contains(line, "HTTP/") && !strings.Contains(line, "HTTP/1.1") {
+			line = httpVersionRe.ReplaceAllString(line, "HTTP/1.1")
+		}
+
+		normalized = append(normalized, line)
+
+		if line == "" && bodyStartIndex == -1 {
+			bodyStartIndex = i + 1
+			hasEmptyLine = true
+		}
+	}
+
+	// Ensure empty line exists after headers (before body or at end)
+	if !hasEmptyLine {
+		normalized = append(normalized, "")
+		bodyStartIndex = len(normalized)
+	}
+
+	if bodyStartIndex > 0 && bodyStartIndex < len(normalized) {
+		bodyLines := normalized[bodyStartIndex:]
+		body := strings.Join(bodyLines, "\r\n")
+		bodyLen := len([]byte(body))
+
+		foundContentLength := false
+		for i := 1; i < bodyStartIndex-1; i++ {
+			if strings.HasPrefix(strings.ToLower(normalized[i]), "content-length:") {
+				normalized[i] = fmt.Sprintf("Content-Length: %d", bodyLen)
+				foundContentLength = true
+				break
+			}
+		}
+		if !foundContentLength && bodyLen > 0 {
+			normalized = append(normalized[:bodyStartIndex-1],
+				append([]string{fmt.Sprintf("Content-Length: %d", bodyLen)},
+					normalized[bodyStartIndex-1:]...)...)
+		}
+	}
+
+	return strings.Join(normalized, "\r\n")
+}
+
 // sendReq - unified request sender for both sync/async modes
 func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 	req = normalizeRequest(req)
@@ -260,6 +324,9 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 		w.loopStartAddr = addr
 	}
 
+	// Check if fire-and-forget (empty pattern line for this idx)
+	fireAndForget := idx < len(w.patterns) && len(w.patterns[idx]) == 0
+
 	var resp, status string
 	var err error
 
@@ -267,27 +334,76 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 		// Keep-alive: reconnect if addr changed or not connected
 		if addr != w.connAddr || (w.conn == nil && w.h2conn == nil) {
 			o.closeWorkerConn(w)
-			w.logger.Write(fmt.Sprintf("Conn: %s\n", addr))
+			w.logger.Write(fmt.Sprintf("Conn-Keep (%d): %s\n", idx, addr))
 			if err := o.dialWithRetry(w, addr); err != nil {
 				return fmt.Errorf("dial: %v", err)
 			}
 		}
+
+		// Fire-and-forget: send without waiting for response
+		if fireAndForget {
+			w.logger.Write(fmt.Sprintf("Fire&Forget (%d)\n", idx))
+			bytesOut := uint32(len(req))
+			if o.httpH2 {
+				// HTTP/2: send headers+data frames only
+				parsedReq := parseRawReq2H2(req)
+				if parsedReq == nil {
+					return fmt.Errorf("failed to parse request for fire-and-forget")
+				}
+				if _, _, err := w.h2conn.sendReqH2(parsedReq, 0, false); err != nil {
+					return err
+				}
+			} else {
+				// HTTP/1.1: write and close
+				_, err = w.conn.Write([]byte(req))
+				if err != nil {
+					return err
+				}
+			}
+			// Report stats for fire-and-forget (no latency, no bytes in)
+			stats.ReportRequest(w.id, 0, 0, bytesOut)
+			o.closeWorkerConn(w) // force new connection for next request
+			w.prevResp = ""
+			return nil
+		}
+
 		resp, status, err = o.sendWithReconnect(w, []byte(req), addr)
+		w.logger.Write(fmt.Sprintf("DEBUG: depois sendWithReconnect idx=%d err=%v\n", idx, err))
 	} else {
 		// No keep-alive: new connection each request
-		w.logger.Write(fmt.Sprintf("Conn: %s\n", addr))
+		w.logger.Write(fmt.Sprintf("Conn (%d): %s\n", idx, addr))
+
+		// Fire-and-forget in non-keepalive mode
+		if fireAndForget {
+			w.logger.Write(fmt.Sprintf("Fire&Forget (%d)\n", idx))
+			conn, dialErr := o.dialNewConn(addr)
+			if dialErr != nil {
+				return dialErr
+			}
+			_, err = conn.Write([]byte(req))
+			conn.Close()
+			if err != nil {
+				return err
+			}
+			// Report stats for fire-and-forget (no latency, no bytes in)
+			stats.ReportRequest(w.id, 0, 0, uint32(len(req)))
+			w.prevResp = ""
+			return nil
+		}
+
 		resp, status, err = o.sendWithRetry(w, []byte(req), addr)
+		w.logger.Write(fmt.Sprintf("DEBUG: depois sendWithRetry idx=%d err=%v\n", idx, err))
 	}
 
 	if err != nil {
 		return err
 	}
 
-	w.logger.Write(fmt.Sprintf("HTTP %s\n", status))
+	w.logger.Write(fmt.Sprintf("HTTP (%d) %s\n", idx, status))
 	w.prevResp = resp
 
 	// Apply response actions if pattern matches
-	if w.actionPatterns != nil {
+	if w.actionPatterns != nil && w.actionPatterns[idx] != nil {
 		if err := o.applyResponseActions(w, idx, req, resp, status); err != nil {
 			return err
 		}
@@ -309,6 +425,14 @@ func loadPatterns(path string) ([][]pattern, error) {
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	patterns := make([][]pattern, len(lines))
 	for i, line := range lines {
+		line = strings.TrimSpace(line)
+
+		// Empty line = fire-and-forget marker, keep empty slice for indexing
+		if line == "" {
+			patterns[i] = []pattern{}
+			continue
+		}
+
 		// multiple patterns per line separated by <space>$<space>!
 		parts := strings.Split(line, " $ ")
 		patterns[i] = make([]pattern, len(parts))

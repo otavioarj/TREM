@@ -213,7 +213,7 @@ Response actions allow you to execute commands when a regex matches the response
 
 **Format:** Each line in the action file follows:
 ```
-indices:regex`:action1, action2, ...
+indices`regex`:action1, action2, ...
 ```
 
 Where:
@@ -230,33 +230,35 @@ Where:
 | `sre("path")` | Save the request that generated the match to file and pause thread |
 | `srp("path")` | Save the response that generated the match to file and pause thread |
 | `sa("path")` | Save both request and response to file and pause thread |
-| `e` | Gracefully exit the application, it can be combined with other actions, use it at the end :). |
+| `e` | Gracefully exit the application |
 
-> **Note:** All save actions (`sre`, `srp`, `sa`) automatically append `_idx_epoch` to filenames to prevent overwrites. For example, `/tmp/req.txt` becomes `/tmp/req_2_1704312000.txt`. 
->
-> Paused threads generates a message on its tab, requiring pressing **Enter** to resume paused threads.
+> **Note:** Multiple actions can be combined in a single line, separated by `,`. Actions execute in order. For example: `pt("msg"), sre("/path"), e`
+
+> **Note:** All save actions (`sre`, `srp`, `sa`) automatically append `_idx_epoch` to filenames to prevent overwrites. For example, `/tmp/req.txt` becomes `/tmp/req_2_1704312000.txt`.
+
+> **Note:** Press **Enter** at any time to resume paused threads.
 
 ### Action File Examples
 
 **actions.txt** - Basic match detection:
 ```
-2:"success"\s*:\s*true`:pt("Exploitation successful!")
+2`"success"\s*:\s*true`:pt("Exploitation successful!")
 ```
 
 **actions.txt** - Save evidence and exit on match:
 ```
-3:"balance"\s*:\s*[1-9]\d{6}`:sa("/tmp/evidence.txt"), e
+3`"balance"\s*:\s*[1-9]\d{6}`:sa("/tmp/evidence.txt"), e
 ```
 
 **actions.txt** - Multiple conditions:
 ```
-2:"token"\s*:\s*"[^"]+`:pt("Got token")
-3:"error"\s*:\s*false`:sre("/tmp/winning_request.txt"), e
+2`"token"\s*:\s*"[^"]+`:pt("Got token")
+3`"error"\s*:\s*false`:sre("/tmp/winning_request.txt"), e
 ```
 
 **actions.txt** - Alert all threads on critical finding:
 ```
-2,3,4:"admin"\s*:\s*true`:pa("ADMIN ACCESS ACHIEVED!"), sa("/tmp/admin_poc.txt"), e
+2,3,4`"admin"\s*:\s*true`:pa("ADMIN ACCESS ACHIEVED!"), sa("/tmp/admin_poc.txt"), e
 ```
 
 ### Usage Examples
@@ -268,7 +270,7 @@ Where:
 
 With `actions.txt`:
 ```
-2:"quantity"\s*:\s*-`:sa("/tmp/oversold.txt"), e
+2`"quantity"\s*:\s*-`:sa("/tmp/oversold.txt"), e
 ```
 
 This will: match responses where quantity went negative (overselling), save both request and response as evidence, then exit.
@@ -280,7 +282,7 @@ This will: match responses where quantity went negative (overselling), save both
 
 With `actions.txt`:
 ```
-2:"authenticated"\s*:\s*true`:sre("/tmp/valid_creds.txt"), pt("Valid credentials found!"), e
+2`"authenticated"\s*:\s*true`:sre("/tmp/valid_creds.txt"), pt("Valid credentials found!"), e
 ```
 
 **Multi-stage exploitation monitoring:**
@@ -290,8 +292,8 @@ With `actions.txt`:
 
 With `actions.txt`:
 ```
-3:"race_won"`:pt("Race condition triggered!")
-4:"balance"\s*>\s*1000000`:sa("/tmp/jackpot.txt"), pa("JACKPOT!"), e
+3`"race_won"`:pt("Race condition triggered!")
+4`"balance"\s*>\s*1000000`:sa("/tmp/jackpot.txt"), pa("JACKPOT!"), e
 ```
 
 ### Combining with Other Features

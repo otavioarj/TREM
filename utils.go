@@ -36,17 +36,23 @@ var hostHeaderRe = regexp.MustCompile(`(?im)^Host:\s*([^:\r\n]+)(?::(\d+))?`)
 // Pre-compiled regex for extracting $key$ patterns
 var keyPatternRe = regexp.MustCompile(`\$([^$]+)\$`)
 
-// drainChannel - drains all available messages from channel into localBuffer (non-blocking)
-func drainChannel(w *monkey) {
+// drainChannel - drains messages from channel into localBuffer (non-blocking)
+// limit=0 means unlimited, otherwise drains at most 'limit' messages
+func drainChannel(w *monkey, limit int) {
 	if w.valChan == nil {
 		return
 	}
+	count := 0
 	for {
+		if limit > 0 && count >= limit {
+			return // reached limit
+		}
 		select {
 		case msg := <-w.valChan:
 			for k, v := range msg {
 				w.localBuffer[k] = append(w.localBuffer[k], v)
 			}
+			count++
 		default:
 			return // no more messages
 		}
@@ -206,50 +212,6 @@ func countKeys(req string) int {
 		i += end + 1
 	}
 	return len(cnt)
-}
-
-func normalizeRequest(req string) string {
-	lines := strings.Split(req, "\n")
-	var normalized []string
-	var bodyStartIndex int = -1
-
-	for i, line := range lines {
-		line = strings.TrimRight(line, "\r")
-		if i == 0 && !strings.Contains(line, "HTTP/") {
-			line = line + " HTTP/1.1"
-		} else if i == 0 && strings.Contains(line, "HTTP/") && !strings.Contains(line, "HTTP/1.1") {
-			// Use pre-compiled regex
-			line = httpVersionRe.ReplaceAllString(line, "HTTP/1.1")
-		}
-
-		normalized = append(normalized, line)
-
-		if line == "" && bodyStartIndex == -1 {
-			bodyStartIndex = i + 1
-		}
-	}
-
-	if bodyStartIndex > 0 && bodyStartIndex < len(normalized) {
-		bodyLines := normalized[bodyStartIndex:]
-		body := strings.Join(bodyLines, "\r\n")
-		bodyLen := len([]byte(body))
-
-		foundContentLength := false
-		for i := 1; i < bodyStartIndex-1; i++ {
-			if strings.HasPrefix(strings.ToLower(normalized[i]), "content-length:") {
-				normalized[i] = fmt.Sprintf("Content-Length: %d", bodyLen)
-				foundContentLength = true
-				break
-			}
-		}
-		if !foundContentLength && bodyLen > 0 {
-			normalized = append(normalized[:bodyStartIndex-1],
-				append([]string{fmt.Sprintf("Content-Length: %d", bodyLen)},
-					normalized[bodyStartIndex-1:]...)...)
-		}
-	}
-
-	return strings.Join(normalized, "\r\n")
 }
 
 func FormatConfig(threads, delay, loopStart, loopTimes, cliHello, tlsTimeout int,
@@ -479,7 +441,7 @@ func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 			continue
 		}
 
-		// Parse: indices`regex`:actions
+		// Parse: indices:regex`:actions
 		// Find first backtick for indices
 		btIdx := strings.IndexByte(line, ':')
 		if btIdx < 1 {
@@ -652,5 +614,5 @@ func saveToFile(basePath string, idx int, content string) error {
 func formatH2ResponseAsH1(resp string, status string) string {
 	// H2 response from readResponse is already: "header: value\r\n...\r\n\r\nbody"
 	// Just prepend HTTP/1.1 status line
-	return fmt.Sprintf("HTTP/1.1 %s OK\r\n%s", status, resp)
+	return fmt.Sprintf("HTTP/1.1 %s \r\n%s", status, resp)
 }

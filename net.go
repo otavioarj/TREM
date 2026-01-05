@@ -44,7 +44,7 @@ func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Durati
 		return "", "", fmt.Errorf("failed to parse request")
 	}
 	h2 := newH2Conn(conn)
-	return h2.sendReqH2(req, threadID)
+	return h2.sendReqH2(req, threadID, true)
 }
 
 // sendOnConn - sends request on existing connection, reports metrics
@@ -304,6 +304,7 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) error {
 			h2c := newH2Conn(conn)
 			if err := h2c.handshake(); err != nil {
 				conn.Close()
+				w.logger.Write(fmt.Sprintf("[V] H2 HandShake err: %v\n", err))
 				lastErr = err
 				continue
 			}
@@ -400,4 +401,24 @@ func (o *Orch) sendWithReconnect(w *monkey, raw []byte, addr string) (string, st
 		return sendOnConnH2(raw, w.h2conn, w.id)
 	}
 	return sendOnConn(raw, w.conn, w.id)
+}
+
+// dialNewConn - creates new connection for fire-and-forget (non-keepalive mode)
+func (o *Orch) dialNewConn(addr string) (net.Conn, error) {
+	conn, err := dialWithProxy(addr, o.proxyURL)
+	if err != nil {
+		return nil, err
+	}
+
+	host, port, _ := net.SplitHostPort(addr)
+	if port == "443" {
+		tlsConn, err := tlsHandshakeDo(conn, host, o.clientHelloID, o.tlsTimeout, nil, -1, o.tlsCert, false)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+
+	return conn, nil
 }
