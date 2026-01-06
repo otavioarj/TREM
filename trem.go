@@ -69,6 +69,7 @@ type Orch struct {
 	readyChan     chan int
 	startChan     chan struct{}
 	loopChan      chan struct{}
+	loopReadyChan chan int // workers signal ready for next loop
 	wg            sync.WaitGroup
 	hostFlag      string
 	delayMs       int
@@ -150,10 +151,11 @@ func main() {
 		"The following actions, are implemented:\n pa(\"msg\") - print msg on match and pause ALL threads.\n pt(\"msg\") - print msg on match and pause the thread.\n"+
 		" sr  - save request that generated the match, and pause thread.\n sre - save response that generated the match, and pause thread.\n"+
 		" sa  - save request and response that generated the match, and pause thread.\n e   - gracefully exit on match, use as last action if combined with others!")
-	fbckFlag := flag.Int("fbck", 64, "FIFO block consumption: max values to drain per request (0=unlimited).")
+	fbckFlag := flag.Int("fbck", 8, "FIFO block consumption: max values to drain for requests per thread (0=unlimited).")
 	flag.Parse()
 
-	configBanner = FormatConfig(*thrFlag, *delayFlag, *loopStartFlag, *loopTimesFlag, *cliFlag, *touFlag,
+	//*fbckFlag = *fbckFlag * *thrFlag
+	configBanner = FormatConfig(*thrFlag, *delayFlag, *loopStartFlag, *loopTimesFlag, *cliFlag, *fbckFlag,
 		*kaFlag, *verboseFlag, *httpFlag,
 		*proxyFlag, *hostFlag, *mtlsFlag, *modeFlag, *univFlag)
 	verbose = *verboseFlag
@@ -308,6 +310,7 @@ func main() {
 		orch.startChan = make(chan struct{})
 		if orch.loopStart > 0 {
 			orch.loopChan = make(chan struct{})
+			orch.loopReadyChan = make(chan int, *thrFlag)
 		}
 	}
 
@@ -353,6 +356,9 @@ func main() {
 				loopCount := 0
 				for {
 					if orch.loopTimes > 0 && loopCount >= orch.loopTimes {
+						if verbose {
+							fmt.Printf("[V] loop orchestrator: limit reached\n")
+						}
 						break
 					}
 
@@ -362,18 +368,48 @@ func main() {
 					default:
 					}
 
+					if verbose {
+						fmt.Printf("[V] loop orchestrator: waiting loopReadyChan\n")
+					}
+
+					// Wait for all workers to signal they're ready for next loop
+					loopReadyCount := 0
+					for range orch.loopReadyChan {
+						loopReadyCount++
+						if verbose {
+							fmt.Printf("[V] loop orchestrator: loopReady %d/%d\n", loopReadyCount, len(orch.monkeys))
+						}
+						if loopReadyCount == len(orch.monkeys) {
+							break
+						}
+					}
+
+					if verbose {
+						fmt.Printf("[V] loop orchestrator: all ready, swapping channels\n")
+					}
+
+					// Now safe to swap channels - all workers are waiting
 					orch.barrierMu.Lock()
 					orch.readyChan = make(chan int, len(orch.monkeys))
 					orch.startChan = make(chan struct{})
 					oldLoopChan := orch.loopChan
 					orch.loopChan = make(chan struct{})
+					orch.loopReadyChan = make(chan int, len(orch.monkeys))
 					orch.barrierMu.Unlock()
 
+					// Release workers to start next loop iteration
 					close(oldLoopChan)
+
+					if verbose {
+						fmt.Printf("[V] loop orchestrator: waiting readyChan (barrier)\n")
+					}
 
 					readyCount = 0
 					for range orch.readyChan {
 						readyCount++
+						if verbose {
+							fmt.Printf("[V] loop orchestrator: barrier %d/%d\n", readyCount, len(orch.monkeys))
+						}
 						if readyCount == len(orch.monkeys) {
 							break
 						}
@@ -381,6 +417,9 @@ func main() {
 
 					close(orch.startChan)
 					loopCount++
+					if verbose {
+						fmt.Printf("[V] loop orchestrator: loop %d complete\n", loopCount)
+					}
 				}
 			}
 		}
@@ -428,27 +467,35 @@ func (o *Orch) runWorker(w *monkey) {
 		time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
 	}
 
+	w.logger.Write("DEBUG: request chain complete, entering loop handling\n")
+
 	// Loop handling
 	if o.loopStart > 0 {
 		loopCount := 0
 		for {
 			if o.loopTimes > 0 && loopCount >= o.loopTimes {
+				w.logger.Write("DEBUG: loop limit reached, exiting\n")
 				break
 			}
 
 			select {
 			case <-o.quitChan:
+				w.logger.Write("DEBUG: quitChan received in loop\n")
 				return
 			default:
 			}
 
-			// Sync mode: wait for loop signal
+			// Sync mode: signal ready for loop, then wait for release
 			if o.mode == "sync" {
+				w.logger.Write("DEBUG: signaling loopReadyChan\n")
+				o.loopReadyChan <- w.id
+				w.logger.Write("DEBUG: waiting loopChan\n")
 				select {
 				case <-o.quitChan:
 					return
 				case <-o.loopChan:
 				}
+				w.logger.Write("DEBUG: loopChan released\n")
 			}
 
 			loopCount++
@@ -467,10 +514,6 @@ func (o *Orch) runWorker(w *monkey) {
 					delete(w.localBuffer, k)
 				}
 			}
-			for k := range w.staticVals {
-				delete(w.staticVals, k)
-			}
-
 			// Execute loop requests
 			for i := o.loopStart - 1; i < len(w.reqFiles); i++ {
 				if err := o.processReq(w, i); err != nil {

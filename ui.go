@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -72,16 +73,18 @@ func (a *AsyncLogWriter) Close() {
 
 // UIManager - manages tview app, thread tabs, and stats panel
 type UIManager struct {
-	app         *tview.Application
-	pages       *tview.Pages
-	statsPanel  *tview.TextView
-	mainFlex    *tview.Flex
-	tabNames    []string
-	loggers     []*AsyncLogWriter
-	textViews   []*tview.TextView
-	dumpEnabled bool
-	dumpFiles   []*os.File
-	dumpChans   []chan string
+	app          *tview.Application
+	pages        *tview.Pages
+	statsPanel   *tview.TextView
+	mainFlex     *tview.Flex
+	tabNames     []string
+	loggers      []*AsyncLogWriter
+	textViews    []*tview.TextView
+	dumpEnabled  bool
+	dumpFiles    []*os.File
+	dumpChans    []chan string
+	dumpClosed   bool // flag to prevent send on closed channel
+	dumpClosedMu sync.Mutex
 }
 
 // NewUIManager - creates UI with thread tabs and stats panel
@@ -178,12 +181,17 @@ func (ui *UIManager) logConsumer(idx int, tv *tview.TextView, ch <-chan string) 
 				fmt.Fprint(tv, content)
 				tv.ScrollToEnd()
 			})
-			// Send to dump goroutine if enabled
+			// Send to dump goroutine if enabled (check closed flag)
 			if ui.dumpEnabled && ui.dumpChans[idx] != nil {
-				select {
-				case ui.dumpChans[idx] <- content:
-				default:
-					// buffer full, skip
+				ui.dumpClosedMu.Lock()
+				closed := ui.dumpClosed
+				ui.dumpClosedMu.Unlock()
+				if !closed {
+					select {
+					case ui.dumpChans[idx] <- content:
+					default:
+						// buffer full, skip
+					}
 				}
 			}
 			batch.Reset()
@@ -275,6 +283,14 @@ func (ui *UIManager) closeDumpFiles() {
 	if !ui.dumpEnabled {
 		return
 	}
+	// Set closed flag first to prevent sends
+	ui.dumpClosedMu.Lock()
+	ui.dumpClosed = true
+	ui.dumpClosedMu.Unlock()
+
+	// Small delay to let pending flushes complete
+	time.Sleep(50 * time.Millisecond)
+
 	for i, ch := range ui.dumpChans {
 		if ch != nil {
 			close(ch)

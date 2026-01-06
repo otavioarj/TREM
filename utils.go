@@ -180,16 +180,13 @@ func generateCombinations(buffer map[string][]string, keys []string) []map[strin
 }
 
 // consumeValues - removes used values from localBuffer
-func consumeValues(buffer map[string][]string, keys []string) {
+func consumeValues(buffer map[string][]string, keys []string, count int) {
 	for _, k := range keys {
-		// This is the real magic :) All keys that starts with '_', i.e, $_key$
-		// Never is consumed, thus, will live for all -xt loops
-		// Multiples values for $_key$ WILL generate combinations, so all values
-		// WILL be a request!!
 		if len(buffer[k]) > 0 && k[1] != '_' {
-			buffer[k] = buffer[k][1:] // remove it first
-			if len(buffer[k]) == 0 {
+			if count >= len(buffer[k]) {
 				delete(buffer, k)
+			} else {
+				buffer[k] = buffer[k][count:]
 			}
 		}
 	}
@@ -214,11 +211,11 @@ func countKeys(req string) int {
 	return len(cnt)
 }
 
-func FormatConfig(threads, delay, loopStart, loopTimes, cliHello, tlsTimeout int,
+func FormatConfig(threads, delay, loopStart, loopTimes, cliHello, fbck int,
 	keepAlive, verbose, httpVer bool,
 	proxy, host, mtls, mode, univ string) string {
 	var lines []string
-	lines = append(lines, fmt.Sprintf("HTTP2: %v. Verbose: %v. Threads: %d. TLS Tout: %dms. ", httpVer, verbose, threads, tlsTimeout))
+	lines = append(lines, fmt.Sprintf("HTTP2: %v. Verbose: %v. Threads: %d. FIFO Block: %d. ", httpVer, verbose, threads, fbck))
 	lines = append(lines, fmt.Sprintf("Keep-alive: %v. \nDelay: %dms.  Mode: %s.", keepAlive, delay, mode))
 	loopTimesStr := "∞"
 
