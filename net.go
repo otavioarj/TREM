@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -306,6 +307,10 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) error {
 				conn.Close()
 				w.logger.Write(fmt.Sprintf("[V] H2 HandShake err: %v\n", err))
 				lastErr = err
+				// Don't retry on H2 protocol errors - server doesn't support H2
+				if errors.Is(err, errH2NotSupported) {
+					return fmt.Errorf("H2 not supported: %v", err)
+				}
 				continue
 			}
 			w.connMu.Lock()

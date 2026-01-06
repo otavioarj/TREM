@@ -5,16 +5,19 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/net/http2/hpack"
 )
+
+// HTTP/2 protocol error - should not retry
+var errH2NotSupported = errors.New("server does not support HTTP/2")
 
 // HTTP/2 frame types
 const (
@@ -37,6 +40,9 @@ const (
 	flagPadded     = 0x8
 	flagPriority   = 0x20
 )
+
+// HTTP/2 max frame size (default, can be negotiated higher)
+const maxFrameSize = 16384
 
 // HTTP/2 connection preface
 var h2Preface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
@@ -70,24 +76,19 @@ func (h *H2Conn) handshake() error {
 	if h.handshook {
 		return nil
 	}
-	file, _ := os.OpenFile("log.txt", os.O_WRONLY|os.O_CREATE, 0644)
-	defer file.Close()
 
 	// Send preface
 	if _, err := h.conn.Write(h2Preface); err != nil {
-		file.WriteString(fmt.Sprintf("[V] H2 HandShake Preface err: %v\n", err))
 		return err
 	}
 
 	// Send empty SETTINGS
 	if _, err := h.conn.Write(h2SettingsFrame); err != nil {
-		file.WriteString(fmt.Sprintf("[V] H2 E-SETTINGS err: %v\n", err))
 		return err
 	}
 
-	// Read server SETTINGS (just consume, don't process)
+	// Read server SETTINGS and send ACK
 	if err := h.readAndAckSettings(); err != nil {
-		file.WriteString(fmt.Sprintf("[V] H2  R-SETTINGS err: %v\n", err))
 		return err
 	}
 
@@ -95,29 +96,124 @@ func (h *H2Conn) handshake() error {
 	return nil
 }
 
-// readAndAckSettings - reads server SETTINGS and sends ACK
+// readAndAckSettings - reads frames until server SETTINGS, then sends ACK
+// Returns errH2NotSupported if server sends invalid H2 data (e.g. HTTP/1.1 response)
 func (h *H2Conn) readAndAckSettings() error {
-	hdr := make([]byte, 9)
-	if _, err := io.ReadFull(h.conn, hdr); err != nil {
+	buf := make([]byte, 9)
+
+	// Set read deadline for handshake (short timeout)
+	h.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer h.conn.SetReadDeadline(time.Time{})
+
+	// Read first frame header with validation
+	n, err := h.conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("%w: cannot read H2 tunnel!", err)
+	}
+
+	// Need at least 5 bytes to detect HTTP/1.1 or validate H2 frame
+	if n < 5 {
+		return fmt.Errorf("%w: server responded invalid data!", errH2NotSupported)
+	} else if bytes.HasPrefix(buf[:n], []byte("HTTP/")) {
+		return fmt.Errorf("%w: server supports ONLY HTTP/1.1", errH2NotSupported)
+	}
+
+	// Validate first frame header
+	if err := validateH2FrameHeader(buf[:n]); err != nil {
 		return err
+	}
+
+	// Complete reading if we don't have full 9 bytes yet
+	if n < 9 {
+		if _, err := io.ReadFull(h.conn, buf[n:]); err != nil {
+			return err
+		}
+	}
+
+	// Process first frame and continue loop
+	hdr := buf
+	for {
+		length := int(hdr[0])<<16 | int(hdr[1])<<8 | int(hdr[2])
+		ftype := hdr[3]
+		flags := hdr[4]
+
+		// Read payload if any
+		var payload []byte
+		if length > 0 {
+			payload = make([]byte, length)
+			if _, err := io.ReadFull(h.conn, payload); err != nil {
+				return err
+			}
+		}
+
+		switch ftype {
+		case frameSettings:
+			// If it's SETTINGS (not ACK), send ACK
+			if flags&0x1 == 0 {
+				ack := []byte{0, 0, 0, frameSettings, 0x1, 0, 0, 0, 0}
+				if _, err := h.conn.Write(ack); err != nil {
+					return err
+				}
+			}
+			return nil // Got SETTINGS, handshake complete
+
+		case frameWindowUpdate:
+			// Consume and continue waiting for SETTINGS
+			break
+
+		case framePing:
+			// Respond to PING if not ACK
+			if flags&0x1 == 0 {
+				pong := buildFrame(framePing, 0x1, 0, payload)
+				h.conn.Write(pong)
+			}
+			break
+
+		case frameGoAway:
+			errCode := uint32(0)
+			if len(payload) >= 8 {
+				errCode = uint32(payload[4])<<24 | uint32(payload[5])<<16 | uint32(payload[6])<<8 | uint32(payload[7])
+			}
+			return fmt.Errorf("GOAWAY during handshake, error code: %d", errCode)
+		}
+
+		// Read next frame header
+		if _, err := io.ReadFull(h.conn, hdr); err != nil {
+			return err
+		}
+
+		// Validate subsequent frames too
+		if err := validateH2FrameHeader(hdr); err != nil {
+			return err
+		}
+	}
+}
+
+// validateH2FrameHeader - validates H2 frame header bytes
+// Returns errH2NotSupported for invalid data
+func validateH2FrameHeader(hdr []byte) error {
+	if len(hdr) < 5 {
+		return fmt.Errorf("%w: insufficient header bytes", errH2NotSupported)
 	}
 
 	length := int(hdr[0])<<16 | int(hdr[1])<<8 | int(hdr[2])
 	ftype := hdr[3]
 
-	// Read payload if any
-	if length > 0 {
-		payload := make([]byte, length)
-		if _, err := io.ReadFull(h.conn, payload); err != nil {
-			return err
-		}
+	// Validate frame length
+	if length > maxFrameSize*2 { // Allow some margin
+		return fmt.Errorf("%w: invalid frame length %d", errH2NotSupported, length)
 	}
 
-	// If it's SETTINGS (not ACK), send ACK
-	if ftype == frameSettings && hdr[4]&0x1 == 0 {
-		ack := []byte{0, 0, 0, frameSettings, 0x1, 0, 0, 0, 0}
-		if _, err := h.conn.Write(ack); err != nil {
-			return err
+	// Validate frame type (0x0 - 0x9 are valid)
+	if ftype > frameContinuation {
+		return fmt.Errorf("%w: invalid frame type 0x%02x", errH2NotSupported, ftype)
+	}
+
+	// For SETTINGS frame, streamID must be 0
+	if ftype == frameSettings && len(hdr) >= 9 {
+		streamID := uint32(hdr[5]&0x7F)<<24 | uint32(hdr[6])<<16 | uint32(hdr[7])<<8 | uint32(hdr[8])
+		if streamID != 0 {
+			return fmt.Errorf("%w: SETTINGS frame with non-zero stream ID", errH2NotSupported)
 		}
 	}
 

@@ -266,7 +266,7 @@ func (o *Orch) processReq(w *monkey, idx int) error {
 	}
 
 	// Consume used values
-	consumeValues(w.localBuffer, keys, len(combinations))
+	consumeValues(w.localBuffer, keys, o.fifoBlockSize)
 	return nil
 }
 
@@ -341,7 +341,7 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 		// Keep-alive: reconnect if addr changed or not connected
 		if addr != w.connAddr || (w.conn == nil && w.h2conn == nil) {
 			o.closeWorkerConn(w)
-			w.logger.Write(fmt.Sprintf("Conn-Keep (%d): %s\n", idx+1, addr))
+			w.logger.Write(fmt.Sprintf("Conn-Keep (%d): %s\n", idx, addr))
 			if err := o.dialWithRetry(w, addr); err != nil {
 				return fmt.Errorf("dial: %v", err)
 			}
@@ -349,7 +349,7 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 
 		// Fire-and-forget: send without waiting for response
 		if fireAndForget {
-			//w.logger.Write(fmt.Sprintf("Fire&Forget (%d)\n", idx+1))
+			w.logger.Write(fmt.Sprintf("Fire&Forget (%d)\n", idx))
 			bytesOut := uint32(len(req))
 			if o.httpH2 {
 				// HTTP/2: send headers+data frames only
@@ -377,11 +377,11 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 		resp, status, err = o.sendWithReconnect(w, []byte(req), addr)
 	} else {
 		// No keep-alive: new connection each request
-		w.logger.Write(fmt.Sprintf("Conn (%d): %s\n", idx+1, addr))
+		w.logger.Write(fmt.Sprintf("Conn (%d): %s\n", idx, addr))
 
 		// Fire-and-forget in non-keepalive mode
 		if fireAndForget {
-			//w.logger.Write(fmt.Sprintf("Fire&Forget (%d)\n", idx))
+			w.logger.Write(fmt.Sprintf("Fire&Forget (%d)\n", idx))
 			conn, dialErr := o.dialNewConn(addr)
 			if dialErr != nil {
 				return dialErr
@@ -404,7 +404,7 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 		return err
 	}
 
-	w.logger.Write(fmt.Sprintf("HTTP (%d) %s\n", idx+1, status))
+	w.logger.Write(fmt.Sprintf("HTTP (%d) %s\n", idx, status))
 	w.prevResp = resp
 
 	// Apply response actions if pattern matches

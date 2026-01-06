@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.5.0"
+var version = "v1.5.2"
 
 // Verbose mode flag
 var verbose bool
@@ -151,10 +151,9 @@ func main() {
 		"The following actions, are implemented:\n pa(\"msg\") - print msg on match and pause ALL threads.\n pt(\"msg\") - print msg on match and pause the thread.\n"+
 		" sr  - save request that generated the match, and pause thread.\n sre - save response that generated the match, and pause thread.\n"+
 		" sa  - save request and response that generated the match, and pause thread.\n e   - gracefully exit on match, use as last action if combined with others!")
-	fbckFlag := flag.Int("fbck", 8, "FIFO block consumption: max values to drain for requests per thread (0=unlimited).")
+	fbckFlag := flag.Int("fbck", 64, "FIFO block consumption: max values to drain per request (0=unlimited).")
 	flag.Parse()
 
-	//*fbckFlag = *fbckFlag * *thrFlag
 	configBanner = FormatConfig(*thrFlag, *delayFlag, *loopStartFlag, *loopTimesFlag, *cliFlag, *fbckFlag,
 		*kaFlag, *verboseFlag, *httpFlag,
 		*proxyFlag, *hostFlag, *mtlsFlag, *modeFlag, *univFlag)
@@ -467,35 +466,28 @@ func (o *Orch) runWorker(w *monkey) {
 		time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
 	}
 
-	w.logger.Write("DEBUG: request chain complete, entering loop handling\n")
-
 	// Loop handling
 	if o.loopStart > 0 {
 		loopCount := 0
 		for {
 			if o.loopTimes > 0 && loopCount >= o.loopTimes {
-				w.logger.Write("DEBUG: loop limit reached, exiting\n")
 				break
 			}
 
 			select {
 			case <-o.quitChan:
-				w.logger.Write("DEBUG: quitChan received in loop\n")
 				return
 			default:
 			}
 
 			// Sync mode: signal ready for loop, then wait for release
 			if o.mode == "sync" {
-				w.logger.Write("DEBUG: signaling loopReadyChan\n")
 				o.loopReadyChan <- w.id
-				w.logger.Write("DEBUG: waiting loopChan\n")
 				select {
 				case <-o.quitChan:
 					return
 				case <-o.loopChan:
 				}
-				w.logger.Write("DEBUG: loopChan released\n")
 			}
 
 			loopCount++
@@ -514,6 +506,10 @@ func (o *Orch) runWorker(w *monkey) {
 					delete(w.localBuffer, k)
 				}
 			}
+			for k := range w.staticVals {
+				delete(w.staticVals, k)
+			}
+
 			// Execute loop requests
 			for i := o.loopStart - 1; i < len(w.reqFiles); i++ {
 				if err := o.processReq(w, i); err != nil {
