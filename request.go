@@ -78,29 +78,31 @@ func parseRawReq2H2(raw string) *ParsedReq {
 	return req
 }
 
-// prepareReqBase - loads request and applies regex patterns (no FIFO substitution)
-func (o *Orch) prepareReqBase(w *monkey, idx int) (string, error) {
+// prepareReq - loads request (absIdx) and applies patterns (relIdx)
+// Single mode: relIdx == absIdx
+// Group mode: relIdx = position in group, absIdx = position in reqFiles
+func (o *Orch) prepareReq(w *monkey, relIdx, absIdx int) (string, error) {
 	var raw []byte
 	var err error
 
-	// Use cache if available
+	// Use cache if available (indexed by absolute index)
 	if len(w.reqCache) > 0 {
-		raw = []byte(w.reqCache[idx])
+		raw = []byte(w.reqCache[absIdx])
 	} else {
-		raw, err = os.ReadFile(w.reqFiles[idx])
+		raw, err = os.ReadFile(w.reqFiles[absIdx])
 		if err != nil {
 			return "", err
 		}
 	}
 	req := string(raw)
 
-	// Apply pattern replacements (skip for first request)
-	if idx > 0 {
-		for _, p := range w.patterns[idx-1] {
+	// Apply pattern replacements (skip for first request in chain)
+	if relIdx > 0 && len(w.patterns) > relIdx-1 {
+		for _, p := range w.patterns[relIdx-1] {
 			// Skip extraction if static value already exists
 			if len(p.keyword) > 0 && p.keyword[0] == '_' {
 				if _, exists := w.staticVals["$"+p.keyword+"$"]; exists {
-					continue // already have this static value
+					continue
 				}
 			}
 
@@ -135,7 +137,7 @@ func (o *Orch) prepareReqBase(w *monkey, idx int) (string, error) {
 
 // doBarrier - handles sync barrier: dial and wait for all threads
 // Returns addr for subsequent sends
-func (o *Orch) doBarrier(w *monkey, idx int, addr string) error {
+func (o *Orch) doBarrier(w *monkey, relIdx int, addr string) error {
 	// Dial if not connected or addr changed
 	if w.conn == nil && w.h2conn == nil {
 		w.logger.Write(fmt.Sprintf("Connecting: %s\n", addr))
@@ -161,8 +163,10 @@ func (o *Orch) doBarrier(w *monkey, idx int, addr string) error {
 }
 
 // processReq - unified request processor for sync/async modes with FIFO combinations
-func (o *Orch) processReq(w *monkey, idx int) error {
-	baseReq, err := o.prepareReqBase(w, idx)
+// relIdx = relative index within group (for patterns and barriers)
+// absIdx = absolute index in reqFiles (for loading request and response actions)
+func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
+	baseReq, err := o.prepareReq(w, relIdx, absIdx)
 	if err != nil {
 		return err
 	}
@@ -175,13 +179,13 @@ func (o *Orch) processReq(w *monkey, idx int) error {
 		if err != nil {
 			return err
 		}
-		// Barrier if sync mode and this idx triggers it
-		if o.mode == "sync" && o.syncBarriers[idx] {
-			if err := o.doBarrier(w, idx, addr); err != nil {
+		// Barrier uses relIdx (relative to group)
+		if o.mode == "sync" && o.syncBarriers[relIdx] {
+			if err := o.doBarrier(w, relIdx, addr); err != nil {
 				return err
 			}
 		}
-		return o.sendReq(w, idx, req, addr)
+		return o.sendReq(w, relIdx, absIdx, req, addr)
 	}
 
 	// Handle FIFO mode - drain channel first (limited by fifoBlockSize)
@@ -195,12 +199,12 @@ func (o *Orch) processReq(w *monkey, idx int) error {
 		if err != nil {
 			return err
 		}
-		if o.mode == "sync" && o.syncBarriers[idx] {
-			if err := o.doBarrier(w, idx, addr); err != nil {
+		if o.mode == "sync" && o.syncBarriers[relIdx] {
+			if err := o.doBarrier(w, relIdx, addr); err != nil {
 				return err
 			}
 		}
-		return o.sendReq(w, idx, baseReq, addr)
+		return o.sendReq(w, relIdx, absIdx, baseReq, addr)
 	}
 
 	// Check for missing keys
@@ -221,20 +225,19 @@ func (o *Orch) processReq(w *monkey, idx int) error {
 	}
 
 	// Generate combinations: each key=value creates a new request
-	// PER original requestN.txt file!
 	combinations := generateCombinations(w.localBuffer, keys)
 	if len(combinations) == 0 {
-		// No values available, send as-is (will likely fail regex check)
+		// No values available, send as-is
 		addr, err := parseHost(baseReq, o.hostFlag)
 		if err != nil {
 			return err
 		}
-		if o.mode == "sync" && o.syncBarriers[idx] {
-			if err := o.doBarrier(w, idx, addr); err != nil {
+		if o.mode == "sync" && o.syncBarriers[relIdx] {
+			if err := o.doBarrier(w, relIdx, addr); err != nil {
 				return err
 			}
 		}
-		return o.sendReq(w, idx, baseReq, addr)
+		return o.sendReq(w, relIdx, absIdx, baseReq, addr)
 	}
 
 	// Send request for each combination
@@ -253,14 +256,14 @@ func (o *Orch) processReq(w *monkey, idx int) error {
 		}
 
 		// Barrier only on first request of combinations
-		if firstReq && o.mode == "sync" && o.syncBarriers[idx] {
-			if err := o.doBarrier(w, idx, addr); err != nil {
+		if firstReq && o.mode == "sync" && o.syncBarriers[relIdx] {
+			if err := o.doBarrier(w, relIdx, addr); err != nil {
 				return err
 			}
 			firstReq = false
 		}
 
-		if err := o.sendReq(w, idx, req, addr); err != nil {
+		if err := o.sendReq(w, relIdx, absIdx, req, addr); err != nil {
 			return err
 		}
 	}
@@ -321,18 +324,20 @@ func normalizeRequest(req string) string {
 	return strings.Join(normalized, "\r\n")
 }
 
-// sendReq - unified request sender for both sync/async modes
-func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
+// sendReq - request sender for both sync/async modes
+// relIdx = relative index per group, for patterns/fire-and-forget/loop detection
+// absIdx = absolute index, from -l request order, for logging and response actions
+func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) error {
 	req = normalizeRequest(req)
 
-	// Save loop start req and addr if this is the loop start point
-	if o.loopStart > 0 && idx == o.loopStart-1 {
+	// Save loop start req and addr (using relIdx for comparison)
+	if o.loopStart > 0 && relIdx == o.loopStart-1 {
 		w.loopStartReq = req
 		w.loopStartAddr = addr
 	}
 
-	// Check if fire-and-forget (empty pattern line for this idx)
-	fireAndForget := idx < len(w.patterns) && len(w.patterns[idx]) == 0
+	// Fire-and-forget detection uses relIdx (group patterns)
+	fireAndForget := relIdx < len(w.patterns) && len(w.patterns[relIdx]) == 0
 
 	var resp, status string
 	var err error
@@ -341,15 +346,16 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 		// Keep-alive: reconnect if addr changed or not connected
 		if addr != w.connAddr || (w.conn == nil && w.h2conn == nil) {
 			o.closeWorkerConn(w)
-			w.logger.Write(fmt.Sprintf("Conn-Keep (%d): %s\n", idx, addr))
+			w.logger.Write(fmt.Sprintf("Conn-Keep (r%d): %s\n", absIdx+1, addr))
 			if err := o.dialWithRetry(w, addr); err != nil {
 				return fmt.Errorf("dial: %v", err)
 			}
 		}
 
 		// Fire-and-forget: send without waiting for response
+		// TODO: option to use TCP-RST and not FIN-ACK?
 		if fireAndForget {
-			w.logger.Write(fmt.Sprintf("Fire&Forget (%d)\n", idx))
+			w.logger.Write(fmt.Sprintf("Fire&Forget (r%d)\n", absIdx+1))
 			bytesOut := uint32(len(req))
 			if o.httpH2 {
 				// HTTP/2: send headers+data frames only
@@ -377,11 +383,11 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 		resp, status, err = o.sendWithReconnect(w, []byte(req), addr)
 	} else {
 		// No keep-alive: new connection each request
-		w.logger.Write(fmt.Sprintf("Conn (%d): %s\n", idx, addr))
+		w.logger.Write(fmt.Sprintf("Conn (r%d): %s\n", absIdx+1, addr))
 
 		// Fire-and-forget in non-keepalive mode
 		if fireAndForget {
-			w.logger.Write(fmt.Sprintf("Fire&Forget (%d)\n", idx))
+			w.logger.Write(fmt.Sprintf("Fire&Forget (r%d)\n", absIdx+1))
 			conn, dialErr := o.dialNewConn(addr)
 			if dialErr != nil {
 				return dialErr
@@ -404,12 +410,12 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 		return err
 	}
 
-	w.logger.Write(fmt.Sprintf("HTTP (%d) %s\n", idx, status))
+	w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
 	w.prevResp = resp
 
-	// Apply response actions if pattern matches
-	if w.actionPatterns != nil && w.actionPatterns[idx] != nil {
-		if err := o.applyResponseActions(w, idx, req, resp, status); err != nil {
+	// Apply response actions (uses absIdx for global pattern matching)
+	if w.actionPatterns != nil && w.actionPatterns[absIdx] != nil {
+		if err := o.applyResponseActions(w, absIdx, req, resp, status); err != nil {
 			return err
 		}
 	}
@@ -428,6 +434,17 @@ func loadPatterns(path string) ([][]pattern, error) {
 		return nil, err
 	}
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+
+	// Filter comment lines (keep empty for fire-and-forget)
+	var filtered []string
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	lines = filtered
+
 	patterns := make([][]pattern, len(lines))
 	for i, line := range lines {
 		line = strings.TrimSpace(line)
@@ -465,64 +482,70 @@ func (o *Orch) applyResponseActions(w *monkey, idx int, req, resp, status string
 	}
 
 	// Check if regex matches response
-	if !ap.re.MatchString(resp) {
-		return nil
+	m := ap.re.FindStringSubmatch(resp)
+	if m == nil {
+		return nil // No match, continue normally
 	}
 
-	w.logger.Write(fmt.Sprintf("Action match at idx %d\n", idx+1))
+	w.logger.Write(fmt.Sprintf("RA matched (r%d): %s\n", idx+1, ap.re.String()))
 
 	// Execute actions in order
 	for _, action := range ap.actions {
 		switch action.actionType {
-		case ActionPrintThread:
-			o.pauseThread(w, action.arg)
-
 		case ActionPrintAll:
-			o.pauseAllThreads(action.arg)
+			// Broadcast message to all threads and pause all
+			msg := fmt.Sprintf("\n>>> RA (r%d) T%d: %s <<<\n", idx+1, w.id+1, action.arg)
+			o.uiManager.BroadcastMessage(msg)
+			o.pauseAllThreads()
+			o.checkPause(w)
+
+		case ActionPrintThread:
+			// Print to this thread only and pause it
+			w.logger.Write(fmt.Sprintf(">>> RA: %s <<<\n", action.arg))
+			o.pauseThread(w.id)
+			o.checkPause(w)
 
 		case ActionSaveReq:
-			if err := saveToFile(action.arg, idx, req); err != nil {
-				w.logger.Write(fmt.Sprintf("Save req error: %v\n", err))
-				return err
+			// Save request that generated match
+			if err := os.WriteFile(action.arg, []byte(req), 0644); err != nil {
+				w.logger.Write(fmt.Sprintf("RA save error: %v\n", err))
+			} else {
+				w.logger.Write(fmt.Sprintf("RA saved req to: %s\n", action.arg))
 			}
-			w.logger.Write(fmt.Sprintf("Saved request to %s\n", action.arg))
-			o.pauseThread(w, "Request saved")
+			o.pauseThread(w.id)
+			o.checkPause(w)
 
 		case ActionSaveResp:
-			respToSave := resp
-			if o.httpH2 {
-				respToSave = formatH2ResponseAsH1(resp, status)
+			// Save response that generated match
+			if err := os.WriteFile(action.arg, []byte(resp), 0644); err != nil {
+				w.logger.Write(fmt.Sprintf("RA save error: %v\n", err))
+			} else {
+				w.logger.Write(fmt.Sprintf("RA saved resp to: %s\n", action.arg))
 			}
-			if err := saveToFile(action.arg, idx, respToSave); err != nil {
-				w.logger.Write(fmt.Sprintf("Save resp error: %v\n", err))
-				return err
-			}
-			w.logger.Write(fmt.Sprintf("Saved response to %s\n", action.arg))
-			o.pauseThread(w, "Response saved")
+			o.pauseThread(w.id)
+			o.checkPause(w)
 
 		case ActionSaveAll:
-			respToSave := resp
-			if o.httpH2 {
-				respToSave = formatH2ResponseAsH1(resp, status)
+			// Save both request and response
+			content := fmt.Sprintf("=== REQUEST ===\n%s\n\n=== RESPONSE ===\n%s", req, resp)
+			if err := os.WriteFile(action.arg, []byte(content), 0644); err != nil {
+				w.logger.Write(fmt.Sprintf("RA save error: %v\n", err))
+			} else {
+				w.logger.Write(fmt.Sprintf("RA saved req+resp to: %s\n", action.arg))
 			}
-			content := req + " " + respToSave
-			if err := saveToFile(action.arg, idx, content); err != nil {
-				w.logger.Write(fmt.Sprintf("Save all error: %v\n", err))
-				return err
-			}
-			w.logger.Write(fmt.Sprintf("Saved req+resp to %s\n", action.arg))
-			o.pauseThread(w, "Request and response saved")
+			o.pauseThread(w.id)
+			o.checkPause(w)
 
 		case ActionExit:
-			w.logger.Write("Exit action triggered\n")
-			// Graceful exit - close quitChan
+			// Graceful exit - close quitChan to signal all workers
+			w.logger.Write("RA: exit triggered\n")
 			select {
 			case <-o.quitChan:
 				// Already closed
 			default:
 				close(o.quitChan)
 			}
-			return fmt.Errorf("exit action")
+			return fmt.Errorf("RA exit")
 		}
 	}
 
