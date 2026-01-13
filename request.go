@@ -99,9 +99,9 @@ func (o *Orch) prepareReq(w *monkey, relIdx, absIdx int) (string, error) {
 	// Apply pattern replacements (skip for first request in chain)
 	if relIdx > 0 && len(w.patterns) > relIdx-1 {
 		for _, p := range w.patterns[relIdx-1] {
-			// Skip extraction if static value already exists
+			// Skip extraction if static value already exists in global store
 			if len(p.keyword) > 0 && p.keyword[0] == '_' {
-				if _, exists := w.staticVals["$"+p.keyword+"$"]; exists {
+				if _, exists := globalStaticVals.Load(p.keyword); exists {
 					continue
 				}
 			}
@@ -117,20 +117,24 @@ func (o *Orch) prepareReq(w *monkey, relIdx, absIdx int) (string, error) {
 			req = strings.ReplaceAll(req, "$"+p.keyword+"$", extracted)
 			w.logger.Write(fmt.Sprintf("Matched %s: %s\n", p.keyword, extracted))
 
-			// Save static values (keys starting with _) for persistence across requests
+			// Save static values (keys starting with _) to global store for cross-group access
 			if len(p.keyword) > 0 && p.keyword[0] == '_' {
-				w.staticVals["$"+p.keyword+"$"] = extracted
+				globalStaticVals.Store(p.keyword, extracted)
 			}
 		}
 	}
 
-	// Apply static values (extracted from previous requests with _ prefix)
-	for k, v := range w.staticVals {
-		if strings.Contains(req, k) {
-			req = strings.ReplaceAll(req, k, v)
-			w.logger.Write(fmt.Sprintf("Static %s: %s\n", k, v))
+	// Apply static values from global store (extracted from previous requests with _ prefix)
+	globalStaticVals.Range(func(key, value interface{}) bool {
+		k := key.(string)
+		v := value.(string)
+		fullKey := "$" + k + "$"
+		if strings.Contains(req, fullKey) {
+			req = strings.ReplaceAll(req, fullKey, v)
+			w.logger.Write(fmt.Sprintf("Static %s: %s\n", fullKey, v))
 		}
-	}
+		return true
+	})
 
 	return req, nil
 }
@@ -174,7 +178,7 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	// Handle static mode
 	if o.valDist.IsStatic() {
 		k, v := o.valDist.StaticKV()
-		req := strings.ReplaceAll(baseReq, k, v)
+		req := strings.ReplaceAll(baseReq, "$"+k+"$", v)
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
@@ -246,7 +250,7 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	for _, combo := range combinations {
 		req := baseReq
 		for k, v := range combo {
-			req = strings.ReplaceAll(req, k, v)
+			req = strings.ReplaceAll(req, "$"+k+"$", v)
 			w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, v))
 		}
 
@@ -324,9 +328,9 @@ func normalizeRequest(req string) string {
 	return strings.Join(normalized, "\r\n")
 }
 
-// sendReq - request sender for both sync/async modes
-// relIdx = relative index per group, for patterns/fire-and-forget/loop detection
-// absIdx = absolute index, from -l request order, for logging and response actions
+// sendReq - unified request sender for both sync/async modes
+// relIdx = relative index (for patterns/fire-and-forget/loop detection)
+// absIdx = absolute index (for logging and response actions)
 func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) error {
 	req = normalizeRequest(req)
 
@@ -353,7 +357,6 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 		}
 
 		// Fire-and-forget: send without waiting for response
-		// TODO: option to use TCP-RST and not FIN-ACK?
 		if fireAndForget {
 			w.logger.Write(fmt.Sprintf("Fire&Forget (r%d)\n", absIdx+1))
 			bytesOut := uint32(len(req))

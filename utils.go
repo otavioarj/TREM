@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // Action types for response actions
@@ -62,19 +64,26 @@ func drainChannel(w *monkey, limit int) {
 // waitForKeys - blocks until all required keys are available in localBuffer
 // Emits periodic messages about missing keys
 func waitForKeys(w *monkey, keys []string, done <-chan struct{}) bool {
-	ticker := time.NewTicker(2 * time.Second)
+	wait_time := 25 // in milliseconds
+	ticker := time.NewTicker(time.Duration(wait_time) * time.Millisecond)
 	defer ticker.Stop()
 	var prints []string
-	// Wait for max tries, or ticker*max_wait seconds
-	max_wait := 5
-	wait_idx := 1
+	max_wait := 2 * (1000 / wait_time) //left operand is seconds :)
+
 	for {
-		// Check if all keys present
+		// Check if all keys present (in localBuffer OR globalStaticVals)
 		var missing []string
 		for _, k := range keys {
-			if len(w.localBuffer[k]) == 0 {
-				missing = append(missing, k)
+			if len(w.localBuffer[k]) > 0 {
+				continue
 			}
+			// For _key patterns, also check globalStaticVals
+			if len(k) > 0 && k[0] == '_' {
+				if _, exists := globalStaticVals.Load(k); exists {
+					continue
+				}
+			}
+			missing = append(missing, k)
 		}
 		if len(missing) == 0 {
 			return true
@@ -90,11 +99,11 @@ func waitForKeys(w *monkey, keys []string, done <-chan struct{}) bool {
 				w.localBuffer[k] = append(w.localBuffer[k], v)
 			}
 		case <-ticker.C:
-			if wait_idx == max_wait {
+			if max_wait == 0 {
 				w.logger.Write(fmt.Sprintf("Giving up FIFO keys: %v\n", missing))
 				return false
 			}
-			wait_idx++
+			max_wait--
 			for p := range missing {
 				if len(prints) > p && missing[p] != prints[p] {
 					w.logger.Write(fmt.Sprintf("Waiting FIFO keys: %v\n", missing))
@@ -111,9 +120,16 @@ func waitForKeys(w *monkey, keys []string, done <-chan struct{}) bool {
 func checkMissingKeys(buffer map[string][]string, keys []string) []string {
 	var missing []string
 	for _, k := range keys {
-		if len(buffer[k]) == 0 {
-			missing = append(missing, k)
+		if len(buffer[k]) > 0 {
+			continue
 		}
+		// For _key patterns, also check globalStaticVals
+		if len(k) > 0 && k[0] == '_' {
+			if _, exists := globalStaticVals.Load(k); exists {
+				continue
+			}
+		}
+		missing = append(missing, k)
 	}
 	return missing
 }
@@ -123,7 +139,7 @@ func extractKeys(req string) []string {
 	matches := keyPatternRe.FindAllStringSubmatch(req, -1)
 	keys := make([]string, 0, len(matches))
 	for _, m := range matches {
-		key := "$" + m[1] + "$"
+		key := m[1]
 		// Linear search - faster for small N due to cache
 		found := false
 		for _, k := range keys {
@@ -182,7 +198,7 @@ func generateCombinations(buffer map[string][]string, keys []string) []map[strin
 // consumeValues - removes used values from localBuffer
 func consumeValues(buffer map[string][]string, keys []string, count int) {
 	for _, k := range keys {
-		if len(buffer[k]) > 0 && k[1] != '_' {
+		if len(buffer[k]) > 0 && k[0] != '_' {
 			if count >= len(buffer[k]) {
 				delete(buffer, k)
 			} else {
@@ -612,4 +628,40 @@ func formatH2ResponseAsH1(resp string, status string) string {
 	// H2 response from readResponse is already: "header: value\r\n...\r\n\r\nbody"
 	// Just prepend HTTP/1.1 status line
 	return fmt.Sprintf("HTTP/1.1 %s \r\n%s", status, resp)
+}
+
+// setupValDist - creates and initializes value distributor
+func setupValDist(univFlag string, fmodeFlag, totalThreads int, logger LogWriter) *ValDist {
+	if univFlag == "" {
+		return NewValDist("", 1, totalThreads)
+	}
+	if !strings.Contains(univFlag, "=") {
+		vd := NewValDist(univFlag, fmodeFlag, totalThreads)
+		if err := vd.EnsureFifo(); err != nil {
+			exitErr(fmt.Sprintf("FIFO error: %v", err))
+		}
+		vd.Start(logger)
+		return vd
+	}
+	parts := strings.Split(univFlag, "=")
+	if len(parts) != 2 {
+		exitErr("Universal must be key=val or file (FIFO) path")
+	}
+	return NewValDistStatic(parts[0], parts[1])
+}
+
+// loadMTLSCert - loads mTLS certificate if specified
+func loadMTLSCert(mtlsFlag string) *utls.Certificate {
+	if mtlsFlag == "" {
+		return nil
+	}
+	certAndPass := strings.Split(mtlsFlag, ":")
+	if len(certAndPass) != 2 {
+		exitErr("Client Certificate (mTLS) must be file:pass!")
+	}
+	cert, err := loadPKCS12Certificate(certAndPass[0], certAndPass[1])
+	if err != nil {
+		exitErr(err.Error())
+	}
+	return &cert
 }

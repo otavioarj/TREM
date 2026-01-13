@@ -25,6 +25,11 @@ var configBanner string
 // Global stats
 var stats *StatsCollector
 
+// globalStaticVals - shared static values across all threads/groups
+// Keys starting with _ are persisted here and survive across loops
+// Values can be updated; last write wins
+var globalStaticVals sync.Map
+
 // pattern - regex extraction
 type pattern struct {
 	re      *regexp.Regexp
@@ -63,9 +68,6 @@ type monkey struct {
 	// FIFO value distribution
 	valChan     chan map[string]string // receives values from ValDist
 	localBuffer map[string][]string    // accumulated values for consumption
-
-	// Static values extracted from regex patterns (keys starting with _)
-	staticVals map[string]string
 }
 
 // Orch - orchestrator for sync/async modes
@@ -112,7 +114,10 @@ type Orch struct {
 func main() {
 	thrFlag := flag.Int("thr", 1, "Thread count (single mode only)")
 	listFlag := flag.String("l", "", "Request files list, comma separated")
-	reFlag := flag.String("re", "", "Regex file: each line N regex from r(N) response that is substituted on r(N+1). Leave line empty for fire-and-forget.")
+	reFlag := flag.String("re", "", "Regex definitions file. Format for each line: regex`:key $ regex2`:key2 ... regexK`:keyK\n"+
+		"Where line N will apply regexes on response N to populate the request N+1 $key$ placeholder.\nNote: A blank line break (\\n)"+
+		" means the given request will not wait for the response! Example, -l r1,r2,r3 -re re.txt, with re.txt as:\n"+
+		" regex1`:key1\n\n regex3`:key3\nMeans request r2 is sent and then request r3, r2 response is never read.")
 	modeFlag := flag.String("mode", "async", "Mode: async or sync")
 	delayFlag := flag.Int("d", 0, "Delay ms between requests (single mode only)")
 	hostFlag := flag.String("h", "", "Host override: host:port")
@@ -126,7 +131,13 @@ func main() {
 	touFlag := flag.Int("tou", 10000, "TLS dial timeout (ms)")
 	retryFlag := flag.Int("retry", 3, "Max connection retries")
 	httpFlag := flag.Bool("http2", false, "Force HTTP/2")
-	univFlag := flag.String("u", "", "Universal: FIFO path or key=value for $_key$ substitution")
+	univFlag := flag.String("u", "", "Universaly replaces key=val.\nIf key=value, ie., $num$=179, will match/replace every"+
+		" $num$ (requests) to 179.\nIf a path. ie., /tmp/fifo, will create a named-pipe where other program can write key=value"+
+		"\nExample of a password-spray racer: ./trem <params> -u /tmp/fifo || cat pass-spray.txt > /tmp/fifo\n"+
+		"    With pass-spray.txt as: $pass$=21938712\n"+
+		"                            32847832\n"+
+		"                            32473872\n"+
+		"                            ...")
 	fmodeFlag := flag.Int("fmode", 1, "FIFO distribution mode: 1=round-robin, 2=broadcast")
 	fwFlag := flag.Bool("fw", true, "FIFO wait: wait for first value before starting workers")
 	mtlsFlag := flag.String("mtls", "", "mTLS client cert: file.p12:password")
@@ -147,7 +158,6 @@ func main() {
 		"Example:\n  1,3,5 thr=25 mode=async delay=25 x=1 xt=2\n  2,4 thr=10 mode=sync delay=0 x=2 xt=10 sb=1")
 	flag.Parse()
 
-	PrintLogo()
 	verbose = *verboseFlag
 
 	// Stats collection window size
@@ -157,6 +167,8 @@ func main() {
 	} else if windowSize < 1 {
 		windowSize = 10
 	}
+
+	PrintLogo()
 
 	// Check for unexpected positional arguments
 	if flag.NArg() > 0 {
@@ -195,42 +207,6 @@ func main() {
 			*cliFlag, *touFlag, *retryFlag, *httpFlag, *fwFlag, *fbckFlag,
 			*mtlsFlag, *dumpFlag, windowSize)
 	}
-}
-
-// setupValDist - creates and initializes value distributor
-func setupValDist(univFlag string, fmodeFlag, totalThreads int, logger LogWriter) *ValDist {
-	if univFlag == "" {
-		return NewValDist("", 1, totalThreads)
-	}
-	if !strings.Contains(univFlag, "=") {
-		vd := NewValDist(univFlag, fmodeFlag, totalThreads)
-		if err := vd.EnsureFifo(); err != nil {
-			exitErr(fmt.Sprintf("FIFO error: %v", err))
-		}
-		vd.Start(logger)
-		return vd
-	}
-	parts := strings.Split(univFlag, "=")
-	if len(parts) != 2 {
-		exitErr("Universal must be key=val or file (FIFO) path")
-	}
-	return NewValDistStatic(parts[0], parts[1])
-}
-
-// loadMTLSCert - loads mTLS certificate if specified
-func loadMTLSCert(mtlsFlag string) *utls.Certificate {
-	if mtlsFlag == "" {
-		return nil
-	}
-	certAndPass := strings.Split(mtlsFlag, ":")
-	if len(certAndPass) != 2 {
-		exitErr("Client Certificate (mTLS) must be file:pass!")
-	}
-	cert, err := loadPKCS12Certificate(certAndPass[0], certAndPass[1])
-	if err != nil {
-		exitErr(err.Error())
-	}
-	return &cert
 }
 
 // runGroupMode - executes TREM with thread groups from -thrG file
@@ -280,6 +256,12 @@ func runGroupMode(groupsFile string, reqFiles []string, actionPatterns map[int]*
 	// Init stats
 	stats = NewStatsCollector(windowSize, verbose)
 	stats.SetValDist(valDist)
+	// Configure group offsets for stats G#T# display
+	offsets := make([]int, len(groups))
+	for i, g := range groups {
+		offsets[i] = g.StartThreadID
+	}
+	stats.SetGroupOffsets(offsets)
 	ui.StartStatsConsumer(stats.OutputChan())
 
 	// Load mTLS certificate
@@ -305,7 +287,6 @@ func runGroupMode(groupsFile string, reqFiles []string, actionPatterns map[int]*
 				actionPatterns: actionPatterns,
 				valChan:        valDist.GetThreadChan(globalID),
 				localBuffer:    make(map[string][]string),
-				staticVals:     make(map[string]string),
 			}
 		}
 
@@ -361,16 +342,16 @@ func runGroupMode(groupsFile string, reqFiles []string, actionPatterns map[int]*
 		}
 
 		go func(o *Orch) {
+			// Apply start delay for this group
+			if o.startDelay > 0 {
+				time.Sleep(time.Duration(o.startDelay) * time.Millisecond)
+			}
+
 			// Wait for FIFO if enabled
 			if o.fifoWait {
 				stats.SetFifoWaiting(true)
 				o.valDist.WaitFirst()
 				stats.SetFifoWaiting(false)
-			}
-
-			// Apply start delay for this group
-			if o.startDelay > 0 {
-				time.Sleep(time.Duration(o.startDelay) * time.Millisecond)
 			}
 
 			// Start workers
@@ -395,7 +376,7 @@ func runGroupMode(groupsFile string, reqFiles []string, actionPatterns map[int]*
 		stats.Stop()
 		valDist.Stop()
 		ui.BroadcastMessage("\n=== All requests completed ===\n")
-		ui.BroadcastMessage("Press Q to quit, Ctrl+N/P:Groups, Tab:Threads\n")
+		ui.BroadcastMessage("Press Q to quit, Ctrl+P:Groups, Tab:Threads\n")
 	}()
 
 	if err := ui.Run(); err != nil {
@@ -473,7 +454,6 @@ func runSingleMode(reqFiles []string, reFlag string, thrFlag int, modeFlag strin
 			actionPatterns: actionPatterns,
 			valChan:        valDist.GetThreadChan(i),
 			localBuffer:    make(map[string][]string),
-			staticVals:     make(map[string]string),
 		}
 	}
 
@@ -724,14 +704,12 @@ func (o *Orch) runWorker(w *monkey) {
 
 			w.prevResp = ""
 
-			// Clear buffers for fresh loop iteration
+			// Clear non-static buffers for fresh loop iteration
+			// Static values (keys starting with _) are preserved in globalStaticVals
 			for k := range w.localBuffer {
-				if len(k) > 1 && k[1] != '_' {
+				if len(k) > 1 && k[0] != '_' {
 					delete(w.localBuffer, k)
 				}
-			}
-			for k := range w.staticVals {
-				delete(w.staticVals, k)
 			}
 
 			// Execute loop requests starting from loopStart (relative to group)
