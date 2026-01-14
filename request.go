@@ -78,65 +78,50 @@ func parseRawReq2H2(raw string) *ParsedReq {
 	return req
 }
 
-// prepareReq - loads request (absIdx) and applies patterns (relIdx)
-// Single mode: relIdx == absIdx
-// Group mode: relIdx = position in group, absIdx = position in reqFiles
-func (o *Orch) prepareReq(w *monkey, relIdx, absIdx int) (string, error) {
-	var raw []byte
-	var err error
+// prepareReq - loads request template and applies pattern extractions
+// relIdx: relative index in group (for patterns)
+// absIdx: absolute index in reqFiles (for file loading)
+// Returns: template, values from patterns+static, error
+func (o *Orch) prepareReq(w *monkey, relIdx, absIdx int) (*TemplateReq, map[string]string, error) {
+	var raw string
 
-	// Use cache if available (indexed by absolute index)
+	// use cache if available
 	if len(w.reqCache) > 0 {
-		raw = []byte(w.reqCache[absIdx])
+		raw = w.reqCache[absIdx]
 	} else {
-		raw, err = os.ReadFile(w.reqFiles[absIdx])
+		data, err := os.ReadFile(w.reqFiles[absIdx])
 		if err != nil {
-			return "", err
+			return nil, nil, err
 		}
+		raw = string(data)
 	}
-	req := string(raw)
 
-	// Apply pattern replacements (skip for first request in chain)
+	// get parsed template from cache
+	tmpl := getTemplate(w.reqFiles[absIdx], raw)
+	values := make(map[string]string)
+
+	// Phase 1: Apply pattern replacements (skip for first request in chain)
+	// Original behavior: patterns[relIdx-1] contains patterns for transition TO request relIdx
 	if relIdx > 0 && len(w.patterns) > relIdx-1 {
-		for _, p := range w.patterns[relIdx-1] {
-			// Skip extraction if static value already exists in global store
-			if len(p.keyword) > 0 && p.keyword[0] == '_' {
-				if _, exists := globalStaticVals.Load(p.keyword); exists {
-					continue
-				}
-			}
-
-			m := p.re.FindStringSubmatch(w.prevResp)
-			if m == nil {
-				if verbose {
-					w.logger.Write(fmt.Sprintf("[V] regex no match, pattern: %s\n", p.keyword))
-				}
-				return "", fmt.Errorf("regex did not match for: %s", p.keyword)
-			}
-			extracted := decodeExtracted(m[1])
-			req = strings.ReplaceAll(req, "$"+p.keyword+"$", extracted)
-			w.logger.Write(fmt.Sprintf("Matched %s: %s\n", p.keyword, extracted))
-
-			// Save static values (keys starting with _) to global store for cross-group access
-			if len(p.keyword) > 0 && p.keyword[0] == '_' {
-				globalStaticVals.Store(p.keyword, extracted)
-			}
+		patternVals, err := applyPatterns(w.patterns[relIdx-1], w.prevResp, w.logger)
+		if err != nil {
+			return nil, nil, err
+		}
+		for k, v := range patternVals {
+			values[k] = v
 		}
 	}
 
-	// Apply static values from global store (extracted from previous requests with _ prefix)
-	globalStaticVals.Range(func(key, value interface{}) bool {
-		k := key.(string)
-		v := value.(string)
-		fullKey := "$" + k + "$"
-		if strings.Contains(req, fullKey) {
-			req = strings.ReplaceAll(req, fullKey, v)
-			w.logger.Write(fmt.Sprintf("Static %s: %s\n", fullKey, v))
+	// Phase 2: Apply static values from global store (extracted from previous requests with _ prefix)
+	keyNames := getUniqueKeyNames(tmpl)
+	staticVals := collectStaticValues(keyNames, w.logger)
+	for k, v := range staticVals {
+		if _, exists := values[k]; !exists {
+			values[k] = v
 		}
-		return true
-	})
+	}
 
-	return req, nil
+	return tmpl, values, nil
 }
 
 // doBarrier - handles sync barrier: dial and wait for all threads
@@ -166,24 +151,28 @@ func (o *Orch) doBarrier(w *monkey, relIdx int, addr string) error {
 	return nil
 }
 
-// processReq - unified request processor for sync/async modes with FIFO combinations
+// processReq - unified request processor for sync/async modes
 // relIdx = relative index within group (for patterns and barriers)
 // absIdx = absolute index in reqFiles (for loading request and response actions)
 func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
-	baseReq, err := o.prepareReq(w, relIdx, absIdx)
+	// Phase 1: load template and apply patterns
+	tmpl, values, err := o.prepareReq(w, relIdx, absIdx)
 	if err != nil {
 		return err
 	}
 
-	// Handle static mode
-	if o.valDist.IsStatic() {
+	// Phase 2: handle static mode (-u key=val) - direct send
+	if o.valDist != nil && o.valDist.IsStatic() {
 		k, v := o.valDist.StaticKV()
-		req := strings.ReplaceAll(baseReq, "$"+k+"$", v)
+		if k != "" {
+			values[k] = v
+		}
+		req := buildRequest(tmpl, values)
+		req = normalizeReq(req)
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
 		}
-		// Barrier uses relIdx (relative to group)
 		if o.mode == "sync" && o.syncBarriers[relIdx] {
 			if err := o.doBarrier(w, relIdx, addr); err != nil {
 				return err
@@ -192,14 +181,25 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 		return o.sendReq(w, relIdx, absIdx, req, addr)
 	}
 
-	// Handle FIFO mode - drain channel first (limited by fifoBlockSize)
-	drainChannel(w, o.fifoBlockSize)
+	// Phase 3: handle FIFO mode - drain channel first
+	if o.valDist != nil && o.valDist.IsFifo() {
+		drainChannel(w, o.fifoBlockSize)
+	}
 
-	// Extract keys needed from request
-	keys := extractKeys(baseReq)
+	// Phase 4: get keys still needing values
+	keyNames := getUniqueKeyNames(tmpl)
+	var keys []string
+	for _, key := range keyNames {
+		if _, hasVal := values[key]; !hasVal {
+			keys = append(keys, key)
+		}
+	}
+
+	// No additional keys needed, send directly
 	if len(keys) == 0 {
-		// No FIFO keys, just send
-		addr, err := parseHost(baseReq, o.hostFlag)
+		req := buildRequest(tmpl, values)
+		req = normalizeReq(req)
+		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
 		}
@@ -208,20 +208,19 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 				return err
 			}
 		}
-		return o.sendReq(w, relIdx, absIdx, baseReq, addr)
+		return o.sendReq(w, relIdx, absIdx, req, addr)
 	}
 
-	// Check for missing keys
+	// Phase 5: check for missing keys in FIFO buffer
 	missing := checkMissingKeys(w.localBuffer, keys)
 	if len(missing) > 0 {
-		// Check globalStaticVals for _key patterns and substitute
+		// check globalStaticVals for _key patterns
 		n := 0
 		for _, k := range missing {
 			if len(k) > 0 && k[0] == '_' {
 				if v, exists := globalStaticVals.Load(k); exists {
-					fullKey := "$" + k + "$"
-					baseReq = strings.ReplaceAll(baseReq, fullKey, v.(string))
-					w.logger.Write(fmt.Sprintf("Static %s: %s\n", fullKey, v.(string)))
+					values[k] = v.(string)
+					w.logger.Write(fmt.Sprintf("Static $%s$: %s\n", k, v.(string)))
 					continue
 				}
 			}
@@ -229,25 +228,26 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 			n++
 		}
 		missing = missing[:n]
+
 		if len(missing) > 0 && o.fifoWait {
-			// Block waiting, waitForKeys will emit periodic messages
 			if !waitForKeys(w, keys, o.quitChan) {
 				w.logger.Write("FIFO closed while waiting for keys\n")
 				return fmt.Errorf("FIFO timeout waiting for keys: %v", missing)
 			}
-		} else {
-			// Warn and continue without substitution
+		} else if len(missing) > 0 {
 			for _, k := range missing {
 				w.logger.Write(fmt.Sprintf("Key %s not found in FIFO, sending anyway!\n", k))
 			}
 		}
 	}
 
-	// Generate combinations: each key=value creates a new request
+	// Phase 6: generate combinations from FIFO buffer
 	combinations := generateCombinations(w.localBuffer, keys)
 	if len(combinations) == 0 {
-		// No values available, send as-is
-		addr, err := parseHost(baseReq, o.hostFlag)
+		// no values available, send as-is
+		req := buildRequest(tmpl, values)
+		req = normalizeReq(req)
+		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
 		}
@@ -256,25 +256,30 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 				return err
 			}
 		}
-		return o.sendReq(w, relIdx, absIdx, baseReq, addr)
+		return o.sendReq(w, relIdx, absIdx, req, addr)
 	}
 
-	// Send request for each combination
-	// Barrier triggers on FIRST combination only
+	// Phase 7: send request for each combination
 	firstReq := true
 	for _, combo := range combinations {
-		req := baseReq
+		// merge pattern/static values with combo values
+		mergedVals := make(map[string]string, len(values)+len(combo))
+		for k, v := range values {
+			mergedVals[k] = v
+		}
 		for k, v := range combo {
-			req = strings.ReplaceAll(req, "$"+k+"$", v)
+			mergedVals[k] = v
 			w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, v))
 		}
 
+		req := buildRequest(tmpl, mergedVals)
+		req = normalizeReq(req)
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
 		}
 
-		// Barrier only on first request of combinations
+		// barrier only on first request of combinations
 		if firstReq && o.mode == "sync" && o.syncBarriers[relIdx] {
 			if err := o.doBarrier(w, relIdx, addr); err != nil {
 				return err
@@ -287,82 +292,29 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 		}
 	}
 
-	// Consume used values
+	// consume used values
 	consumeValues(w.localBuffer, keys, o.fifoBlockSize)
 	return nil
 }
 
-func normalizeRequest(req string) string {
-	lines := strings.Split(req, "\n")
-	var normalized []string
-	var bodyStartIndex int = -1
-	var hasEmptyLine bool
-
-	for i, line := range lines {
-		line = strings.TrimRight(line, "\r")
-		if i == 0 && !strings.Contains(line, "HTTP/") {
-			line = line + " HTTP/1.1"
-		} else if i == 0 && strings.Contains(line, "HTTP/") && !strings.Contains(line, "HTTP/1.1") {
-			line = httpVersionRe.ReplaceAllString(line, "HTTP/1.1")
-		}
-
-		normalized = append(normalized, line)
-
-		if line == "" && bodyStartIndex == -1 {
-			bodyStartIndex = i + 1
-			hasEmptyLine = true
-		}
-	}
-
-	// Ensure empty line exists after headers (before body or at end)
-	if !hasEmptyLine {
-		normalized = append(normalized, "")
-		bodyStartIndex = len(normalized)
-	}
-
-	if bodyStartIndex > 0 && bodyStartIndex < len(normalized) {
-		bodyLines := normalized[bodyStartIndex:]
-		body := strings.Join(bodyLines, "\r\n")
-		bodyLen := len([]byte(body))
-
-		foundContentLength := false
-		for i := 1; i < bodyStartIndex-1; i++ {
-			if strings.HasPrefix(strings.ToLower(normalized[i]), "content-length:") {
-				normalized[i] = fmt.Sprintf("Content-Length: %d", bodyLen)
-				foundContentLength = true
-				break
-			}
-		}
-		if !foundContentLength && bodyLen > 0 {
-			normalized = append(normalized[:bodyStartIndex-1],
-				append([]string{fmt.Sprintf("Content-Length: %d", bodyLen)},
-					normalized[bodyStartIndex-1:]...)...)
-		}
-	}
-
-	return strings.Join(normalized, "\r\n")
-}
-
-// sendReq - unified request sender for both sync/async modes
+// sendReq - sends prepared request (already normalized)
 // relIdx = relative index (for patterns/fire-and-forget/loop detection)
 // absIdx = absolute index (for logging and response actions)
 func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) error {
-	req = normalizeRequest(req)
-
-	// Save loop start req and addr (using relIdx for comparison)
+	// save loop start req and addr
 	if o.loopStart > 0 && relIdx == o.loopStart-1 {
 		w.loopStartReq = req
 		w.loopStartAddr = addr
 	}
 
-	// Fire-and-forget detection uses relIdx (group patterns)
+	// fire-and-forget detection uses relIdx (group patterns)
 	fireAndForget := relIdx < len(w.patterns) && len(w.patterns[relIdx]) == 0
 
 	var resp, status string
 	var err error
 
 	if o.keepAlive || o.httpH2 {
-		// Keep-alive: reconnect if addr changed or not connected
+		// keep-alive: reconnect if addr changed or not connected
 		if addr != w.connAddr || (w.conn == nil && w.h2conn == nil) {
 			o.closeWorkerConn(w)
 			w.logger.Write(fmt.Sprintf("Conn-Keep (r%d): %s\n", absIdx+1, addr))
@@ -371,12 +323,11 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 			}
 		}
 
-		// Fire-and-forget: send without waiting for response
+		// fire-and-forget: send without waiting for response
 		if fireAndForget {
 			w.logger.Write(fmt.Sprintf("Fire&Forget (r%d)\n", absIdx+1))
 			bytesOut := uint32(len(req))
 			if o.httpH2 {
-				// HTTP/2: send headers+data frames only
 				parsedReq := parseRawReq2H2(req)
 				if parsedReq == nil {
 					return fmt.Errorf("failed to parse request for fire-and-forget")
@@ -385,25 +336,23 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 					return err
 				}
 			} else {
-				// HTTP/1.1: write and close
 				_, err = w.conn.Write([]byte(req))
 				if err != nil {
 					return err
 				}
 			}
-			// Report stats for fire-and-forget (no latency, no bytes in)
 			stats.ReportRequest(w.id, 0, 0, bytesOut)
-			o.closeWorkerConn(w) // force new connection for next request
+			o.closeWorkerConn(w)
 			w.prevResp = ""
 			return nil
 		}
 
 		resp, status, err = o.sendWithReconnect(w, []byte(req), addr)
 	} else {
-		// No keep-alive: new connection each request
+		// no keep-alive: new connection each request
 		w.logger.Write(fmt.Sprintf("Conn (r%d): %s\n", absIdx+1, addr))
 
-		// Fire-and-forget in non-keepalive mode
+		// fire-and-forget in non-keepalive mode
 		if fireAndForget {
 			w.logger.Write(fmt.Sprintf("Fire&Forget (r%d)\n", absIdx+1))
 			conn, dialErr := o.dialNewConn(addr)
@@ -415,7 +364,6 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 			if err != nil {
 				return err
 			}
-			// Report stats for fire-and-forget (no latency, no bytes in)
 			stats.ReportRequest(w.id, 0, 0, uint32(len(req)))
 			w.prevResp = ""
 			return nil
@@ -431,14 +379,14 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 	w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
 	w.prevResp = resp
 
-	// Apply response actions (uses absIdx for global pattern matching)
+	// apply response actions (uses absIdx for global pattern matching)
 	if w.actionPatterns != nil && w.actionPatterns[absIdx] != nil {
 		if err := o.applyResponseActions(w, absIdx, req, resp, status); err != nil {
 			return err
 		}
 	}
 
-	// Close if not keepalive (HTTP/1.1 only, H2 always reuses)
+	// close if not keepalive (HTTP/1.1 only, H2 always reuses)
 	if !o.keepAlive && !o.httpH2 {
 		o.closeWorkerConn(w)
 	}

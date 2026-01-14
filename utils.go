@@ -35,9 +35,6 @@ type actionPattern struct {
 // Pre-compiled regex for parseHost
 var hostHeaderRe = regexp.MustCompile(`(?im)^Host:\s*([^:\r\n]+)(?::(\d+))?`)
 
-// Pre-compiled regex for extracting $key$ patterns
-var keyPatternRe = regexp.MustCompile(`\$([^$]+)\$`)
-
 // drainChannel - drains messages from channel into localBuffer (non-blocking)
 // limit=0 means unlimited, otherwise drains at most 'limit' messages
 func drainChannel(w *monkey, limit int) {
@@ -128,27 +125,6 @@ func checkMissingKeys(buffer map[string][]string, keys []string) []string {
 	return missing
 }
 
-// extractKeys - extracts all $key$ patterns from request string
-func extractKeys(req string) []string {
-	matches := keyPatternRe.FindAllStringSubmatch(req, -1)
-	keys := make([]string, 0, len(matches))
-	for _, m := range matches {
-		key := m[1]
-		// Linear search - faster for small N due to cache
-		found := false
-		for _, k := range keys {
-			if k == key {
-				found = true
-				break
-			}
-		}
-		if !found {
-			keys = append(keys, key)
-		}
-	}
-	return keys
-}
-
 // generateCombinations - generates cartesian product of values for keys
 // Returns list of maps, each map is one combination; which is one request later
 func generateCombinations(buffer map[string][]string, keys []string) []map[string]string {
@@ -200,25 +176,6 @@ func consumeValues(buffer map[string][]string, keys []string, count int) {
 			}
 		}
 	}
-}
-
-func countKeys(req string) int {
-	i := 0
-	cnt := make(map[string]int)
-	for {
-		start := strings.Index(req[i:], "$")
-		if start < 0 {
-			break
-		}
-		i += start + 1
-		end := strings.Index(req[i:], "$")
-		if end < 0 {
-			break
-		}
-		cnt[req[i:i+end]]++
-		i += end + 1
-	}
-	return len(cnt)
 }
 
 func FormatConfig(threads, delay, loopStart, loopTimes, cliHello, fbck int,
@@ -598,30 +555,6 @@ func parseActions(s string) ([]respAction, error) {
 	}
 
 	return actions, nil
-}
-
-// saveToFile - saves content to file with _idx_epoch suffix
-func saveToFile(basePath string, idx int, content string) error {
-	epoch := time.Now().Unix()
-	var finalPath string
-
-	dotIdx := strings.LastIndexByte(basePath, '.')
-	if dotIdx > 0 {
-		// Insert before extension: /path/file.txt -> /path/file_idx_epoch.txt
-		finalPath = fmt.Sprintf("%s_%d_%d%s", basePath[:dotIdx], idx, epoch, basePath[dotIdx:])
-	} else {
-		// No extension: /path/file -> /path/file_idx_epoch
-		finalPath = fmt.Sprintf("%s_%d_%d", basePath, idx, epoch)
-	}
-
-	return os.WriteFile(finalPath, []byte(content), 0644)
-}
-
-// formatH2ResponseAsH1 - converts H2 response headers to HTTP/1.1 format
-func formatH2ResponseAsH1(resp string, status string) string {
-	// H2 response from readResponse is already: "header: value\r\n...\r\n\r\nbody"
-	// Just prepend HTTP/1.1 status line
-	return fmt.Sprintf("HTTP/1.1 %s \r\n%s", status, resp)
 }
 
 // setupValDist - creates and initializes value distributor

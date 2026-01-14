@@ -138,7 +138,8 @@ func main() {
 		"                            32847832\n"+
 		"                            32473872\n"+
 		"                            ...")
-	fmodeFlag := flag.Int("fmode", 1, "FIFO distribution mode: 1=round-robin, 2=broadcast")
+	fmodeFlag := flag.Int("fmode", 2, "FIFO distribution mode: \n 1 Broadcast: every value is sent to every thread\n 2 Round-robin:"+
+		" each value new value is sent to one thread.")
 	fwFlag := flag.Bool("fw", true, "FIFO wait: wait for first value before starting workers")
 	mtlsFlag := flag.String("mtls", "", "mTLS client cert: file.p12:password")
 	swFlag := flag.Int("sw", 10, "Stats window: sample size for RPS/jitter calculation")
