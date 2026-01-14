@@ -123,12 +123,6 @@ func checkMissingKeys(buffer map[string][]string, keys []string) []string {
 		if len(buffer[k]) > 0 {
 			continue
 		}
-		// For _key patterns, also check globalStaticVals
-		if len(k) > 0 && k[0] == '_' {
-			if _, exists := globalStaticVals.Load(k); exists {
-				continue
-			}
-		}
 		missing = append(missing, k)
 	}
 	return missing

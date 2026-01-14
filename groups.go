@@ -316,7 +316,7 @@ func formatGroupsSummary(groups []*ThreadGroup) string {
 			loopStr = "∞"
 		}
 
-		lines = append(lines, fmt.Sprintf("G%d: %s %dt [%s] x%d→%s",
+		lines = append(lines, fmt.Sprintf("G%d: %s %dthrds [%s] x%d→%s",
 			g.ID+1, g.Mode, g.ThreadCount,
 			strings.Join(reqNames, ","),
 			g.LoopStart, loopStr))

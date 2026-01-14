@@ -214,7 +214,22 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	// Check for missing keys
 	missing := checkMissingKeys(w.localBuffer, keys)
 	if len(missing) > 0 {
-		if o.fifoWait {
+		// Check globalStaticVals for _key patterns and substitute
+		n := 0
+		for _, k := range missing {
+			if len(k) > 0 && k[0] == '_' {
+				if v, exists := globalStaticVals.Load(k); exists {
+					fullKey := "$" + k + "$"
+					baseReq = strings.ReplaceAll(baseReq, fullKey, v.(string))
+					w.logger.Write(fmt.Sprintf("Static %s: %s\n", fullKey, v.(string)))
+					continue
+				}
+			}
+			missing[n] = k
+			n++
+		}
+		missing = missing[:n]
+		if len(missing) > 0 && o.fifoWait {
 			// Block waiting, waitForKeys will emit periodic messages
 			if !waitForKeys(w, keys, o.quitChan) {
 				w.logger.Write("FIFO closed while waiting for keys\n")
