@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -85,7 +86,6 @@ func getUniqueKeyNames(tmpl *TemplateReq) []string {
 
 	seen := make(map[string]bool, len(tmpl.Keys))
 	names := make([]string, 0, len(tmpl.Keys))
-
 	for _, k := range tmpl.Keys {
 		if !seen[k.Name] {
 			seen[k.Name] = true
@@ -110,7 +110,6 @@ func buildRequest(tmpl *TemplateReq, values map[string]string) string {
 			growth += len(v) - (k.End - k.Start)
 		}
 	}
-
 	var sb strings.Builder
 	sb.Grow(len(tmpl.Raw) + growth)
 
@@ -124,7 +123,6 @@ func buildRequest(tmpl *TemplateReq, values map[string]string) string {
 			// keep placeholder if value not found
 			sb.WriteString(tmpl.Raw[k.Start:k.End])
 		}
-
 		prevEnd = k.End
 	}
 
@@ -141,18 +139,14 @@ func normalizeReq(req string) string {
 	if reqLineEnd < 0 {
 		return req
 	}
-
 	requestLine := strings.TrimRight(req[:reqLineEnd], "\r")
-
 	// ensure HTTP/1.1
 	if !strings.Contains(requestLine, " HTTP/") {
 		requestLine += " HTTP/1.1"
 	} else if !strings.HasSuffix(requestLine, "HTTP/1.1") {
 		requestLine = httpVersionRe.ReplaceAllString(requestLine, "HTTP/1.1")
 	}
-
 	rest := req[reqLineEnd+1:]
-
 	// find headers/body separator
 	var headersPart, body string
 	if sepIdx := strings.Index(rest, "\r\n\r\n"); sepIdx >= 0 {
@@ -165,7 +159,6 @@ func normalizeReq(req string) string {
 		headersPart = strings.TrimRight(rest, "\r\n")
 		body = ""
 	}
-
 	// process headers
 	headerLines := strings.Split(headersPart, "\n")
 	headers := make([]string, 0, len(headerLines))
@@ -178,7 +171,6 @@ func normalizeReq(req string) string {
 		if line == "" {
 			continue
 		}
-
 		lower := strings.ToLower(line)
 		if strings.HasPrefix(lower, "content-length:") {
 			hasContentLen = true
@@ -189,50 +181,27 @@ func normalizeReq(req string) string {
 		}
 		headers = append(headers, line)
 	}
-
 	bodyLen := len(body)
-
 	// set Content-Length (skip if Transfer-Encoding present)
 	if !hasTransferEnc {
 		if hasContentLen && contentLenIdx >= 0 {
-			headers[contentLenIdx] = "Content-Length: " + itoa(bodyLen)
+			headers[contentLenIdx] = "Content-Length: " + strconv.Itoa(bodyLen)
 		} else if bodyLen > 0 {
-			headers = append(headers, "Content-Length: "+itoa(bodyLen))
+			headers = append(headers, "Content-Length: "+strconv.Itoa(bodyLen))
 		}
 	}
-
 	// rebuild request
 	var sb strings.Builder
 	sb.Grow(len(req) + 32)
-
 	sb.WriteString(requestLine)
 	sb.WriteString("\r\n")
-
 	for _, h := range headers {
 		sb.WriteString(h)
 		sb.WriteString("\r\n")
 	}
-
 	sb.WriteString("\r\n")
 	sb.WriteString(body)
-
 	return sb.String()
-}
-
-// itoa - int to string without strconv import :)
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
 }
 
 // applyPatterns - applies regex patterns to extract values from previous response
@@ -240,15 +209,7 @@ func itoa(n int) string {
 // Note: patterns[relIdx-1] contains patterns for transition TO request relIdx
 func applyPatterns(pats []pattern, prevResp string, logger LogWriter) (map[string]string, error) {
 	values := make(map[string]string, len(pats))
-
 	for _, p := range pats {
-		// skip if static value already exists in global store
-		if len(p.keyword) > 0 && p.keyword[0] == '_' {
-			if _, exists := globalStaticVals.Load(p.keyword); exists {
-				continue
-			}
-		}
-
 		m := p.re.FindStringSubmatch(prevResp)
 		if m == nil {
 			if verbose {
@@ -274,7 +235,6 @@ func applyPatterns(pats []pattern, prevResp string, logger LogWriter) (map[strin
 // Only collects for keys that exist in request and have values in global store
 func collectStaticValues(keys []string, logger LogWriter) map[string]string {
 	values := make(map[string]string)
-
 	for _, key := range keys {
 		if len(key) > 0 && key[0] == '_' {
 			if v, exists := globalStaticVals.Load(key); exists {

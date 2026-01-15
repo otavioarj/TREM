@@ -80,7 +80,7 @@ type Orch struct {
 	loopReadyChan chan int // workers signal ready for next loop
 	wg            sync.WaitGroup
 	hostFlag      string
-	delayMs       int
+	reqDelayMs    int // delay between requests (from -d or r_delay)
 	outFlag       bool
 	keepAlive     bool
 	proxyURL      string
@@ -108,7 +108,7 @@ type Orch struct {
 	// Group mode fields
 	groupID    int   // group identifier (0-based)
 	reqIndices []int // request indices for this group (0-based, sorted)
-	startDelay int   // delay ms before starting threads
+	startDelay int   // delay ms before starting threads (s_delay)
 }
 
 func main() {
@@ -119,7 +119,7 @@ func main() {
 		" means the given request will not wait for the response! Example, -l r1,r2,r3 -re re.txt, with re.txt as:\n"+
 		" regex1`:key1\n\n regex3`:key3\nMeans request r2 is sent and then request r3, r2 response is never read.")
 	modeFlag := flag.String("mode", "async", "Mode: async or sync")
-	delayFlag := flag.Int("d", 0, "Delay ms between requests (single mode only)")
+	delayFlag := flag.Int("d", 0, "Delay ms between requests")
 	hostFlag := flag.String("h", "", "Host override: host:port")
 	outFlag := flag.Bool("o", false, "Output last response to file")
 	kaFlag := flag.Bool("k", true, "Keep-alive: reuse TLS connection for chain")
@@ -154,9 +154,11 @@ func main() {
 		" sa  - save request and response that generated the match, and pause thread.\n e   - gracefully exit on match, use as last action if combined with others!")
 	fbckFlag := flag.Int("fbck", 64, "FIFO block consumption: max values to drain per request (0=unlimited).")
 	thrGFlag := flag.String("thrG", "", "Thread groups file. Defines independent request groups with separate threads.\n"+
-		"When present, -thr, -mode, -d, -x, -xt, -sb, -re are ignored (defined per group).\n"+
-		"Format per line: indices thr=N mode=sync|async delay=N [x=N] [xt=N] [sb=N,M] [re=file]\n"+
-		"Example:\n  1,3,5 thr=25 mode=async delay=25 x=1 xt=2\n  2,4 thr=10 mode=sync delay=0 x=2 xt=10 sb=1")
+		"When present, -thr, -mode, -x, -xt, -sb, -re are ignored (defined per group).\n"+
+		"Format per line, [] are optionals: req indices thr=N mode=sync|async s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N,M] [re=file]\n"+
+		"  s_delay = start delay (ms delay to start group chain)\n"+
+		"  r_delay = request delay (ms between requests, equals to -d flag if this omitted)\n"+
+		"Example:\n  1,3,5 thr=25 mode=async s_delay=25 r_delay=10 x=1 xt=2\n  2,4 thr=10 mode=sync s_delay=0 x=2 xt=10 sb=1")
 	flag.Parse()
 
 	verbose = *verboseFlag
@@ -192,61 +194,96 @@ func main() {
 		exitErr(fmt.Sprintf("invalid -ra: %v", err))
 	}
 
-	// Branch: Group mode (-thrG) or Single mode (-thr)
+	// Build groups: either from -thrG file or synthetic single group
+	var groups []*ThreadGroup
+
+	// Single Mode now is the group mode with just one group!
+	// This simplify the code and reduce overheads, and the TUI is more intuitive :)
 	if *thrGFlag != "" {
-		runGroupMode(*thrGFlag, reqFiles, actionPatterns, *univFlag, *fmodeFlag,
-			*hostFlag, *outFlag, *kaFlag, *proxyFlag, *cliFlag, *touFlag,
-			*retryFlag, *httpFlag, *fwFlag, *fbckFlag, *mtlsFlag, *dumpFlag, windowSize)
+		// Group mode: parse groups file
+		groups, err = parseGroupsFile(*thrGFlag, len(reqFiles))
+		if err != nil {
+			exitErr(fmt.Sprintf("invalid -thrG: %v", err))
+		}
+
+		// Load patterns for each group
+		for _, g := range groups {
+			numTransitions := len(g.ReqIndices) - 1
+			if g.PatternsFile != "" {
+				patterns, err := loadPatterns(g.PatternsFile)
+				if err != nil {
+					exitErr(fmt.Sprintf("group %d patterns: %v", g.ID+1, err))
+				}
+				if len(patterns) < numTransitions {
+					exitErr(fmt.Sprintf("group %d: patterns file needs %d lines, got %d",
+						g.ID+1, numTransitions, len(patterns)))
+				}
+				g.Patterns = patterns[:numTransitions]
+			} else {
+				// No patterns file = fire-and-forget for all transitions
+				g.Patterns = make([][]pattern, numTransitions)
+			}
+		}
+
+		configBanner = formatGroupsBanner(groups, *univFlag)
 	} else {
-		// Single mode requires -re
+		// Single mode: requires -re and -thr, creates synthetic group
 		if *reFlag == "" {
 			exitErr("-re is required in single mode (or use -thrG for group mode)")
 		}
-		runSingleMode(reqFiles, *reFlag, *thrFlag, *modeFlag, *delayFlag,
-			*loopStartFlag, *loopTimesFlag, *sbFlag, actionPatterns,
-			*univFlag, *fmodeFlag, *hostFlag, *outFlag, *kaFlag, *proxyFlag,
-			*cliFlag, *touFlag, *retryFlag, *httpFlag, *fwFlag, *fbckFlag,
-			*mtlsFlag, *dumpFlag, windowSize)
+
+		if *loopStartFlag > len(reqFiles) {
+			exitErr(fmt.Sprintf("-x must be between 1 and %d", len(reqFiles)))
+		}
+		loopStart := *loopStartFlag
+		if loopStart == 0 || (loopStart == -1 && *loopTimesFlag > 1) {
+			loopStart = 1
+		}
+
+		allPatterns, err := loadPatterns(*reFlag)
+		if err != nil {
+			exitErr(err.Error())
+		}
+		if len(allPatterns) < len(reqFiles)-1 {
+			exitErr(fmt.Sprintf("regex file must have %d lines, got %d", len(reqFiles)-1, len(allPatterns)))
+		}
+
+		// Parse sync barriers
+		var syncBarriers map[int]bool
+		if *sbFlag != "" {
+			syncBarriers, err = parseIndexList(*sbFlag)
+			if err != nil {
+				exitErr(fmt.Sprintf("invalid -sb: %v", err))
+			}
+		} else {
+			syncBarriers = make(map[int]bool)
+		}
+
+		// Create synthetic single group
+		group := createSingleGroup(len(reqFiles), *thrFlag, *modeFlag,
+			loopStart, *loopTimesFlag, syncBarriers, allPatterns)
+		group.ReqDelay = delayFlag // use -d flag value
+		groups = []*ThreadGroup{group}
+		// Still using the same Stat format from previous single mode
+		configBanner = FormatConfig(*thrFlag, *delayFlag, loopStart, *loopTimesFlag, *cliFlag, *fbckFlag,
+			*kaFlag, verbose, *httpFlag, *proxyFlag, *hostFlag, *mtlsFlag, *modeFlag, *univFlag)
 	}
+
+	// Run unified orchestration, now TREM has always group(s), more simple and elegant
+	runOrchestration(groups, reqFiles, actionPatterns, *univFlag, *fmodeFlag,
+		*hostFlag, *outFlag, *kaFlag, *proxyFlag, *cliFlag, *touFlag,
+		*retryFlag, *httpFlag, *fwFlag, *fbckFlag, *mtlsFlag, *dumpFlag, windowSize, *delayFlag)
 }
 
-// runGroupMode - executes TREM with thread groups from -thrG file
-func runGroupMode(groupsFile string, reqFiles []string, actionPatterns map[int]*actionPattern,
+// runOrchestration - unified execution for both single and group modes
+func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns map[int]*actionPattern,
 	univFlag string, fmodeFlag int, hostFlag string, outFlag, kaFlag bool,
 	proxyFlag string, cliFlag, touFlag, retryFlag int, httpFlag, fwFlag bool,
-	fbckFlag int, mtlsFlag string, dumpFlag bool, windowSize int) {
-
-	// Parse groups file
-	groups, err := parseGroupsFile(groupsFile, len(reqFiles))
-	if err != nil {
-		exitErr(fmt.Sprintf("invalid -thrG: %v", err))
-	}
-
-	// Load patterns for each group
-	for _, g := range groups {
-		numTransitions := len(g.ReqIndices) - 1
-		if g.PatternsFile != "" {
-			patterns, err := loadPatterns(g.PatternsFile)
-			if err != nil {
-				exitErr(fmt.Sprintf("group %d patterns: %v", g.ID+1, err))
-			}
-			if len(patterns) < numTransitions {
-				exitErr(fmt.Sprintf("group %d: patterns file needs %d lines, got %d",
-					g.ID+1, numTransitions, len(patterns)))
-			}
-			g.Patterns = patterns[:numTransitions]
-		} else {
-			// No patterns file = fire-and-forget for all transitions
-			g.Patterns = make([][]pattern, numTransitions)
-		}
-	}
+	fbckFlag int, mtlsFlag string, dumpFlag bool, windowSize int, defaultDelay int) {
 
 	totalThreads := getTotalThreads(groups)
 
-	// Generate config banner for groups
-	configBanner = formatGroupsBanner(groups, univFlag)
-
-	// Init UI with groups
+	// Init UI with groups (always uses group-based layout now)
 	ui := NewUIManager(totalThreads, dumpFlag)
 	ui.SetupGroups(groups)
 	ui.Build()
@@ -257,6 +294,7 @@ func runGroupMode(groupsFile string, reqFiles []string, actionPatterns map[int]*
 	// Init stats
 	stats = NewStatsCollector(windowSize, verbose)
 	stats.SetValDist(valDist)
+
 	// Configure group offsets for stats G#T# display
 	offsets := make([]int, len(groups))
 	for i, g := range groups {
@@ -273,6 +311,12 @@ func runGroupMode(groupsFile string, reqFiles []string, actionPatterns map[int]*
 	var allWg sync.WaitGroup
 
 	for _, g := range groups {
+		// Determine request delay: group r_delay or default from -d flag
+		reqDelay := defaultDelay
+		if g.ReqDelay != nil {
+			reqDelay = *g.ReqDelay
+		}
+
 		// Create monkeys for this group
 		monkeys := make([]*monkey, g.ThreadCount)
 		for i := 0; i < g.ThreadCount; i++ {
@@ -296,7 +340,7 @@ func runGroupMode(groupsFile string, reqFiles []string, actionPatterns map[int]*
 			mode:          g.Mode,
 			monkeys:       monkeys,
 			hostFlag:      hostFlag,
-			delayMs:       0,
+			reqDelayMs:    reqDelay,
 			outFlag:       outFlag,
 			keepAlive:     kaFlag,
 			proxyURL:      proxyFlag,
@@ -316,7 +360,7 @@ func runGroupMode(groupsFile string, reqFiles []string, actionPatterns map[int]*
 			uiManager:     ui,
 			groupID:       g.ID,
 			reqIndices:    g.ReqIndices,
-			startDelay:    g.Delay,
+			startDelay:    g.StartDelay,
 		}
 		orch.pauseCond = sync.NewCond(&orch.pauseMu)
 
@@ -378,156 +422,6 @@ func runGroupMode(groupsFile string, reqFiles []string, actionPatterns map[int]*
 		valDist.Stop()
 		ui.BroadcastMessage("\n=== All requests completed ===\n")
 		ui.BroadcastMessage("Press Q to quit, Ctrl+P:Groups, Tab:Threads\n")
-	}()
-
-	if err := ui.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "TView error: %v\n", err)
-	}
-	defer ui.app.Stop()
-}
-
-// runSingleMode - executes TREM with single group (original behavior)
-func runSingleMode(reqFiles []string, reFlag string, thrFlag int, modeFlag string,
-	delayFlag, loopStartFlag, loopTimesFlag int, sbFlag string,
-	actionPatterns map[int]*actionPattern, univFlag string, fmodeFlag int,
-	hostFlag string, outFlag, kaFlag bool, proxyFlag string,
-	cliFlag, touFlag, retryFlag int, httpFlag, fwFlag bool,
-	fbckFlag int, mtlsFlag string, dumpFlag bool, windowSize int) {
-
-	if loopStartFlag > len(reqFiles) {
-		exitErr(fmt.Sprintf("-x must be between 1 and %d", len(reqFiles)))
-	}
-	if loopStartFlag == 0 || (loopStartFlag == -1 && loopTimesFlag > 1) {
-		loopStartFlag = 1
-	}
-
-	allPatterns, err := loadPatterns(reFlag)
-	if err != nil {
-		exitErr(err.Error())
-	}
-	if len(allPatterns) < len(reqFiles)-1 {
-		exitErr(fmt.Sprintf("regex file must have %d lines, got %d", len(reqFiles)-1, len(allPatterns)))
-	}
-
-	// Parse sync barriers
-	var syncBarriers map[int]bool
-	if sbFlag != "" {
-		syncBarriers, err = parseIndexList(sbFlag)
-		if err != nil {
-			exitErr(fmt.Sprintf("invalid -sb: %v", err))
-		}
-	} else {
-		syncBarriers = make(map[int]bool)
-	}
-
-	configBanner = FormatConfig(thrFlag, delayFlag, loopStartFlag, loopTimesFlag, cliFlag, fbckFlag,
-		kaFlag, verbose, httpFlag, proxyFlag, hostFlag, mtlsFlag, modeFlag, univFlag)
-
-	// Build request indices (all requests)
-	reqIndices := make([]int, len(reqFiles))
-	for i := range reqFiles {
-		reqIndices[i] = i
-	}
-
-	// Init UI in single mode
-	ui := NewUIManager(thrFlag, dumpFlag)
-	ui.SetupSingleMode(thrFlag, len(reqFiles))
-	ui.Build()
-
-	// Setup value distributor
-	valDist := setupValDist(univFlag, fmodeFlag, thrFlag, ui.GetLogger(0))
-
-	stats = NewStatsCollector(windowSize, verbose)
-	stats.SetValDist(valDist)
-	ui.StartStatsConsumer(stats.OutputChan())
-
-	// Create monkeys
-	monkeys := make([]*monkey, thrFlag)
-	for i := 0; i < thrFlag; i++ {
-		monkeys[i] = &monkey{
-			id:             i,
-			groupID:        0,
-			localID:        i,
-			logger:         ui.GetLogger(i),
-			reqFiles:       reqFiles,
-			reqIndices:     reqIndices,
-			patterns:       allPatterns,
-			actionPatterns: actionPatterns,
-			valChan:        valDist.GetThreadChan(i),
-			localBuffer:    make(map[string][]string),
-		}
-	}
-
-	// Load mTLS certificate
-	tlsCert := loadMTLSCert(mtlsFlag)
-
-	// Create orchestrator
-	orch := &Orch{
-		mode:          modeFlag,
-		monkeys:       monkeys,
-		hostFlag:      hostFlag,
-		delayMs:       delayFlag,
-		outFlag:       outFlag,
-		keepAlive:     kaFlag,
-		proxyURL:      proxyFlag,
-		loopStart:     loopStartFlag,
-		loopTimes:     loopTimesFlag,
-		quitChan:      make(chan struct{}),
-		clientHelloID: cliFlag,
-		tlsTimeout:    time.Duration(touFlag) * time.Millisecond,
-		tlsCert:       tlsCert,
-		maxRetries:    retryFlag,
-		httpH2:        httpFlag,
-		valDist:       valDist,
-		fifoWait:      fwFlag && valDist.IsFifo(),
-		syncBarriers:  syncBarriers,
-		pauseThreads:  make(map[int]bool),
-		uiManager:     ui,
-		fifoBlockSize: fbckFlag,
-		groupID:       0,
-		reqIndices:    reqIndices,
-	}
-	orch.pauseCond = sync.NewCond(&orch.pauseMu)
-
-	monkeysFinished := false
-	ui.SetupInputCapture([]*Orch{orch}, &monkeysFinished)
-
-	if orch.mode == "sync" {
-		orch.readyChan = make(chan int, thrFlag)
-		orch.startChan = make(chan struct{})
-		if orch.loopStart > 0 {
-			orch.loopChan = make(chan struct{})
-			orch.loopReadyChan = make(chan int, thrFlag)
-		}
-	}
-
-	for range monkeys {
-		orch.wg.Add(1)
-	}
-
-	go func() {
-		if orch.fifoWait {
-			stats.SetFifoWaiting(true)
-			orch.valDist.WaitFirst()
-			stats.SetFifoWaiting(false)
-		}
-
-		for _, w := range orch.monkeys {
-			go orch.runWorker(w)
-		}
-
-		if orch.mode == "sync" {
-			orch.runSyncOrchestration()
-		}
-	}()
-
-	go func() {
-		orch.wg.Wait()
-		monkeysFinished = true
-		stats.Stop()
-		valDist.Stop()
-		ui.BroadcastMessage("\n=== All requests completed ===\n")
-		ui.BroadcastMessage("Press Q to quit, Tab/Shift+Tab to navigate\n")
 	}()
 
 	if err := ui.Run(); err != nil {
@@ -669,7 +563,7 @@ func (o *Orch) runWorker(w *monkey) {
 			w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
 			return
 		}
-		time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
+		time.Sleep(time.Duration(o.reqDelayMs) * time.Millisecond)
 	}
 
 	// Loop handling (loopStart is 1-based, relative to group)
@@ -720,7 +614,7 @@ func (o *Orch) runWorker(w *monkey) {
 					w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
 					return
 				}
-				time.Sleep(time.Duration(o.delayMs) * time.Millisecond)
+				time.Sleep(time.Duration(o.reqDelayMs) * time.Millisecond)
 			}
 		}
 	}

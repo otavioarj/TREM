@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strconv"
@@ -11,6 +15,42 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 )
+
+// decodeBody - decompresses gzip/deflate encoded body
+// Returns raw bytes if encoding is empty, identity, or unknown
+func decodeBody(body *bytes.Buffer, encoding string) ([]byte, error) {
+	switch encoding {
+	case "", "identity":
+		return body.Bytes(), nil
+
+	case "gzip":
+		r, err := gzip.NewReader(body)
+		if err != nil {
+			return nil, fmt.Errorf("gzip open: %v", err)
+		}
+		defer r.Close()
+		decoded, err := io.ReadAll(r)
+		if err != nil {
+			return nil, fmt.Errorf("gzip read: %v", err)
+		}
+		return decoded, nil
+
+	case "deflate":
+		r := flate.NewReader(body)
+		defer r.Close()
+		decoded, err := io.ReadAll(r)
+		if err != nil {
+			return nil, fmt.Errorf("deflate read: %v", err)
+		}
+		return decoded, nil
+
+	default:
+		if verbose {
+			fmt.Printf("[V] unknown encoding: %s, returning raw\n", encoding)
+		}
+		return body.Bytes(), nil
+	}
+}
 
 // Action types for response actions
 const (
@@ -58,15 +98,14 @@ func drainChannel(w *monkey, limit int) {
 	}
 }
 
-// waitForKeys - blocks until all required keys are available in localBuffer
+// waitForKeys - blocks (for wait_time) until all required keys are available in localBuffer
 // Emits periodic messages about missing keys
-func waitForKeys(w *monkey, keys []string, done <-chan struct{}) bool {
-	wait_time := 25 // in milliseconds
+func waitForKeys(w *monkey, keys []string, values map[string]string, done <-chan struct{}) bool {
+	wait_time := 10 // in milliseconds
 	ticker := time.NewTicker(time.Duration(wait_time) * time.Millisecond)
 	defer ticker.Stop()
 	var prints []string
 	max_wait := 2 * (1000 / wait_time) //left operand is seconds :)
-
 	for {
 		// Check if all keys present (in localBuffer OR globalStaticVals)
 		var missing []string
@@ -74,9 +113,11 @@ func waitForKeys(w *monkey, keys []string, done <-chan struct{}) bool {
 			if len(w.localBuffer[k]) > 0 {
 				continue
 			}
-			// For _key patterns, also check globalStaticVals
+			// For _key patterns, also check globalStaticVals and insert it do values
 			if len(k) > 0 && k[0] == '_' {
-				if _, exists := globalStaticVals.Load(k); exists {
+				if v, exists := globalStaticVals.Load(k); exists {
+					values[k] = v.(string)
+					w.logger.Write(fmt.Sprintf("Static $%s$: %s\n", k, v.(string)))
 					continue
 				}
 			}
@@ -97,13 +138,13 @@ func waitForKeys(w *monkey, keys []string, done <-chan struct{}) bool {
 			}
 		case <-ticker.C:
 			if max_wait == 0 {
-				w.logger.Write(fmt.Sprintf("Giving up FIFO keys: %v\n", missing))
+				w.logger.Write(fmt.Sprintf("Giving up keys: %v\n", missing))
 				return false
 			}
 			max_wait--
 			for p := range missing {
 				if len(prints) > p && missing[p] != prints[p] {
-					w.logger.Write(fmt.Sprintf("Waiting FIFO keys: %v\n", missing))
+					w.logger.Write(fmt.Sprintf("Waiting keys: %v\n", missing))
 				}
 				prints = missing
 			}
@@ -395,7 +436,6 @@ func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot read action file: %v", err)
 	}
-
 	result := make(map[int]*actionPattern)
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 
@@ -438,19 +478,16 @@ func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 		if err != nil {
 			return nil, fmt.Errorf("line %d: invalid regex: %v", lineNum+1, err)
 		}
-
 		// Parse actions
 		actions, err := parseActions(rest)
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %v", lineNum+1, err)
 		}
-
 		// Create pattern
 		ap := &actionPattern{
 			re:      re,
 			actions: actions,
 		}
-
 		// Assign to each index (error if duplicate)
 		for idx := range indices {
 			if result[idx] != nil {
@@ -459,7 +496,6 @@ func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 			result[idx] = ap
 		}
 	}
-
 	return result, nil
 }
 
@@ -516,7 +552,6 @@ func parseActions(s string) ([]respAction, error) {
 		default:
 			return nil, fmt.Errorf("unknown action at position %d: %s", i, s[i:])
 		}
-
 		i += consumed
 
 		var arg string
@@ -526,7 +561,6 @@ func parseActions(s string) ([]respAction, error) {
 				return nil, fmt.Errorf("expected '\"' after action at position %d", i)
 			}
 			i++ // skip opening "
-
 			// Find closing ")
 			endQuote := strings.Index(s[i:], "\")")
 			if endQuote < 0 {
@@ -535,7 +569,6 @@ func parseActions(s string) ([]respAction, error) {
 			arg = s[i : i+endQuote]
 			i += endQuote + 2 // skip content + ")
 		}
-
 		actions = append(actions, respAction{
 			actionType: actionType,
 			arg:        arg,
@@ -549,11 +582,9 @@ func parseActions(s string) ([]respAction, error) {
 			i++
 		}
 	}
-
 	if len(actions) == 0 {
 		return nil, errors.New("no valid actions found")
 	}
-
 	return actions, nil
 }
 

@@ -15,7 +15,8 @@ type ThreadGroup struct {
 	ReqIndices    []int        // 0-based request indices (sorted)
 	ThreadCount   int          // number of threads in this group
 	Mode          string       // "sync" or "async"
-	Delay         int          // delay ms before starting threads
+	StartDelay    int          // s_delay= delay ms before starting threads
+	ReqDelay      *int         // r_delay= delay ms between requests (nil = use -d flag)
 	LoopStart     int          // 1-based relative to group (default 1)
 	LoopTimes     int          // loop count (0=infinite, default 1)
 	SyncBarriers  map[int]bool // 0-based relative indices within group
@@ -24,8 +25,35 @@ type ThreadGroup struct {
 	StartThreadID int          // first global threadID for this group
 }
 
+// createSingleGroup - creates synthetic ThreadGroup for single mode (no -thrG)
+// Used to unify execution path between single and group modes
+func createSingleGroup(reqCount, threadCount int, mode string,
+	loopStart, loopTimes int, syncBarriers map[int]bool,
+	patterns [][]pattern) *ThreadGroup {
+
+	// Build request indices (all requests)
+	reqIndices := make([]int, reqCount)
+	for i := 0; i < reqCount; i++ {
+		reqIndices[i] = i
+	}
+
+	return &ThreadGroup{
+		ID:            0,
+		ReqIndices:    reqIndices,
+		ThreadCount:   threadCount,
+		Mode:          mode,
+		StartDelay:    0,   // single mode has no start delay
+		ReqDelay:      nil, // use -d flag value
+		LoopStart:     loopStart,
+		LoopTimes:     loopTimes,
+		SyncBarriers:  syncBarriers,
+		Patterns:      patterns,
+		StartThreadID: 0,
+	}
+}
+
 // parseGroupsFile - parses -thrG file and returns validated groups
-// Format per line: 1,3,5 thr=25 mode=async delay=25 x=1 xt=2 sb=1,3 re=patterns.txt
+// Format per line, i.e: 1,3,5 thr=25 mode=async s_delay=25 r_delay=10 x=1 xt=2 sb=1,3 re=patterns.txt
 func parseGroupsFile(path string, totalReqs int) ([]*ThreadGroup, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -114,14 +142,15 @@ func parseGroupLine(line string, groupID, lineNum int) (*ThreadGroup, error) {
 	// Split into tokens
 	tokens := strings.Fields(line)
 	if len(tokens) < 4 {
-		return nil, fmt.Errorf("line %d: insufficient parameters (need indices + thr + mode + delay)",
+		return nil, fmt.Errorf("line %d: insufficient parameters (need indices + thr + mode + s_delay)",
 			lineNum)
 	}
 
 	group := &ThreadGroup{
 		ID:           groupID,
-		LoopStart:    -1, // default: no loop (-1 means no looping)
-		LoopTimes:    1,  // default: 1 iteration if loop is enabled
+		LoopStart:    -1,  // default: no loop (-1 means no looping)
+		LoopTimes:    1,   // default: 1 iteration if loop is enabled
+		ReqDelay:     nil, // default: use -d flag
 		SyncBarriers: make(map[int]bool),
 	}
 
@@ -133,7 +162,7 @@ func parseGroupLine(line string, groupID, lineNum int) (*ThreadGroup, error) {
 	group.ReqIndices = indices
 
 	// Parse remaining key=value pairs
-	foundThr, foundMode, foundDelay := false, false, false
+	foundThr, foundMode, foundSDelay := false, false, false
 	foundX, foundXt, foundSb := false, false, false
 
 	for _, token := range tokens[1:] {
@@ -158,13 +187,20 @@ func parseGroupLine(line string, groupID, lineNum int) (*ThreadGroup, error) {
 			group.Mode = value
 			foundMode = true
 
-		case "delay":
+		case "s_delay":
 			n, err := strconv.Atoi(value)
 			if err != nil || n < 0 {
-				return nil, fmt.Errorf("line %d: invalid delay=%s", lineNum, value)
+				return nil, fmt.Errorf("line %d: invalid s_delay=%s", lineNum, value)
 			}
-			group.Delay = n
-			foundDelay = true
+			group.StartDelay = n
+			foundSDelay = true
+
+		case "r_delay":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("line %d: invalid r_delay=%s", lineNum, value)
+			}
+			group.ReqDelay = &n
 
 		case "x":
 			n, err := strconv.Atoi(value)
@@ -205,8 +241,8 @@ func parseGroupLine(line string, groupID, lineNum int) (*ThreadGroup, error) {
 	if !foundMode {
 		return nil, fmt.Errorf("line %d: missing required parameter 'mode'", lineNum)
 	}
-	if !foundDelay {
-		return nil, fmt.Errorf("line %d: missing required parameter 'delay'", lineNum)
+	if !foundSDelay {
+		return nil, fmt.Errorf("line %d: missing required parameter 's_delay'", lineNum)
 	}
 
 	// If xt is set without x, default x=1 (loop from first request)
@@ -316,7 +352,7 @@ func formatGroupsSummary(groups []*ThreadGroup) string {
 			loopStr = "∞"
 		}
 
-		lines = append(lines, fmt.Sprintf("G%d: %s %dthrds [%s] x%d→%s",
+		lines = append(lines, fmt.Sprintf("G%d: %s T:%d [%s] x%d→%s",
 			g.ID+1, g.Mode, g.ThreadCount,
 			strings.Join(reqNames, ","),
 			g.LoopStart, loopStr))

@@ -89,8 +89,7 @@ type UIManager struct {
 	statsPanel *tview.TextView
 
 	// Group structure
-	groups    []GroupInfo
-	hasGroups bool // true if using -thrG mode
+	groups []GroupInfo
 
 	// Thread data (indexed by global threadID)
 	loggers     []*AsyncLogWriter
@@ -105,7 +104,7 @@ type UIManager struct {
 	dumpClosedMu sync.Mutex
 }
 
-// NewUIManager - creates UI with optional group support
+// NewUIManager - creates UI with group support
 func NewUIManager(totalThreads int, dumpEnabled bool) *UIManager {
 	ui := &UIManager{
 		app:         tview.NewApplication(),
@@ -113,7 +112,6 @@ func NewUIManager(totalThreads int, dumpEnabled bool) *UIManager {
 		textViews:   make([]*tview.TextView, totalThreads),
 		threadNodes: make([]*tview.TreeNode, totalThreads),
 		dumpEnabled: dumpEnabled,
-		hasGroups:   false,
 	}
 
 	if dumpEnabled {
@@ -124,9 +122,8 @@ func NewUIManager(totalThreads int, dumpEnabled bool) *UIManager {
 	return ui
 }
 
-// SetupGroups - configures UI for group mode
+// SetupGroups - configures UI for group mode (always used now)
 func (ui *UIManager) SetupGroups(groups []*ThreadGroup) {
-	ui.hasGroups = true
 	ui.groups = make([]GroupInfo, len(groups))
 
 	for i, g := range groups {
@@ -140,23 +137,7 @@ func (ui *UIManager) SetupGroups(groups []*ThreadGroup) {
 	}
 }
 
-// SetupSingleMode - configures UI for single group (original behavior)
-func (ui *UIManager) SetupSingleMode(threadCount int, reqCount int) {
-	ui.hasGroups = false
-	indices := make([]int, reqCount)
-	for i := 0; i < reqCount; i++ {
-		indices[i] = i
-	}
-	ui.groups = []GroupInfo{{
-		ID:          0,
-		Name:        "Main",
-		ThreadCount: threadCount,
-		Mode:        "async",
-		ReqIndices:  indices,
-	}}
-}
-
-// Build - constructs the UI layout (call after SetupGroups/SetupSingleMode)
+// Build - constructs the UI layout (call after SetupGroups)
 func (ui *UIManager) Build() {
 	// Create all thread views and loggers
 	globalID := 0
@@ -179,32 +160,23 @@ func (ui *UIManager) Build() {
 	// Content area (shows selected thread)
 	ui.contentBox = ui.textViews[0]
 
-	// Layout
-	if ui.hasGroups {
-		// TreeView layout for groups
-		leftPanel := tview.NewFlex().
-			SetDirection(tview.FlexRow).
-			AddItem(ui.treeView, 0, 1, true)
+	// Always use TreeView layout with groups panel on left
+	leftPanel := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(ui.treeView, 0, 1, true)
 
-		rightPanel := tview.NewFlex().
-			SetDirection(tview.FlexRow).
-			AddItem(ui.contentBox, 0, 2, false).
-			AddItem(ui.statsPanel, 0, 1, false)
+	rightPanel := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(ui.contentBox, 0, 2, false).
+		AddItem(ui.statsPanel, 0, 1, false)
 
-		ui.mainFlex = tview.NewFlex().
-			SetDirection(tview.FlexColumn).
-			AddItem(leftPanel, 20, 0, true).
-			AddItem(rightPanel, 0, 1, false)
-	} else {
-		// Simple layout for single mode
-		ui.mainFlex = tview.NewFlex().
-			SetDirection(tview.FlexRow).
-			AddItem(ui.contentBox, 0, 2, true).
-			AddItem(ui.statsPanel, 0, 1, false)
-	}
+	ui.mainFlex = tview.NewFlex().
+		SetDirection(tview.FlexColumn).
+		AddItem(leftPanel, 20, 0, true).
+		AddItem(rightPanel, 0, 1, false)
 
 	// Set initial tree selection AFTER mainFlex exists (callbacks may fire)
-	if firstNode != nil && ui.hasGroups {
+	if firstNode != nil {
 		ui.treeView.SetCurrentNode(firstNode)
 	}
 }
@@ -215,12 +187,7 @@ func (ui *UIManager) createThreadView(globalID, groupID, localID int) {
 		SetDynamicColors(true).
 		SetScrollable(true)
 
-	var title string
-	if ui.hasGroups {
-		title = fmt.Sprintf(" G%d:T%d | Tab:Next Thread Ctlr+P:Next Group Q:Quit", groupID+1, localID+1)
-	} else {
-		title = fmt.Sprintf(" Thread %d | Tab:Next Shift+Tab:Prev Q:Quit", globalID+1)
-	}
+	title := fmt.Sprintf(" G%d:T%d | Tab:Next Thread Ctrl+P:Next Group Q:Quit", groupID+1, localID+1)
 	tv.SetBorder(true).SetTitle(title)
 
 	// Async logger
@@ -230,12 +197,7 @@ func (ui *UIManager) createThreadView(globalID, groupID, localID int) {
 
 	// Setup dump file if enabled
 	if ui.dumpEnabled {
-		var filename string
-		if ui.hasGroups {
-			filename = fmt.Sprintf("g%d_t%d_%s.txt", groupID+1, localID+1, time.Now().Format("15-04"))
-		} else {
-			filename = fmt.Sprintf("thr%d_%s.txt", globalID, time.Now().Format("15-04"))
-		}
+		filename := fmt.Sprintf("g%d_t%d_%s.txt", groupID+1, localID+1, time.Now().Format("15-04"))
 		f, err := os.Create(filename)
 		if err != nil {
 			exitErr(fmt.Sprintf("Failed to create dump file %s: %v", filename, err))
@@ -257,11 +219,7 @@ func (ui *UIManager) createThreadView(globalID, groupID, localID int) {
 	ui.textViews[globalID] = tv
 
 	// Initial message
-	if ui.hasGroups {
-		fmt.Fprintf(tv, "Group %d, Thread %d starting...\n", groupID+1, localID+1)
-	} else {
-		fmt.Fprintf(tv, "Thread %d starting...\n", globalID+1)
-	}
+	fmt.Fprintf(tv, "Group %d, Thread %d starting...\n", groupID+1, localID+1)
 }
 
 // buildTreeView - creates hierarchical tree view for groups/threads
@@ -334,18 +292,11 @@ func (ui *UIManager) updateContentView(globalThreadID int) {
 
 	newContent := ui.textViews[globalThreadID]
 
-	// Update the right panel content
-	if ui.hasGroups {
-		// Find the right panel (second item in mainFlex)
-		rightPanel := ui.mainFlex.GetItem(1).(*tview.Flex)
-		rightPanel.Clear()
-		rightPanel.AddItem(newContent, 0, 2, false)
-		rightPanel.AddItem(ui.statsPanel, 0, 1, false)
-	} else {
-		ui.mainFlex.Clear()
-		ui.mainFlex.AddItem(newContent, 0, 2, true)
-		ui.mainFlex.AddItem(ui.statsPanel, 0, 1, false)
-	}
+	// Find the right panel (second item in mainFlex) and update
+	rightPanel := ui.mainFlex.GetItem(1).(*tview.Flex)
+	rightPanel.Clear()
+	rightPanel.AddItem(newContent, 0, 2, false)
+	rightPanel.AddItem(ui.statsPanel, 0, 1, false)
 
 	ui.contentBox = newContent
 }
@@ -442,8 +393,8 @@ func (ui *UIManager) SetupInputCapture(orchs []*Orch, monkeysFinished *bool) {
 			return nil
 
 		case tcell.KeyCtrlP:
-			// Previous group
-			currentIdx = ui.prevGroupFirstThread(currentIdx)
+			// Next group
+			currentIdx = ui.nextGroupFirstThread(currentIdx)
 			ui.selectThread(currentIdx)
 			return nil
 

@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -422,8 +420,11 @@ func (h *H2Conn) readResponse(streamID uint32) (resp, status string, bytesIn int
 	sb.WriteString("\r\n")
 
 	// Decode body if compressed
-	decodedBody := decodeBody(&body, encoding)
-	sb.Write(decodedBody)
+	decodedBytes, err := decodeBody(&body, encoding)
+	if err != nil {
+		return "", "", bytesIn, err
+	}
+	sb.Write(decodedBytes)
 
 	return sb.String(), status, bytesIn, nil
 }
@@ -440,27 +441,6 @@ func buildFrame(ftype, flags byte, streamID uint32, payload []byte) []byte {
 	binary.BigEndian.PutUint32(frame[5:], streamID)
 	copy(frame[9:], payload)
 	return frame
-}
-
-// decodeBody - decompresses body if needed
-func decodeBody(body *bytes.Buffer, encoding string) []byte {
-	switch encoding {
-	case "gzip":
-		r, err := gzip.NewReader(body)
-		if err != nil {
-			return body.Bytes()
-		}
-		defer r.Close()
-		decoded, _ := io.ReadAll(r)
-		return decoded
-	case "deflate":
-		r := flate.NewReader(body)
-		defer r.Close()
-		decoded, _ := io.ReadAll(r)
-		return decoded
-	default:
-		return body.Bytes()
-	}
 }
 
 // sendOnConnH2 - sends on existing H2 connection

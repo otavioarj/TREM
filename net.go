@@ -3,8 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -59,7 +57,6 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 	var contentLength int64 = -1
 	var chunked bool
 	var encoding string
-	var decodedBody bytes.Buffer
 
 	bytesOut := len(raw)
 	_, err = conn.Write(raw)
@@ -168,34 +165,11 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 		}
 	}
 
-	switch encoding {
-	case "", "identity":
-		decodedBody = *body
-	case "gzip":
-		bodyPlain, err := gzip.NewReader(body)
-		if err != nil {
-			return "", "", fmt.Errorf("gzip open err: %v", err)
-		}
-		defer bodyPlain.Close()
-		_, err = io.Copy(&decodedBody, bodyPlain)
-		if err != nil {
-			return "", "", fmt.Errorf("gzip read err: %v", err)
-		}
-	case "deflate":
-		bodyPlain := flate.NewReader(body)
-		defer bodyPlain.Close()
-		_, err = io.Copy(&decodedBody, bodyPlain)
-		if err != nil {
-			return "", "", fmt.Errorf("deflate read err: %v", err)
-		}
-	default:
-		if verbose {
-			fmt.Printf("[V] unknown encoding: %s, returning raw\n", encoding)
-		}
-		decodedBody = *body
+	decodedBytes, err := decodeBody(body, encoding)
+	if err != nil {
+		return "", "", err
 	}
-
-	sb.Write(decodedBody.Bytes())
+	sb.Write(decodedBytes)
 
 	var latencyUs uint32
 	if verbose {

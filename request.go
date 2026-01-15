@@ -211,32 +211,17 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 		return o.sendReq(w, relIdx, absIdx, req, addr)
 	}
 
-	// Phase 5: check for missing keys in FIFO buffer
+	// Phase 5: check for missing keys in FIFO buffer and globalStatic
 	missing := checkMissingKeys(w.localBuffer, keys)
 	if len(missing) > 0 {
-		// check globalStaticVals for _key patterns
-		n := 0
-		for _, k := range missing {
-			if len(k) > 0 && k[0] == '_' {
-				if v, exists := globalStaticVals.Load(k); exists {
-					values[k] = v.(string)
-					w.logger.Write(fmt.Sprintf("Static $%s$: %s\n", k, v.(string)))
-					continue
-				}
-			}
-			missing[n] = k
-			n++
-		}
-		missing = missing[:n]
-
-		if len(missing) > 0 && o.fifoWait {
-			if !waitForKeys(w, keys, o.quitChan) {
-				w.logger.Write("FIFO closed while waiting for keys\n")
+		if o.fifoWait {
+			// Replaces globalStatic replacing on-the-go
+			if !waitForKeys(w, keys, values, o.quitChan) {
 				return fmt.Errorf("FIFO timeout waiting for keys: %v", missing)
 			}
-		} else if len(missing) > 0 {
+		} else {
 			for _, k := range missing {
-				w.logger.Write(fmt.Sprintf("Key %s not found in FIFO, sending anyway!\n", k))
+				w.logger.Write(fmt.Sprintf("Key %s not found, sending anyway!\n", k))
 			}
 		}
 	}
@@ -297,6 +282,46 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	return nil
 }
 
+// sendFireAndForget - sends request without waiting for response
+// Used when patterns[relIdx] is empty, indicating no response processing needed
+func (o *Orch) sendFireAndForget(w *monkey, req, addr string, absIdx int) error {
+	w.logger.Write(fmt.Sprintf("Fire&Forget (r%d)\n", absIdx+1))
+	bytesOut := uint32(len(req))
+
+	if o.keepAlive || o.httpH2 {
+		// keepalive mode: use existing connection
+		if o.httpH2 {
+			parsedReq := parseRawReq2H2(req)
+			if parsedReq == nil {
+				return fmt.Errorf("failed to parse request for fire-and-forget")
+			}
+			if _, _, err := w.h2conn.sendReqH2(parsedReq, 0, false); err != nil {
+				return err
+			}
+		} else {
+			if _, err := w.conn.Write([]byte(req)); err != nil {
+				return err
+			}
+		}
+		o.closeWorkerConn(w)
+	} else {
+		// non-keepalive mode: create new connection
+		conn, err := o.dialNewConn(addr)
+		if err != nil {
+			return err
+		}
+		_, err = conn.Write([]byte(req))
+		conn.Close()
+		if err != nil {
+			return err
+		}
+	}
+
+	stats.ReportRequest(w.id, 0, 0, bytesOut)
+	w.prevResp = ""
+	return nil
+}
+
 // sendReq - sends prepared request (already normalized)
 // relIdx = relative index (for patterns/fire-and-forget/loop detection)
 // absIdx = absolute index (for logging and response actions)
@@ -323,28 +348,8 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 			}
 		}
 
-		// fire-and-forget: send without waiting for response
 		if fireAndForget {
-			w.logger.Write(fmt.Sprintf("Fire&Forget (r%d)\n", absIdx+1))
-			bytesOut := uint32(len(req))
-			if o.httpH2 {
-				parsedReq := parseRawReq2H2(req)
-				if parsedReq == nil {
-					return fmt.Errorf("failed to parse request for fire-and-forget")
-				}
-				if _, _, err := w.h2conn.sendReqH2(parsedReq, 0, false); err != nil {
-					return err
-				}
-			} else {
-				_, err = w.conn.Write([]byte(req))
-				if err != nil {
-					return err
-				}
-			}
-			stats.ReportRequest(w.id, 0, 0, bytesOut)
-			o.closeWorkerConn(w)
-			w.prevResp = ""
-			return nil
+			return o.sendFireAndForget(w, req, addr, absIdx)
 		}
 
 		resp, status, err = o.sendWithReconnect(w, []byte(req), addr)
@@ -352,21 +357,8 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 		// no keep-alive: new connection each request
 		w.logger.Write(fmt.Sprintf("Conn (r%d): %s\n", absIdx+1, addr))
 
-		// fire-and-forget in non-keepalive mode
 		if fireAndForget {
-			w.logger.Write(fmt.Sprintf("Fire&Forget (r%d)\n", absIdx+1))
-			conn, dialErr := o.dialNewConn(addr)
-			if dialErr != nil {
-				return dialErr
-			}
-			_, err = conn.Write([]byte(req))
-			conn.Close()
-			if err != nil {
-				return err
-			}
-			stats.ReportRequest(w.id, 0, 0, uint32(len(req)))
-			w.prevResp = ""
-			return nil
+			return o.sendFireAndForget(w, req, addr, absIdx)
 		}
 
 		resp, status, err = o.sendWithRetry(w, []byte(req), addr)
