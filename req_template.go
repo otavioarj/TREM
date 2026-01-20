@@ -134,7 +134,7 @@ func buildRequest(tmpl *TemplateReq, values map[string]string) string {
 // - ensures HTTP/1.1 in request line
 // - normalizes line endings to \r\n
 // - calculates and sets Content-Length
-func normalizeReq(req string) string {
+func normalizeReq(req string, blockMode bool) string {
 	reqLineEnd := strings.Index(req, "\n")
 	if reqLineEnd < 0 {
 		return req
@@ -164,7 +164,9 @@ func normalizeReq(req string) string {
 	headers := make([]string, 0, len(headerLines))
 	hasContentLen := false
 	hasTransferEnc := false
+	hasConn := false
 	contentLenIdx := -1
+	connKeep := "Connection: keep-alive\r\n"
 
 	for _, line := range headerLines {
 		line = strings.TrimRight(line, "\r")
@@ -179,7 +181,20 @@ func normalizeReq(req string) string {
 		if strings.HasPrefix(lower, "transfer-encoding:") {
 			hasTransferEnc = true
 		}
+		if blockMode {
+			hconn := strings.Split(lower, "connection:")
+			if len(hconn) == 2 {
+				hasConn = true
+				if strings.TrimSpace(hconn[1]) == "close" {
+					line = connKeep
+				}
+			}
+		}
 		headers = append(headers, line)
+	}
+
+	if blockMode && !hasConn {
+		headers = append(headers, connKeep)
 	}
 	bodyLen := len(body)
 	// set Content-Length (skip if Transfer-Encoding present)

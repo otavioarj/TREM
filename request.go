@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -18,9 +19,7 @@ type ParsedReq struct {
 }
 
 // parseRawReq2H2 - parses HTTP/1.1 raw text into HTTP2 ParsedReq
-//
-//	TREM always get request as HTTP/1.1, so pseudo-header
-//	ARE IGNORED here!
+// TREM always get request as HTTP/1.1, so pseudo-headers ARE IGNORED here!
 func parseRawReq2H2(raw string) *ParsedReq {
 	lines := strings.Split(raw, "\r\n")
 	if len(lines) == 0 {
@@ -100,16 +99,13 @@ func (o *Orch) prepareReq(w *monkey, relIdx, absIdx int) (*TemplateReq, map[stri
 	tmpl := getTemplate(w.reqFiles[absIdx], raw)
 	values := make(map[string]string)
 
-	// Phase 1: Apply pattern replacements (skip for first request in chain)
-	// Original behavior: patterns[relIdx-1] contains patterns for transition TO request relIdx
-	if relIdx > 0 && len(w.patterns) > relIdx-1 {
-		patternVals, err := applyPatterns(w.patterns[relIdx-1], w.prevResp, w.logger)
-		if err != nil {
-			return nil, nil, err
-		}
-		for k, v := range patternVals {
+	// Phase 1: Apply cached pattern values from previous request (same thread group)
+	// Other thread groups can use globalStaticVals to cross Group sharing
+	if w.lastPatternVals != nil {
+		for k, v := range w.lastPatternVals {
 			values[k] = v
 		}
+		w.lastPatternVals = nil // consumes it
 	}
 
 	// Phase 2: Apply static values from global store (extracted from previous requests with _ prefix)
@@ -151,7 +147,7 @@ func (o *Orch) doBarrier(w *monkey, relIdx int, addr string) error {
 	return nil
 }
 
-// processReq - unified request processor for sync/async modes
+// processReq - unified request processor for sync/async/block modes
 // relIdx = relative index within group (for patterns and barriers)
 // absIdx = absolute index in reqFiles (for loading request and response actions)
 func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
@@ -168,10 +164,14 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 			values[k] = v
 		}
 		req := buildRequest(tmpl, values)
-		req = normalizeReq(req)
+		req = normalizeReq(req, o.blockMode)
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
+		}
+		// Block mode: route to appendToBlock
+		if o.blockMode {
+			return o.appendToBlock(w, relIdx, absIdx, req, addr)
 		}
 		if o.mode == "sync" && o.syncBarriers[relIdx] {
 			if err := o.doBarrier(w, relIdx, addr); err != nil {
@@ -198,10 +198,14 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	// No additional keys needed, send directly
 	if len(keys) == 0 {
 		req := buildRequest(tmpl, values)
-		req = normalizeReq(req)
+		req = normalizeReq(req, o.blockMode)
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
+		}
+		// Block mode: route to appendToBlock
+		if o.blockMode {
+			return o.appendToBlock(w, relIdx, absIdx, req, addr)
 		}
 		if o.mode == "sync" && o.syncBarriers[relIdx] {
 			if err := o.doBarrier(w, relIdx, addr); err != nil {
@@ -216,7 +220,7 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	if len(missing) > 0 {
 		if o.fifoWait {
 			// Replaces globalStatic replacing on-the-go
-			if !waitForKeys(w, keys, values, o.quitChan) {
+			if !waitForKeys(w, keys, values, o.fifoBlockSize, o.quitChan) {
 				return fmt.Errorf("FIFO timeout waiting for keys: %v", missing)
 			}
 		} else {
@@ -231,10 +235,14 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	if len(combinations) == 0 {
 		// no values available, send as-is
 		req := buildRequest(tmpl, values)
-		req = normalizeReq(req)
+		req = normalizeReq(req, o.blockMode)
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
+		}
+		// Block mode: route to appendToBlock
+		if o.blockMode {
+			return o.appendToBlock(w, relIdx, absIdx, req, addr)
 		}
 		if o.mode == "sync" && o.syncBarriers[relIdx] {
 			if err := o.doBarrier(w, relIdx, addr); err != nil {
@@ -258,10 +266,18 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 		}
 
 		req := buildRequest(tmpl, mergedVals)
-		req = normalizeReq(req)
+		req = normalizeReq(req, o.blockMode)
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
+		}
+
+		// Block mode: route to appendToBlock
+		if o.blockMode {
+			if err := o.appendToBlock(w, relIdx, absIdx, req, addr); err != nil {
+				return err
+			}
+			continue
 		}
 
 		// barrier only on first request of combinations
@@ -280,6 +296,100 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	// consume used values
 	consumeValues(w.localBuffer, keys, o.fifoBlockSize)
 	return nil
+}
+
+// appendToBlock - accumulates request in buffer for block mode (HTTP/1.1 pipelining)
+// Validates host consistency. Triggers flushBlock when buffer exceeds maxDataSize or last request in the chain.
+func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) error {
+	// First request: establish connection and store addr
+	if len(w.blockOffsets) == 0 {
+		if w.conn == nil {
+			w.logger.Write(fmt.Sprintf("Block-Conn: %s\n", addr))
+			if err := o.dialWithRetry(w, addr); err != nil {
+				return fmt.Errorf("dial: %v", err)
+			}
+		}
+	} else {
+		// Validate same host for pipelining
+		if addr != w.connAddr {
+			return fmt.Errorf("block mode: host mismatch %s vs %s .Pipelining requires same host!", addr, w.connAddr)
+		}
+	}
+
+	// Record offsets and append request
+	// Trick to fast-parser returned responses (HTTP-pipeline FIFO) for actions if needed :)
+	w.blockOffsets = append(w.blockOffsets, len(w.blockBuf))
+	w.blockBuf = append(w.blockBuf, req...)
+
+	isLastReq := relIdx == len(w.reqIndices)-1
+	bufferFull := len(w.blockBuf) >= o.maxDataSize
+
+	if isLastReq || bufferFull {
+		return o.flushBlock(w)
+	}
+
+	w.logger.Write(fmt.Sprintf("Queued r%d (%d bytes, total %d)\n", absIdx+1, len(req), len(w.blockBuf)))
+	return nil
+}
+
+// flushBlock - sends accumulated requests in single TCP write, reads responses in order.
+// This read trusts that the target webserver is following RFC7230 correctly:
+// |-> Responses are in the same order as request from FIFO <-
+func (o *Orch) flushBlock(w *monkey) error {
+	if len(w.blockBuf) == 0 {
+		return nil
+	}
+
+	reqCount := len(w.blockOffsets)
+	w.logger.Write(fmt.Sprintf("Flush %d reqs (%d bytes)\n", reqCount, len(w.blockBuf)))
+
+	// Single TCP write
+	bytesOut := uint32(len(w.blockBuf))
+	if _, err := w.conn.Write(w.blockBuf); err != nil {
+		return fmt.Errorf("block write: %v", err)
+	}
+	reader := bufio.NewReader(w.conn)
+	// Read responses in FIFO order (HTTP/1.1 pipelining RFC7230 guarantees order)
+	for i := 0; i < reqCount; i++ {
+		absIdx := w.reqIndices[i]
+		stats.ReportRequest(w.id, 0, 0, 0)
+		resp, status, _, err := readHTTP1Resp(w.id, reader)
+		if err != nil {
+			return fmt.Errorf("block read resp %d: %v", i+1, err)
+		}
+
+		//w.logger.Write(fmt.Sprintf("RESP: \n\n %s\n", resp))
+		w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
+		w.prevResp = resp
+
+		// Apply response actions if configured for this request
+		// Here goes the trick, we stored request indices to fast-parser response for this action :)
+		if w.actionPatterns != nil && w.actionPatterns[absIdx] != nil {
+			req := o.extractReq(w, i)
+			if err := o.applyResponseActions(w, absIdx, req, resp, status); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Report stats (aggregate for the flush)
+	stats.ReportRequest(w.id, 0, 0, bytesOut)
+
+	// Clear buffers for next batch
+	w.blockBuf = w.blockBuf[:0]
+	w.blockOffsets = w.blockOffsets[:0]
+
+	return nil
+}
+
+// extractReq - extracts request i from blockBuf using offsets
+func (o *Orch) extractReq(w *monkey, i int) string {
+	start := w.blockOffsets[i]
+	end := len(w.blockBuf)
+	if i+1 < len(w.blockOffsets) {
+		end = w.blockOffsets[i+1]
+	}
+	return string(w.blockBuf[start:end])
 }
 
 // sendFireAndForget - sends request without waiting for response
@@ -333,7 +443,7 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 	}
 
 	// fire-and-forget detection uses relIdx (group patterns)
-	fireAndForget := relIdx < len(w.patterns) && len(w.patterns[relIdx]) == 0
+	fireAndForget := w.patterns != nil && relIdx < len(w.patterns) && len(w.patterns[relIdx]) == 0
 
 	var resp, status string
 	var err error
@@ -370,6 +480,14 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 
 	w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
 	w.prevResp = resp
+	// Extract patterns and cache for next request
+	if w.patterns != nil && relIdx < len(w.patterns) && len(w.patterns[relIdx]) > 0 {
+		patternVals, err := applyPatterns(w.patterns[relIdx], resp, w.logger)
+		if err != nil {
+			return err
+		}
+		w.lastPatternVals = patternVals // cache para prepareReq
+	}
 
 	// apply response actions (uses absIdx for global pattern matching)
 	if w.actionPatterns != nil && w.actionPatterns[absIdx] != nil {
@@ -445,7 +563,7 @@ func (o *Orch) applyResponseActions(w *monkey, idx int, req, resp, status string
 		return nil // No match, continue normally
 	}
 
-	w.logger.Write(fmt.Sprintf("RA matched (r%d): %s\n", idx+1, ap.re.String()))
+	w.logger.Write(fmt.Sprintf("RA matched (r%d): %s\n", idx+1, m))
 
 	// Execute actions in order
 	for _, action := range ap.actions {

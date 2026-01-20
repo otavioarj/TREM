@@ -14,7 +14,7 @@ type ThreadGroup struct {
 	ID            int          // 0-based group ID
 	ReqIndices    []int        // 0-based request indices (sorted)
 	ThreadCount   int          // number of threads in this group
-	Mode          string       // "sync" or "async"
+	Mode          string       // "sync", "async", or "block"
 	StartDelay    int          // s_delay= delay ms before starting threads
 	ReqDelay      *int         // r_delay= delay ms between requests (nil = use -d flag)
 	LoopStart     int          // 1-based relative to group (default 1)
@@ -43,7 +43,7 @@ func createSingleGroup(reqCount, threadCount int, mode string,
 		ThreadCount:   threadCount,
 		Mode:          mode,
 		StartDelay:    0,   // single mode has no start delay
-		ReqDelay:      nil, // use -d flag value
+		ReqDelay:      nil, // use -d flag value (caller may override for block mode)
 		LoopStart:     loopStart,
 		LoopTimes:     loopTimes,
 		SyncBarriers:  syncBarriers,
@@ -54,7 +54,8 @@ func createSingleGroup(reqCount, threadCount int, mode string,
 
 // parseGroupsFile - parses -thrG file and returns validated groups
 // Format per line, i.e: 1,3,5 thr=25 mode=async s_delay=25 r_delay=10 x=1 xt=2 sb=1,3 re=patterns.txt
-func parseGroupsFile(path string, totalReqs int) ([]*ThreadGroup, error) {
+// httpH2 is passed to validate block mode incompatibility
+func parseGroupsFile(path string, totalReqs int, httpH2 bool) ([]*ThreadGroup, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read groups file: %v", err)
@@ -72,7 +73,7 @@ func parseGroupsFile(path string, totalReqs int) ([]*ThreadGroup, error) {
 			continue
 		}
 
-		group, err := parseGroupLine(line, groupID, lineNum+1)
+		group, err := parseGroupLine(line, groupID, lineNum+1, httpH2)
 		if err != nil {
 			return nil, err
 		}
@@ -138,7 +139,8 @@ func parseGroupsFile(path string, totalReqs int) ([]*ThreadGroup, error) {
 }
 
 // parseGroupLine - parses single group definition line
-func parseGroupLine(line string, groupID, lineNum int) (*ThreadGroup, error) {
+// httpH2 is passed to validate block mode incompatibility
+func parseGroupLine(line string, groupID, lineNum int, httpH2 bool) (*ThreadGroup, error) {
 	// Split into tokens
 	tokens := strings.Fields(line)
 	if len(tokens) < 4 {
@@ -181,8 +183,12 @@ func parseGroupLine(line string, groupID, lineNum int) (*ThreadGroup, error) {
 			foundThr = true
 
 		case "mode":
-			if value != "sync" && value != "async" {
-				return nil, fmt.Errorf("line %d: mode must be 'sync' or 'async'", lineNum)
+			if value != "sync" && value != "async" && value != "block" {
+				return nil, fmt.Errorf("line %d: mode must be 'sync', 'async', or 'block'", lineNum)
+			}
+			// Validate block mode + http2 incompatibility
+			if value == "block" && httpH2 {
+				return nil, fmt.Errorf("line %d: mode=block is incompatible with -http2 (HTTP/1.1 pipelining only)", lineNum)
 			}
 			group.Mode = value
 			foundMode = true
@@ -253,6 +259,13 @@ func parseGroupLine(line string, groupID, lineNum int) (*ThreadGroup, error) {
 	// If mode=sync without sb, default sb=1 (barrier on first request)
 	if group.Mode == "sync" && !foundSb {
 		group.SyncBarriers[0] = true
+	}
+
+	// Block mode: force delay to 0, ignore patterns file
+	if group.Mode == "block" {
+		zero := 0
+		group.ReqDelay = &zero
+		group.PatternsFile = "" // ignore re= for block mode
 	}
 
 	return group, nil

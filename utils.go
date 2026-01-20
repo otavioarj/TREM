@@ -100,7 +100,7 @@ func drainChannel(w *monkey, limit int) {
 
 // waitForKeys - blocks (for wait_time) until all required keys are available in localBuffer
 // Emits periodic messages about missing keys
-func waitForKeys(w *monkey, keys []string, values map[string]string, done <-chan struct{}) bool {
+func waitForKeys(w *monkey, keys []string, values map[string]string, limit int, done <-chan struct{}) bool {
 	wait_time := 10 // in milliseconds
 	ticker := time.NewTicker(time.Duration(wait_time) * time.Millisecond)
 	defer ticker.Stop()
@@ -113,7 +113,7 @@ func waitForKeys(w *monkey, keys []string, values map[string]string, done <-chan
 			if len(w.localBuffer[k]) > 0 {
 				continue
 			}
-			// For _key patterns, also check globalStaticVals and insert it do values
+			// For _key patterns, also check globalStaticVals and insert it to values
 			if len(k) > 0 && k[0] == '_' {
 				if v, exists := globalStaticVals.Load(k); exists {
 					values[k] = v.(string)
@@ -134,7 +134,9 @@ func waitForKeys(w *monkey, keys []string, values map[string]string, done <-chan
 				return false
 			}
 			for k, v := range msg {
-				w.localBuffer[k] = append(w.localBuffer[k], v)
+				if limit == 0 || len(w.localBuffer[k]) < limit {
+					w.localBuffer[k] = append(w.localBuffer[k], v)
+				}
 			}
 		case <-ticker.C:
 			if max_wait == 0 {

@@ -172,7 +172,7 @@ func (ui *UIManager) Build() {
 
 	ui.mainFlex = tview.NewFlex().
 		SetDirection(tview.FlexColumn).
-		AddItem(leftPanel, 20, 0, true).
+		AddItem(leftPanel, 12, 0, true).
 		AddItem(rightPanel, 0, 1, false)
 
 	// Set initial tree selection AFTER mainFlex exists (callbacks may fire)
