@@ -3,8 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -55,22 +53,36 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 		startTime = time.Now()
 	}
 
-	var sb strings.Builder
-	var contentLength int64 = -1
-	var chunked bool
-	var encoding string
-	var decodedBody bytes.Buffer
-
 	bytesOut := len(raw)
 	_, err = conn.Write(raw)
 	if err != nil {
 		return "", "", err
 	}
-
 	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
+	resp, status, bytesIn, err := readHTTP1Resp(threadID, reader)
 	if err != nil {
 		return "", "", err
+	}
+
+	var latencyUs uint32
+	if verbose {
+		latencyUs = uint32(time.Since(startTime).Microseconds())
+	}
+	stats.ReportRequest(threadID, latencyUs, uint32(bytesIn), uint32(bytesOut))
+
+	return resp, status, nil
+}
+
+// readHTTP1Resp - internal function that reads HTTP/1.1 response and returns bytesIn
+func readHTTP1Resp(threadID int, reader *bufio.Reader) (resp, status string, bytesIn int, err error) {
+	var sb strings.Builder
+	var contentLength int64 = -1
+	var chunked bool
+	var encoding string
+
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", "", 0, err
 	}
 
 	parts := strings.SplitN(line, " ", 3)
@@ -83,13 +95,12 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 		stats.ReportHTTPError(threadID, statusCode)
 	}
 
-	var bytesIn int
 	bytesIn += len(line)
 
 	for {
 		l, err := reader.ReadString('\n')
 		if err != nil {
-			return "", "", err
+			return "", "", bytesIn, err
 		}
 		bytesIn += len(l)
 		sb.WriteString(l)
@@ -152,9 +163,7 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 		limited := io.LimitReader(reader, contentLength)
 		n, _ := io.Copy(body, limited)
 		bytesIn += int(n)
-	} else if contentLength == 0 {
-		// No body
-	} else {
+	} else if contentLength == -1 { // header not found!
 		buf := make([]byte, 4096)
 		for {
 			n, err := reader.Read(buf)
@@ -168,42 +177,13 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 		}
 	}
 
-	switch encoding {
-	case "", "identity":
-		decodedBody = *body
-	case "gzip":
-		bodyPlain, err := gzip.NewReader(body)
-		if err != nil {
-			return "", "", fmt.Errorf("gzip open err: %v", err)
-		}
-		defer bodyPlain.Close()
-		_, err = io.Copy(&decodedBody, bodyPlain)
-		if err != nil {
-			return "", "", fmt.Errorf("gzip read err: %v", err)
-		}
-	case "deflate":
-		bodyPlain := flate.NewReader(body)
-		defer bodyPlain.Close()
-		_, err = io.Copy(&decodedBody, bodyPlain)
-		if err != nil {
-			return "", "", fmt.Errorf("deflate read err: %v", err)
-		}
-	default:
-		if verbose {
-			fmt.Printf("[V] unknown encoding: %s, returning raw\n", encoding)
-		}
-		decodedBody = *body
+	decodedBytes, err := decodeBody(body, encoding)
+	if err != nil {
+		return "", "", bytesIn, err
 	}
+	sb.Write(decodedBytes)
 
-	sb.Write(decodedBody.Bytes())
-
-	var latencyUs uint32
-	if verbose {
-		latencyUs = uint32(time.Since(startTime).Microseconds())
-	}
-	stats.ReportRequest(threadID, latencyUs, uint32(bytesIn), uint32(bytesOut))
-
-	return sb.String(), status, nil
+	return sb.String(), status, bytesIn, nil
 }
 
 func dialWithProxy(addr, proxyURL string) (net.Conn, error) {

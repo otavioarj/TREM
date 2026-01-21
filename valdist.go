@@ -208,11 +208,11 @@ func (d *ValDist) dispatchBatch(batch []kv) {
 	var threadIdx int
 	if d.popMode == 2 {
 		// Round-robin: each kv goes to one thread
-		// Except if the key starts with '_', ie., $_key$
+		// Except if the key starts with '_', ie., _key from FIFO
 		// Keys with this format are always broadcasted to threads and never consumed
 		// Its value can be updated as normal key, although.
 		for _, item := range batch {
-			if item.k[1] == '_' {
+			if item.k[0] == '_' {
 				for threadIdx = range len(d.threadChans) {
 					d.dispatchThread(item.k, item.v, d.threadChans[threadIdx])
 				}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -18,9 +19,7 @@ type ParsedReq struct {
 }
 
 // parseRawReq2H2 - parses HTTP/1.1 raw text into HTTP2 ParsedReq
-//
-//	TREM always get request as HTTP/1.1, so pseudo-header
-//	ARE IGNORED here!
+// TREM always get request as HTTP/1.1, so pseudo-headers ARE IGNORED here!
 func parseRawReq2H2(raw string) *ParsedReq {
 	lines := strings.Split(raw, "\r\n")
 	if len(lines) == 0 {
@@ -78,64 +77,52 @@ func parseRawReq2H2(raw string) *ParsedReq {
 	return req
 }
 
-// prepareReqBase - loads request and applies regex patterns (no FIFO substitution)
-func (o *Orch) prepareReqBase(w *monkey, idx int) (string, error) {
-	var raw []byte
-	var err error
+// prepareReq - loads request template and applies pattern extractions
+// relIdx: relative index in group (for patterns)
+// absIdx: absolute index in reqFiles (for file loading)
+// Returns: template, values from patterns+static, error
+func (o *Orch) prepareReq(w *monkey, relIdx, absIdx int) (*TemplateReq, map[string]string, error) {
+	var raw string
 
-	// Use cache if available
+	// use cache if available
 	if len(w.reqCache) > 0 {
-		raw = []byte(w.reqCache[idx])
+		raw = w.reqCache[absIdx]
 	} else {
-		raw, err = os.ReadFile(w.reqFiles[idx])
+		data, err := os.ReadFile(w.reqFiles[absIdx])
 		if err != nil {
-			return "", err
+			return nil, nil, err
 		}
+		raw = string(data)
 	}
-	req := string(raw)
 
-	// Apply pattern replacements (skip for first request)
-	if idx > 0 {
-		for _, p := range w.patterns[idx-1] {
-			// Skip extraction if static value already exists
-			if len(p.keyword) > 0 && p.keyword[0] == '_' {
-				if _, exists := w.staticVals["$"+p.keyword+"$"]; exists {
-					continue // already have this static value
-				}
-			}
+	// get parsed template from cache
+	tmpl := getTemplate(w.reqFiles[absIdx], raw)
+	values := make(map[string]string)
 
-			m := p.re.FindStringSubmatch(w.prevResp)
-			if m == nil {
-				if verbose {
-					w.logger.Write(fmt.Sprintf("[V] regex no match, pattern: %s\n", p.keyword))
-				}
-				return "", fmt.Errorf("regex did not match for: %s", p.keyword)
-			}
-			extracted := decodeExtracted(m[1])
-			req = strings.ReplaceAll(req, "$"+p.keyword+"$", extracted)
-			w.logger.Write(fmt.Sprintf("Matched %s: %s\n", p.keyword, extracted))
+	// Phase 1: Apply cached pattern values from previous request (same thread group)
+	// Other thread groups can use globalStaticVals to cross Group sharing
+	if w.lastPatternVals != nil {
+		for k, v := range w.lastPatternVals {
+			values[k] = v
+		}
+		w.lastPatternVals = nil // consumes it
+	}
 
-			// Save static values (keys starting with _) for persistence across requests
-			if len(p.keyword) > 0 && p.keyword[0] == '_' {
-				w.staticVals["$"+p.keyword+"$"] = extracted
-			}
+	// Phase 2: Apply static values from global store (extracted from previous requests with _ prefix)
+	keyNames := getUniqueKeyNames(tmpl)
+	staticVals := collectStaticValues(keyNames, w.logger)
+	for k, v := range staticVals {
+		if _, exists := values[k]; !exists {
+			values[k] = v
 		}
 	}
 
-	// Apply static values (extracted from previous requests with _ prefix)
-	for k, v := range w.staticVals {
-		if strings.Contains(req, k) {
-			req = strings.ReplaceAll(req, k, v)
-			w.logger.Write(fmt.Sprintf("Static %s: %s\n", k, v))
-		}
-	}
-
-	return req, nil
+	return tmpl, values, nil
 }
 
 // doBarrier - handles sync barrier: dial and wait for all threads
 // Returns addr for subsequent sends
-func (o *Orch) doBarrier(w *monkey, idx int, addr string) error {
+func (o *Orch) doBarrier(w *monkey, relIdx int, addr string) error {
 	// Dial if not connected or addr changed
 	if w.conn == nil && w.h2conn == nil {
 		w.logger.Write(fmt.Sprintf("Connecting: %s\n", addr))
@@ -160,241 +147,328 @@ func (o *Orch) doBarrier(w *monkey, idx int, addr string) error {
 	return nil
 }
 
-// processReq - unified request processor for sync/async modes with FIFO combinations
-func (o *Orch) processReq(w *monkey, idx int) error {
-	baseReq, err := o.prepareReqBase(w, idx)
+// processReq - unified request processor for sync/async/block modes
+// relIdx = relative index within group (for patterns and barriers)
+// absIdx = absolute index in reqFiles (for loading request and response actions)
+func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
+	// Phase 1: load template and apply patterns
+	tmpl, values, err := o.prepareReq(w, relIdx, absIdx)
 	if err != nil {
 		return err
 	}
 
-	// Handle static mode
-	if o.valDist.IsStatic() {
+	// Phase 2: handle static mode (-u key=val) - direct send
+	if o.valDist != nil && o.valDist.IsStatic() {
 		k, v := o.valDist.StaticKV()
-		req := strings.ReplaceAll(baseReq, k, v)
+		if k != "" {
+			values[k] = v
+		}
+		req := buildRequest(tmpl, values)
+		req = normalizeReq(req, o.blockMode)
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
 		}
-		// Barrier if sync mode and this idx triggers it
-		if o.mode == "sync" && o.syncBarriers[idx] {
-			if err := o.doBarrier(w, idx, addr); err != nil {
+		// Block mode: route to appendToBlock
+		if o.blockMode {
+			return o.appendToBlock(w, relIdx, absIdx, req, addr)
+		}
+		if o.mode == "sync" && o.syncBarriers[relIdx] {
+			if err := o.doBarrier(w, relIdx, addr); err != nil {
 				return err
 			}
 		}
-		return o.sendReq(w, idx, req, addr)
+		return o.sendReq(w, relIdx, absIdx, req, addr)
 	}
 
-	// Handle FIFO mode - drain channel first (limited by fifoBlockSize)
-	drainChannel(w, o.fifoBlockSize)
+	// Phase 3: handle FIFO mode - drain channel first
+	if o.valDist != nil && o.valDist.IsFifo() {
+		drainChannel(w, o.fifoBlockSize)
+	}
 
-	// Extract keys needed from request
-	keys := extractKeys(baseReq)
+	// Phase 4: get keys still needing values
+	keyNames := getUniqueKeyNames(tmpl)
+	var keys []string
+	for _, key := range keyNames {
+		if _, hasVal := values[key]; !hasVal {
+			keys = append(keys, key)
+		}
+	}
+
+	// No additional keys needed, send directly
 	if len(keys) == 0 {
-		// No FIFO keys, just send
-		addr, err := parseHost(baseReq, o.hostFlag)
+		req := buildRequest(tmpl, values)
+		req = normalizeReq(req, o.blockMode)
+		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
 		}
-		if o.mode == "sync" && o.syncBarriers[idx] {
-			if err := o.doBarrier(w, idx, addr); err != nil {
+		// Block mode: route to appendToBlock
+		if o.blockMode {
+			return o.appendToBlock(w, relIdx, absIdx, req, addr)
+		}
+		if o.mode == "sync" && o.syncBarriers[relIdx] {
+			if err := o.doBarrier(w, relIdx, addr); err != nil {
 				return err
 			}
 		}
-		return o.sendReq(w, idx, baseReq, addr)
+		return o.sendReq(w, relIdx, absIdx, req, addr)
 	}
 
-	// Check for missing keys
+	// Phase 5: check for missing keys in FIFO buffer and globalStatic
 	missing := checkMissingKeys(w.localBuffer, keys)
 	if len(missing) > 0 {
 		if o.fifoWait {
-			// Block waiting, waitForKeys will emit periodic messages
-			if !waitForKeys(w, keys, o.quitChan) {
-				w.logger.Write("FIFO closed while waiting for keys\n")
+			// Replaces globalStatic replacing on-the-go
+			if !waitForKeys(w, keys, values, o.fifoBlockSize, o.quitChan) {
 				return fmt.Errorf("FIFO timeout waiting for keys: %v", missing)
 			}
 		} else {
-			// Warn and continue without substitution
 			for _, k := range missing {
-				w.logger.Write(fmt.Sprintf("Key %s not found in FIFO, sending anyway!\n", k))
+				w.logger.Write(fmt.Sprintf("Key %s not found, sending anyway!\n", k))
 			}
 		}
 	}
 
-	// Generate combinations: each key=value creates a new request
-	// PER original requestN.txt file!
+	// Phase 6: generate combinations from FIFO buffer
 	combinations := generateCombinations(w.localBuffer, keys)
 	if len(combinations) == 0 {
-		// No values available, send as-is (will likely fail regex check)
-		addr, err := parseHost(baseReq, o.hostFlag)
+		// no values available, send as-is
+		req := buildRequest(tmpl, values)
+		req = normalizeReq(req, o.blockMode)
+		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
 		}
-		if o.mode == "sync" && o.syncBarriers[idx] {
-			if err := o.doBarrier(w, idx, addr); err != nil {
+		// Block mode: route to appendToBlock
+		if o.blockMode {
+			return o.appendToBlock(w, relIdx, absIdx, req, addr)
+		}
+		if o.mode == "sync" && o.syncBarriers[relIdx] {
+			if err := o.doBarrier(w, relIdx, addr); err != nil {
 				return err
 			}
 		}
-		return o.sendReq(w, idx, baseReq, addr)
+		return o.sendReq(w, relIdx, absIdx, req, addr)
 	}
 
-	// Send request for each combination
-	// Barrier triggers on FIRST combination only
+	// Phase 7: send request for each combination
 	firstReq := true
 	for _, combo := range combinations {
-		req := baseReq
+		// merge pattern/static values with combo values
+		mergedVals := make(map[string]string, len(values)+len(combo))
+		for k, v := range values {
+			mergedVals[k] = v
+		}
 		for k, v := range combo {
-			req = strings.ReplaceAll(req, k, v)
+			mergedVals[k] = v
 			w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, v))
 		}
 
+		req := buildRequest(tmpl, mergedVals)
+		req = normalizeReq(req, o.blockMode)
 		addr, err := parseHost(req, o.hostFlag)
 		if err != nil {
 			return err
 		}
 
-		// Barrier only on first request of combinations
-		if firstReq && o.mode == "sync" && o.syncBarriers[idx] {
-			if err := o.doBarrier(w, idx, addr); err != nil {
+		// Block mode: route to appendToBlock
+		if o.blockMode {
+			if err := o.appendToBlock(w, relIdx, absIdx, req, addr); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// barrier only on first request of combinations
+		if firstReq && o.mode == "sync" && o.syncBarriers[relIdx] {
+			if err := o.doBarrier(w, relIdx, addr); err != nil {
 				return err
 			}
 			firstReq = false
 		}
 
-		if err := o.sendReq(w, idx, req, addr); err != nil {
+		if err := o.sendReq(w, relIdx, absIdx, req, addr); err != nil {
 			return err
 		}
 	}
 
-	// Consume used values
+	// consume used values
 	consumeValues(w.localBuffer, keys, o.fifoBlockSize)
 	return nil
 }
 
-func normalizeRequest(req string) string {
-	lines := strings.Split(req, "\n")
-	var normalized []string
-	var bodyStartIndex int = -1
-	var hasEmptyLine bool
-
-	for i, line := range lines {
-		line = strings.TrimRight(line, "\r")
-		if i == 0 && !strings.Contains(line, "HTTP/") {
-			line = line + " HTTP/1.1"
-		} else if i == 0 && strings.Contains(line, "HTTP/") && !strings.Contains(line, "HTTP/1.1") {
-			line = httpVersionRe.ReplaceAllString(line, "HTTP/1.1")
-		}
-
-		normalized = append(normalized, line)
-
-		if line == "" && bodyStartIndex == -1 {
-			bodyStartIndex = i + 1
-			hasEmptyLine = true
-		}
-	}
-
-	// Ensure empty line exists after headers (before body or at end)
-	if !hasEmptyLine {
-		normalized = append(normalized, "")
-		bodyStartIndex = len(normalized)
-	}
-
-	if bodyStartIndex > 0 && bodyStartIndex < len(normalized) {
-		bodyLines := normalized[bodyStartIndex:]
-		body := strings.Join(bodyLines, "\r\n")
-		bodyLen := len([]byte(body))
-
-		foundContentLength := false
-		for i := 1; i < bodyStartIndex-1; i++ {
-			if strings.HasPrefix(strings.ToLower(normalized[i]), "content-length:") {
-				normalized[i] = fmt.Sprintf("Content-Length: %d", bodyLen)
-				foundContentLength = true
-				break
+// appendToBlock - accumulates request in buffer for block mode (HTTP/1.1 pipelining)
+// Validates host consistency. Triggers flushBlock when buffer exceeds maxDataSize or last request in the chain.
+func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) error {
+	// First request: establish connection and store addr
+	if len(w.blockOffsets) == 0 {
+		if w.conn == nil {
+			w.logger.Write(fmt.Sprintf("Block-Conn: %s\n", addr))
+			if err := o.dialWithRetry(w, addr); err != nil {
+				return fmt.Errorf("dial: %v", err)
 			}
 		}
-		if !foundContentLength && bodyLen > 0 {
-			normalized = append(normalized[:bodyStartIndex-1],
-				append([]string{fmt.Sprintf("Content-Length: %d", bodyLen)},
-					normalized[bodyStartIndex-1:]...)...)
+	} else {
+		// Validate same host for pipelining
+		if addr != w.connAddr {
+			return fmt.Errorf("block mode: host mismatch %s vs %s .Pipelining requires same host!", addr, w.connAddr)
 		}
 	}
 
-	return strings.Join(normalized, "\r\n")
+	// Record offsets and append request
+	// Trick to fast-parser returned responses (HTTP-pipeline FIFO) for actions if needed :)
+	w.blockOffsets = append(w.blockOffsets, len(w.blockBuf))
+	w.blockBuf = append(w.blockBuf, req...)
+
+	isLastReq := relIdx == len(w.reqIndices)-1
+	bufferFull := len(w.blockBuf) >= o.maxDataSize
+
+	if isLastReq || bufferFull {
+		return o.flushBlock(w)
+	}
+
+	w.logger.Write(fmt.Sprintf("Queued r%d (%d bytes, total %d)\n", absIdx+1, len(req), len(w.blockBuf)))
+	return nil
 }
 
-// sendReq - unified request sender for both sync/async modes
-func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
-	req = normalizeRequest(req)
+// flushBlock - sends accumulated requests in single TCP write, reads responses in order.
+// This read trusts that the target webserver is following RFC7230 correctly:
+// |-> Responses are in the same order as request from FIFO <-
+func (o *Orch) flushBlock(w *monkey) error {
+	if len(w.blockBuf) == 0 {
+		return nil
+	}
 
-	// Save loop start req and addr if this is the loop start point
-	if o.loopStart > 0 && idx == o.loopStart-1 {
+	reqCount := len(w.blockOffsets)
+	w.logger.Write(fmt.Sprintf("Flush %d reqs (%d bytes)\n", reqCount, len(w.blockBuf)))
+
+	// Single TCP write
+	bytesOut := uint32(len(w.blockBuf))
+	if _, err := w.conn.Write(w.blockBuf); err != nil {
+		return fmt.Errorf("block write: %v", err)
+	}
+	reader := bufio.NewReader(w.conn)
+	// Read responses in FIFO order (HTTP/1.1 pipelining RFC7230 guarantees order)
+	for i := 0; i < reqCount; i++ {
+		absIdx := w.reqIndices[i]
+		stats.ReportRequest(w.id, 0, 0, 0)
+		resp, status, _, err := readHTTP1Resp(w.id, reader)
+		if err != nil {
+			return fmt.Errorf("block read resp %d: %v", i+1, err)
+		}
+
+		//w.logger.Write(fmt.Sprintf("RESP: \n\n %s\n", resp))
+		w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
+		w.prevResp = resp
+
+		// Apply response actions if configured for this request
+		// Here goes the trick, we stored request indices to fast-parser response for this action :)
+		if w.actionPatterns != nil && w.actionPatterns[absIdx] != nil {
+			req := o.extractReq(w, i)
+			if err := o.applyResponseActions(w, absIdx, req, resp, status); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Report stats (aggregate for the flush)
+	stats.ReportRequest(w.id, 0, 0, bytesOut)
+
+	// Clear buffers for next batch
+	w.blockBuf = w.blockBuf[:0]
+	w.blockOffsets = w.blockOffsets[:0]
+
+	return nil
+}
+
+// extractReq - extracts request i from blockBuf using offsets
+func (o *Orch) extractReq(w *monkey, i int) string {
+	start := w.blockOffsets[i]
+	end := len(w.blockBuf)
+	if i+1 < len(w.blockOffsets) {
+		end = w.blockOffsets[i+1]
+	}
+	return string(w.blockBuf[start:end])
+}
+
+// sendFireAndForget - sends request without waiting for response
+// Used when patterns[relIdx] is empty, indicating no response processing needed
+func (o *Orch) sendFireAndForget(w *monkey, req, addr string, absIdx int) error {
+	w.logger.Write(fmt.Sprintf("Fire&Forget (r%d)\n", absIdx+1))
+	bytesOut := uint32(len(req))
+
+	if o.keepAlive || o.httpH2 {
+		// keepalive mode: use existing connection
+		if o.httpH2 {
+			parsedReq := parseRawReq2H2(req)
+			if parsedReq == nil {
+				return fmt.Errorf("failed to parse request for fire-and-forget")
+			}
+			if _, _, err := w.h2conn.sendReqH2(parsedReq, 0, false); err != nil {
+				return err
+			}
+		} else {
+			if _, err := w.conn.Write([]byte(req)); err != nil {
+				return err
+			}
+		}
+		o.closeWorkerConn(w)
+	} else {
+		// non-keepalive mode: create new connection
+		conn, err := o.dialNewConn(addr)
+		if err != nil {
+			return err
+		}
+		_, err = conn.Write([]byte(req))
+		conn.Close()
+		if err != nil {
+			return err
+		}
+	}
+
+	stats.ReportRequest(w.id, 0, 0, bytesOut)
+	w.prevResp = ""
+	return nil
+}
+
+// sendReq - sends prepared request (already normalized)
+// relIdx = relative index (for patterns/fire-and-forget/loop detection)
+// absIdx = absolute index (for logging and response actions)
+func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) error {
+	// save loop start req and addr
+	if o.loopStart > 0 && relIdx == o.loopStart-1 {
 		w.loopStartReq = req
 		w.loopStartAddr = addr
 	}
 
-	// Check if fire-and-forget (empty pattern line for this idx)
-	fireAndForget := idx < len(w.patterns) && len(w.patterns[idx]) == 0
+	// fire-and-forget detection uses relIdx (group patterns)
+	fireAndForget := w.patterns != nil && relIdx < len(w.patterns) && len(w.patterns[relIdx]) == 0
 
 	var resp, status string
 	var err error
 
 	if o.keepAlive || o.httpH2 {
-		// Keep-alive: reconnect if addr changed or not connected
+		// keep-alive: reconnect if addr changed or not connected
 		if addr != w.connAddr || (w.conn == nil && w.h2conn == nil) {
 			o.closeWorkerConn(w)
-			w.logger.Write(fmt.Sprintf("Conn-Keep (%d): %s\n", idx, addr))
+			w.logger.Write(fmt.Sprintf("Conn-Keep (r%d): %s\n", absIdx+1, addr))
 			if err := o.dialWithRetry(w, addr); err != nil {
 				return fmt.Errorf("dial: %v", err)
 			}
 		}
 
-		// Fire-and-forget: send without waiting for response
 		if fireAndForget {
-			w.logger.Write(fmt.Sprintf("Fire&Forget (%d)\n", idx))
-			bytesOut := uint32(len(req))
-			if o.httpH2 {
-				// HTTP/2: send headers+data frames only
-				parsedReq := parseRawReq2H2(req)
-				if parsedReq == nil {
-					return fmt.Errorf("failed to parse request for fire-and-forget")
-				}
-				if _, _, err := w.h2conn.sendReqH2(parsedReq, 0, false); err != nil {
-					return err
-				}
-			} else {
-				// HTTP/1.1: write and close
-				_, err = w.conn.Write([]byte(req))
-				if err != nil {
-					return err
-				}
-			}
-			// Report stats for fire-and-forget (no latency, no bytes in)
-			stats.ReportRequest(w.id, 0, 0, bytesOut)
-			o.closeWorkerConn(w) // force new connection for next request
-			w.prevResp = ""
-			return nil
+			return o.sendFireAndForget(w, req, addr, absIdx)
 		}
 
 		resp, status, err = o.sendWithReconnect(w, []byte(req), addr)
 	} else {
-		// No keep-alive: new connection each request
-		w.logger.Write(fmt.Sprintf("Conn (%d): %s\n", idx, addr))
+		// no keep-alive: new connection each request
+		w.logger.Write(fmt.Sprintf("Conn (r%d): %s\n", absIdx+1, addr))
 
-		// Fire-and-forget in non-keepalive mode
 		if fireAndForget {
-			w.logger.Write(fmt.Sprintf("Fire&Forget (%d)\n", idx))
-			conn, dialErr := o.dialNewConn(addr)
-			if dialErr != nil {
-				return dialErr
-			}
-			_, err = conn.Write([]byte(req))
-			conn.Close()
-			if err != nil {
-				return err
-			}
-			// Report stats for fire-and-forget (no latency, no bytes in)
-			stats.ReportRequest(w.id, 0, 0, uint32(len(req)))
-			w.prevResp = ""
-			return nil
+			return o.sendFireAndForget(w, req, addr, absIdx)
 		}
 
 		resp, status, err = o.sendWithRetry(w, []byte(req), addr)
@@ -404,17 +478,25 @@ func (o *Orch) sendReq(w *monkey, idx int, req string, addr string) error {
 		return err
 	}
 
-	w.logger.Write(fmt.Sprintf("HTTP (%d) %s\n", idx, status))
+	w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
 	w.prevResp = resp
+	// Extract patterns and cache for next request
+	if w.patterns != nil && relIdx < len(w.patterns) && len(w.patterns[relIdx]) > 0 {
+		patternVals, err := applyPatterns(w.patterns[relIdx], resp, w.logger)
+		if err != nil {
+			return err
+		}
+		w.lastPatternVals = patternVals // cache para prepareReq
+	}
 
-	// Apply response actions if pattern matches
-	if w.actionPatterns != nil && w.actionPatterns[idx] != nil {
-		if err := o.applyResponseActions(w, idx, req, resp, status); err != nil {
+	// apply response actions (uses absIdx for global pattern matching)
+	if w.actionPatterns != nil && w.actionPatterns[absIdx] != nil {
+		if err := o.applyResponseActions(w, absIdx, req, resp, status); err != nil {
 			return err
 		}
 	}
 
-	// Close if not keepalive (HTTP/1.1 only, H2 always reuses)
+	// close if not keepalive (HTTP/1.1 only, H2 always reuses)
 	if !o.keepAlive && !o.httpH2 {
 		o.closeWorkerConn(w)
 	}
@@ -428,12 +510,23 @@ func loadPatterns(path string) ([][]pattern, error) {
 		return nil, err
 	}
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+
+	// Filter comment lines (keep empty for fire-and-forget)
+	var filtered []string
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	lines = filtered
+
 	patterns := make([][]pattern, len(lines))
 	for i, line := range lines {
 		line = strings.TrimSpace(line)
 
-		// Empty line = fire-and-forget marker, keep empty slice for indexing
-		if line == "" {
+		// Line with only : is fire-and-forget marker, keep empty slice for indexing
+		if line == ":" {
 			patterns[i] = []pattern{}
 			continue
 		}
@@ -465,64 +558,70 @@ func (o *Orch) applyResponseActions(w *monkey, idx int, req, resp, status string
 	}
 
 	// Check if regex matches response
-	if !ap.re.MatchString(resp) {
-		return nil
+	m := ap.re.FindStringSubmatch(resp)
+	if m == nil {
+		return nil // No match, continue normally
 	}
 
-	w.logger.Write(fmt.Sprintf("Action match at idx %d\n", idx+1))
+	w.logger.Write(fmt.Sprintf("RA matched (r%d): %s\n", idx+1, m))
 
 	// Execute actions in order
 	for _, action := range ap.actions {
 		switch action.actionType {
-		case ActionPrintThread:
-			o.pauseThread(w, action.arg)
-
 		case ActionPrintAll:
-			o.pauseAllThreads(action.arg)
+			// Broadcast message to all threads and pause all
+			msg := fmt.Sprintf("\n>>> RA (r%d) T%d: %s <<<\n", idx+1, w.id+1, action.arg)
+			o.uiManager.BroadcastMessage(msg)
+			o.pauseAllThreads()
+			o.checkPause(w)
+
+		case ActionPrintThread:
+			// Print to this thread only and pause it
+			w.logger.Write(fmt.Sprintf(">>> RA: %s <<<\n", action.arg))
+			o.pauseThread(w.id)
+			o.checkPause(w)
 
 		case ActionSaveReq:
-			if err := saveToFile(action.arg, idx, req); err != nil {
-				w.logger.Write(fmt.Sprintf("Save req error: %v\n", err))
-				return err
+			// Save request that generated match
+			if err := os.WriteFile(action.arg, []byte(req), 0644); err != nil {
+				w.logger.Write(fmt.Sprintf("RA save error: %v\n", err))
+			} else {
+				w.logger.Write(fmt.Sprintf("RA saved req to: %s\n", action.arg))
 			}
-			w.logger.Write(fmt.Sprintf("Saved request to %s\n", action.arg))
-			o.pauseThread(w, "Request saved")
+			o.pauseThread(w.id)
+			o.checkPause(w)
 
 		case ActionSaveResp:
-			respToSave := resp
-			if o.httpH2 {
-				respToSave = formatH2ResponseAsH1(resp, status)
+			// Save response that generated match
+			if err := os.WriteFile(action.arg, []byte(resp), 0644); err != nil {
+				w.logger.Write(fmt.Sprintf("RA save error: %v\n", err))
+			} else {
+				w.logger.Write(fmt.Sprintf("RA saved resp to: %s\n", action.arg))
 			}
-			if err := saveToFile(action.arg, idx, respToSave); err != nil {
-				w.logger.Write(fmt.Sprintf("Save resp error: %v\n", err))
-				return err
-			}
-			w.logger.Write(fmt.Sprintf("Saved response to %s\n", action.arg))
-			o.pauseThread(w, "Response saved")
+			o.pauseThread(w.id)
+			o.checkPause(w)
 
 		case ActionSaveAll:
-			respToSave := resp
-			if o.httpH2 {
-				respToSave = formatH2ResponseAsH1(resp, status)
+			// Save both request and response
+			content := fmt.Sprintf("=== REQUEST ===\n%s\n\n=== RESPONSE ===\n%s", req, resp)
+			if err := os.WriteFile(action.arg, []byte(content), 0644); err != nil {
+				w.logger.Write(fmt.Sprintf("RA save error: %v\n", err))
+			} else {
+				w.logger.Write(fmt.Sprintf("RA saved req+resp to: %s\n", action.arg))
 			}
-			content := req + " " + respToSave
-			if err := saveToFile(action.arg, idx, content); err != nil {
-				w.logger.Write(fmt.Sprintf("Save all error: %v\n", err))
-				return err
-			}
-			w.logger.Write(fmt.Sprintf("Saved req+resp to %s\n", action.arg))
-			o.pauseThread(w, "Request and response saved")
+			o.pauseThread(w.id)
+			o.checkPause(w)
 
 		case ActionExit:
-			w.logger.Write("Exit action triggered\n")
-			// Graceful exit - close quitChan
+			// Graceful exit - close quitChan to signal all workers
+			w.logger.Write("RA: exit triggered\n")
 			select {
 			case <-o.quitChan:
 				// Already closed
 			default:
 				close(o.quitChan)
 			}
-			return fmt.Errorf("exit action")
+			return fmt.Errorf("RA exit")
 		}
 	}
 

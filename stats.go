@@ -65,6 +65,9 @@ type StatsCollector struct {
 	httpErrors map[string]int
 	errorOrder []string // insertion order for display
 
+	// Group structure for G#T# display
+	groupOffsets []int // starting globalID for each group
+
 	// FIFO status
 	valDist     *ValDist
 	fifoWaiting atomic.Bool
@@ -98,6 +101,27 @@ func NewStatsCollector(windowSize int, verbose bool) *StatsCollector {
 
 	go sc.worker()
 	return sc
+}
+
+// SetGroupOffsets - configures group structure for G#T# display
+// offsets[i] = starting globalID for group i
+func (sc *StatsCollector) SetGroupOffsets(offsets []int) {
+	sc.mu.Lock()
+	sc.groupOffsets = offsets
+	sc.mu.Unlock()
+}
+
+// globalIDToGroupThread - converts globalID to (groupID, localID)
+func (sc *StatsCollector) globalIDToGroupThread(globalID int) (int, int) {
+	if len(sc.groupOffsets) == 0 {
+		return 0, globalID
+	}
+	for i := len(sc.groupOffsets) - 1; i >= 0; i-- {
+		if globalID >= sc.groupOffsets[i] {
+			return i, globalID - sc.groupOffsets[i]
+		}
+	}
+	return 0, globalID
 }
 
 // Report - non-blocking send to stats channel
@@ -378,7 +402,7 @@ func (sc *StatsCollector) calcAvgJitter() float64 {
 	return totalDiff / float64(len(sc.jitterSamples)-1)
 }
 
-// formatErrors - formats error map as "T1(400)x2, T3(500)x1"
+// formatErrors - formats error map as "G1T1(400)x2, G2T3(500)x1"
 func (sc *StatsCollector) formatErrors() string {
 	if len(sc.httpErrors) == 0 {
 		return ""
@@ -386,31 +410,43 @@ func (sc *StatsCollector) formatErrors() string {
 
 	// Sort by thread ID for consistent display
 	type errEntry struct {
-		tid    int
-		status int
-		count  int
+		globalID int
+		groupID  int
+		localID  int
+		status   int
+		count    int
 	}
 	entries := make([]errEntry, 0, len(sc.httpErrors))
 
 	for key, count := range sc.httpErrors {
 		var tid, status int
 		fmt.Sscanf(key, "%d:%d", &tid, &status)
-		entries = append(entries, errEntry{tid, status, count})
+		gid, lid := sc.globalIDToGroupThread(tid)
+		entries = append(entries, errEntry{tid, gid, lid, status, count})
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].tid != entries[j].tid {
-			return entries[i].tid < entries[j].tid
+		if entries[i].globalID != entries[j].globalID {
+			return entries[i].globalID < entries[j].globalID
 		}
 		return entries[i].status < entries[j].status
 	})
 
 	var parts []string
 	for _, e := range entries {
-		if e.count > 1 {
-			parts = append(parts, fmt.Sprintf("T%d(%d)x%d", e.tid+1, e.status, e.count))
+		var label string
+		if len(sc.groupOffsets) > 1 {
+			// Multi-group mode: show G#T#
+			label = fmt.Sprintf("G%dT%d", e.groupID+1, e.localID+1)
 		} else {
-			parts = append(parts, fmt.Sprintf("T%d(%d)", e.tid+1, e.status))
+			// Single mode: show T#
+			label = fmt.Sprintf("T%d", e.globalID+1)
+		}
+
+		if e.count > 1 {
+			parts = append(parts, fmt.Sprintf("%s(%d)x%d", label, e.status, e.count))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s(%d)", label, e.status))
 		}
 	}
 

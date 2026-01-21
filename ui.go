@@ -71,101 +71,234 @@ func (a *AsyncLogWriter) Close() {
 	close(a.ch)
 }
 
+// GroupInfo - UI representation of a thread group
+type GroupInfo struct {
+	ID          int
+	Name        string
+	ThreadCount int
+	Mode        string
+	ReqIndices  []int
+}
+
 // UIManager - manages tview app, thread tabs, and stats panel
 type UIManager struct {
-	app          *tview.Application
-	pages        *tview.Pages
-	statsPanel   *tview.TextView
-	mainFlex     *tview.Flex
-	tabNames     []string
-	loggers      []*AsyncLogWriter
-	textViews    []*tview.TextView
+	app        *tview.Application
+	mainFlex   *tview.Flex
+	treeView   *tview.TreeView
+	contentBox *tview.TextView
+	statsPanel *tview.TextView
+
+	// Group structure
+	groups []GroupInfo
+
+	// Thread data (indexed by global threadID)
+	loggers     []*AsyncLogWriter
+	textViews   []*tview.TextView
+	threadNodes []*tview.TreeNode // for navigation
+
+	// Dump support
 	dumpEnabled  bool
 	dumpFiles    []*os.File
 	dumpChans    []chan string
-	dumpClosed   bool // flag to prevent send on closed channel
+	dumpClosed   bool
 	dumpClosedMu sync.Mutex
 }
 
-// NewUIManager - creates UI with thread tabs and stats panel
-func NewUIManager(threadCount int, dumpEnabled bool) *UIManager {
+// NewUIManager - creates UI with group support
+func NewUIManager(totalThreads int, dumpEnabled bool) *UIManager {
 	ui := &UIManager{
 		app:         tview.NewApplication(),
-		pages:       tview.NewPages(),
-		tabNames:    make([]string, threadCount),
-		loggers:     make([]*AsyncLogWriter, threadCount),
-		textViews:   make([]*tview.TextView, threadCount),
+		loggers:     make([]*AsyncLogWriter, totalThreads),
+		textViews:   make([]*tview.TextView, totalThreads),
+		threadNodes: make([]*tview.TreeNode, totalThreads),
 		dumpEnabled: dumpEnabled,
 	}
 
 	if dumpEnabled {
-		ui.dumpFiles = make([]*os.File, threadCount)
-		ui.dumpChans = make([]chan string, threadCount)
+		ui.dumpFiles = make([]*os.File, totalThreads)
+		ui.dumpChans = make([]chan string, totalThreads)
 	}
 
-	// Create thread tabs
-	for i := 0; i < threadCount; i++ {
-		ui.createThreadTab(i)
+	return ui
+}
+
+// SetupGroups - configures UI for group mode (always used now)
+func (ui *UIManager) SetupGroups(groups []*ThreadGroup) {
+	ui.groups = make([]GroupInfo, len(groups))
+
+	for i, g := range groups {
+		ui.groups[i] = GroupInfo{
+			ID:          g.ID,
+			Name:        fmt.Sprintf("G%d", g.ID+1),
+			ThreadCount: g.ThreadCount,
+			Mode:        g.Mode,
+			ReqIndices:  g.ReqIndices,
+		}
+	}
+}
+
+// Build - constructs the UI layout (call after SetupGroups)
+func (ui *UIManager) Build() {
+	// Create all thread views and loggers
+	globalID := 0
+	for _, group := range ui.groups {
+		for t := 0; t < group.ThreadCount; t++ {
+			ui.createThreadView(globalID, group.ID, t)
+			globalID++
+		}
 	}
 
-	// Create stats panel (bottom 1/3)
+	// Build tree view (returns first node for later selection)
+	firstNode := ui.buildTreeView()
+
+	// Stats panel
 	ui.statsPanel = tview.NewTextView().
 		SetDynamicColors(true).
 		SetScrollable(false)
 	ui.statsPanel.SetBorder(true).SetTitle(" Stats ")
 
-	// Layout: pages (2/3) + stats (1/3) vertical
-	ui.mainFlex = tview.NewFlex().
-		SetDirection(tview.FlexRow).
-		AddItem(ui.pages, 0, 2, true).      // 2/3 height
-		AddItem(ui.statsPanel, 0, 1, false) // 1/3 height
+	// Content area (shows selected thread)
+	ui.contentBox = ui.textViews[0]
 
-	return ui
+	// Always use TreeView layout with groups panel on left
+	leftPanel := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(ui.treeView, 0, 1, true)
+
+	rightPanel := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(ui.contentBox, 0, 2, false).
+		AddItem(ui.statsPanel, 0, 1, false)
+
+	ui.mainFlex = tview.NewFlex().
+		SetDirection(tview.FlexColumn).
+		AddItem(leftPanel, 12, 0, true).
+		AddItem(rightPanel, 0, 1, false)
+
+	// Set initial tree selection AFTER mainFlex exists (callbacks may fire)
+	if firstNode != nil {
+		ui.treeView.SetCurrentNode(firstNode)
+	}
 }
 
-// createThreadTab - creates tab with TextView and AsyncLogWriter
-func (ui *UIManager) createThreadTab(idx int) {
+// createThreadView - creates TextView and logger for a thread
+func (ui *UIManager) createThreadView(globalID, groupID, localID int) {
 	tv := tview.NewTextView().
 		SetDynamicColors(true).
 		SetScrollable(true)
 
-	tv.SetBorder(true).SetTitle(fmt.Sprintf(" Thread %d | Tab:Next Shift+Tab:Prev Q:Quit ", idx+1))
+	title := fmt.Sprintf(" G%d:T%d | Tab:Next Thread Ctrl+P:Next Group Q:Quit", groupID+1, localID+1)
+	tv.SetBorder(true).SetTitle(title)
 
-	// Async logger with buffered channel
+	// Async logger
 	logger := &AsyncLogWriter{
 		ch: make(chan string, logBufferSize),
 	}
 
-	// Setup dump file and goroutine if enabled
+	// Setup dump file if enabled
 	if ui.dumpEnabled {
-		filename := fmt.Sprintf("thr%d_%s.txt", idx, time.Now().Format("15-04"))
+		filename := fmt.Sprintf("g%d_t%d_%s.txt", groupID+1, localID+1, time.Now().Format("15-04"))
 		f, err := os.Create(filename)
 		if err != nil {
 			exitErr(fmt.Sprintf("Failed to create dump file %s: %v", filename, err))
 		}
-		ui.dumpFiles[idx] = f
-		ui.dumpChans[idx] = make(chan string, logBufferSize)
+		ui.dumpFiles[globalID] = f
+		ui.dumpChans[globalID] = make(chan string, logBufferSize)
 
-		// Dump writer goroutine
 		go func(f *os.File, ch <-chan string) {
 			for msg := range ch {
 				f.WriteString(msg)
 			}
-		}(f, ui.dumpChans[idx])
+		}(f, ui.dumpChans[globalID])
 	}
 
 	// Start consumer goroutine
-	go ui.logConsumer(idx, tv, logger.ch)
+	go ui.logConsumer(globalID, tv, logger.ch)
 
-	tabName := fmt.Sprintf("t%d", idx+1)
-	ui.tabNames[idx] = tabName
-	ui.loggers[idx] = logger
-	ui.textViews[idx] = tv
-
-	ui.pages.AddPage(tabName, tv, true, idx == 0)
+	ui.loggers[globalID] = logger
+	ui.textViews[globalID] = tv
 
 	// Initial message
-	fmt.Fprintf(tv, "Thread %d starting...\n", idx+1)
+	fmt.Fprintf(tv, "Group %d, Thread %d starting...\n", groupID+1, localID+1)
+}
+
+// buildTreeView - creates hierarchical tree view for groups/threads
+// Returns the first thread node for initial selection (must be set after mainFlex exists)
+func (ui *UIManager) buildTreeView() *tview.TreeNode {
+	root := tview.NewTreeNode("TREM").SetColor(tcell.ColorYellow)
+	ui.treeView = tview.NewTreeView().
+		SetRoot(root).
+		SetCurrentNode(root)
+	ui.treeView.SetBorder(true).SetTitle("Groups")
+
+	globalID := 0
+	var firstNode *tview.TreeNode
+
+	for _, group := range ui.groups {
+		// Group node
+		groupLabel := fmt.Sprintf("G%d [%s]", group.ID+1, group.Mode)
+		groupNode := tview.NewTreeNode(groupLabel).
+			SetColor(tcell.ColorGreen).
+			SetExpanded(true).
+			SetSelectable(true)
+
+		// Thread nodes under group
+		for t := 0; t < group.ThreadCount; t++ {
+			threadLabel := fmt.Sprintf("T%d", t+1)
+			threadNode := tview.NewTreeNode(threadLabel).
+				SetColor(tcell.ColorWhite).
+				SetReference(globalID). // store global thread ID
+				SetSelectable(true)
+
+			ui.threadNodes[globalID] = threadNode
+			groupNode.AddChild(threadNode)
+
+			if firstNode == nil {
+				firstNode = threadNode
+			}
+			globalID++
+		}
+
+		root.AddChild(groupNode)
+	}
+
+	// Handle selection changes
+	ui.treeView.SetSelectedFunc(func(node *tview.TreeNode) {
+		ref := node.GetReference()
+		if ref != nil {
+			if gid, ok := ref.(int); ok {
+				ui.updateContentView(gid)
+			}
+		}
+	})
+
+	ui.treeView.SetChangedFunc(func(node *tview.TreeNode) {
+		ref := node.GetReference()
+		if ref != nil {
+			if gid, ok := ref.(int); ok {
+				ui.updateContentView(gid)
+			}
+		}
+	})
+
+	return firstNode
+}
+
+// updateContentView - switches the content panel to show selected thread
+func (ui *UIManager) updateContentView(globalThreadID int) {
+	if globalThreadID < 0 || globalThreadID >= len(ui.textViews) {
+		return
+	}
+
+	newContent := ui.textViews[globalThreadID]
+
+	// Find the right panel (second item in mainFlex) and update
+	rightPanel := ui.mainFlex.GetItem(1).(*tview.Flex)
+	rightPanel.Clear()
+	rightPanel.AddItem(newContent, 0, 2, false)
+	rightPanel.AddItem(ui.statsPanel, 0, 1, false)
+
+	ui.contentBox = newContent
 }
 
 // logConsumer - consumes log messages and batch-updates TextView
@@ -181,7 +314,7 @@ func (ui *UIManager) logConsumer(idx int, tv *tview.TextView, ch <-chan string) 
 				fmt.Fprint(tv, content)
 				tv.ScrollToEnd()
 			})
-			// Send to dump goroutine if enabled (check closed flag)
+			// Send to dump goroutine if enabled
 			if ui.dumpEnabled && ui.dumpChans[idx] != nil {
 				ui.dumpClosedMu.Lock()
 				closed := ui.dumpClosed
@@ -190,7 +323,6 @@ func (ui *UIManager) logConsumer(idx int, tv *tview.TextView, ch <-chan string) 
 					select {
 					case ui.dumpChans[idx] <- content:
 					default:
-						// buffer full, skip
 					}
 				}
 			}
@@ -236,46 +368,112 @@ func (ui *UIManager) StartStatsConsumer(statsCh <-chan string) {
 	}()
 }
 
-// GetLogger - returns LogWriter for given thread
-func (ui *UIManager) GetLogger(idx int) LogWriter {
-	return ui.loggers[idx]
+// GetLogger - returns LogWriter for given global thread ID
+func (ui *UIManager) GetLogger(globalThreadID int) LogWriter {
+	return ui.loggers[globalThreadID]
 }
 
 // SetupInputCapture - configures keyboard navigation
-func (ui *UIManager) SetupInputCapture(orch *Orch, monkeysFinished *bool) {
-	currentTab := 0
+func (ui *UIManager) SetupInputCapture(orchs []*Orch, monkeysFinished *bool) {
+	currentIdx := 0
+	totalThreads := len(ui.textViews)
 
 	ui.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyTab {
-			currentTab = (currentTab + 1) % len(ui.tabNames)
-			ui.pages.SwitchToPage(ui.tabNames[currentTab])
+		switch event.Key() {
+		case tcell.KeyTab:
+			// Next thread
+			currentIdx = (currentIdx + 1) % totalThreads
+			ui.selectThread(currentIdx)
 			return nil
-		} else if event.Key() == tcell.KeyBacktab {
-			currentTab = (currentTab - 1 + len(ui.tabNames)) % len(ui.tabNames)
-			ui.pages.SwitchToPage(ui.tabNames[currentTab])
-			return nil
-		} else if event.Key() == tcell.KeyEnter {
-			// Resume all paused threads
-			orch.resumeAll()
-			return nil
-		} else if event.Rune() == 'q' || event.Rune() == 'Q' {
-			// Close dump files and channels
-			ui.closeDumpFiles()
 
-			if *monkeysFinished {
-				ui.app.Stop()
-			} else {
-				select {
-				case <-orch.quitChan:
-				default:
-					close(orch.quitChan)
-				}
-				ui.app.Stop()
+		case tcell.KeyBacktab:
+			// Previous thread
+			currentIdx = (currentIdx - 1 + totalThreads) % totalThreads
+			ui.selectThread(currentIdx)
+			return nil
+
+		case tcell.KeyCtrlP:
+			// Next group
+			currentIdx = ui.nextGroupFirstThread(currentIdx)
+			ui.selectThread(currentIdx)
+			return nil
+
+		case tcell.KeyEnter:
+			// Resume all paused threads
+			for _, o := range orchs {
+				o.resumeAll()
 			}
 			return nil
+
+		case tcell.KeyRune:
+			switch event.Rune() {
+			case 'q', 'Q':
+				ui.closeDumpFiles()
+				if *monkeysFinished {
+					ui.app.Stop()
+				} else {
+					for _, o := range orchs {
+						select {
+						case <-o.quitChan:
+						default:
+							close(o.quitChan)
+						}
+					}
+					ui.app.Stop()
+				}
+				return nil
+			}
 		}
 		return event
 	})
+}
+
+// selectThread - updates tree selection and content view
+func (ui *UIManager) selectThread(globalIdx int) {
+	if globalIdx < 0 || globalIdx >= len(ui.threadNodes) {
+		return
+	}
+	node := ui.threadNodes[globalIdx]
+	if node != nil {
+		ui.treeView.SetCurrentNode(node)
+		ui.updateContentView(globalIdx)
+	}
+}
+
+// nextGroupFirstThread - returns first thread of next group
+func (ui *UIManager) nextGroupFirstThread(currentIdx int) int {
+	offset := 0
+	for i, g := range ui.groups {
+		if currentIdx < offset+g.ThreadCount {
+			// Current is in group i, go to group i+1
+			nextGroup := (i + 1) % len(ui.groups)
+			nextOffset := 0
+			for j := 0; j < nextGroup; j++ {
+				nextOffset += ui.groups[j].ThreadCount
+			}
+			return nextOffset
+		}
+		offset += g.ThreadCount
+	}
+	return 0
+}
+
+// prevGroupFirstThread - returns first thread of previous group
+func (ui *UIManager) prevGroupFirstThread(currentIdx int) int {
+	offset := 0
+	for i, g := range ui.groups {
+		if currentIdx < offset+g.ThreadCount {
+			// Current is in group i, go to group i-1
+			prevGroup := (i - 1 + len(ui.groups)) % len(ui.groups)
+			prevOffset := 0
+			for j := 0; j < prevGroup; j++ {
+				prevOffset += ui.groups[j].ThreadCount
+			}
+			return prevOffset
+		}
+		offset += g.ThreadCount
+	}
+	return 0
 }
 
 // closeDumpFiles - closes dump channels and files
@@ -283,12 +481,10 @@ func (ui *UIManager) closeDumpFiles() {
 	if !ui.dumpEnabled {
 		return
 	}
-	// Set closed flag first to prevent sends
 	ui.dumpClosedMu.Lock()
 	ui.dumpClosed = true
 	ui.dumpClosedMu.Unlock()
 
-	// Small delay to let pending flushes complete
 	time.Sleep(50 * time.Millisecond)
 
 	for i, ch := range ui.dumpChans {
@@ -310,6 +506,20 @@ func (ui *UIManager) Run() error {
 func (ui *UIManager) BroadcastMessage(msg string) {
 	for _, logger := range ui.loggers {
 		logger.Write(msg)
+	}
+}
+
+// BroadcastToGroup - sends message to all threads in a group
+func (ui *UIManager) BroadcastToGroup(groupID int, msg string) {
+	offset := 0
+	for _, g := range ui.groups {
+		if g.ID == groupID {
+			for i := 0; i < g.ThreadCount; i++ {
+				ui.loggers[offset+i].Write(msg)
+			}
+			return
+		}
+		offset += g.ThreadCount
 	}
 }
 

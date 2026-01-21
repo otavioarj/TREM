@@ -1,14 +1,56 @@
 package main
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
+
+// decodeBody - decompresses gzip/deflate encoded body
+// Returns raw bytes if encoding is empty, identity, or unknown
+func decodeBody(body *bytes.Buffer, encoding string) ([]byte, error) {
+	switch encoding {
+	case "", "identity":
+		return body.Bytes(), nil
+
+	case "gzip":
+		r, err := gzip.NewReader(body)
+		if err != nil {
+			return nil, fmt.Errorf("gzip open: %v", err)
+		}
+		defer r.Close()
+		decoded, err := io.ReadAll(r)
+		if err != nil {
+			return nil, fmt.Errorf("gzip read: %v", err)
+		}
+		return decoded, nil
+
+	case "deflate":
+		r := flate.NewReader(body)
+		defer r.Close()
+		decoded, err := io.ReadAll(r)
+		if err != nil {
+			return nil, fmt.Errorf("deflate read: %v", err)
+		}
+		return decoded, nil
+
+	default:
+		if verbose {
+			fmt.Printf("[V] unknown encoding: %s, returning raw\n", encoding)
+		}
+		return body.Bytes(), nil
+	}
+}
 
 // Action types for response actions
 const (
@@ -33,9 +75,6 @@ type actionPattern struct {
 // Pre-compiled regex for parseHost
 var hostHeaderRe = regexp.MustCompile(`(?im)^Host:\s*([^:\r\n]+)(?::(\d+))?`)
 
-// Pre-compiled regex for extracting $key$ patterns
-var keyPatternRe = regexp.MustCompile(`\$([^$]+)\$`)
-
 // drainChannel - drains messages from channel into localBuffer (non-blocking)
 // limit=0 means unlimited, otherwise drains at most 'limit' messages
 func drainChannel(w *monkey, limit int) {
@@ -59,22 +98,30 @@ func drainChannel(w *monkey, limit int) {
 	}
 }
 
-// waitForKeys - blocks until all required keys are available in localBuffer
+// waitForKeys - blocks (for wait_time) until all required keys are available in localBuffer
 // Emits periodic messages about missing keys
-func waitForKeys(w *monkey, keys []string, done <-chan struct{}) bool {
-	ticker := time.NewTicker(2 * time.Second)
+func waitForKeys(w *monkey, keys []string, values map[string]string, limit int, done <-chan struct{}) bool {
+	wait_time := 10 // in milliseconds
+	ticker := time.NewTicker(time.Duration(wait_time) * time.Millisecond)
 	defer ticker.Stop()
 	var prints []string
-	// Wait for max tries, or ticker*max_wait seconds
-	max_wait := 5
-	wait_idx := 1
+	max_wait := 2 * (1000 / wait_time) //left operand is seconds :)
 	for {
-		// Check if all keys present
+		// Check if all keys present (in localBuffer OR globalStaticVals)
 		var missing []string
 		for _, k := range keys {
-			if len(w.localBuffer[k]) == 0 {
-				missing = append(missing, k)
+			if len(w.localBuffer[k]) > 0 {
+				continue
 			}
+			// For _key patterns, also check globalStaticVals and insert it to values
+			if len(k) > 0 && k[0] == '_' {
+				if v, exists := globalStaticVals.Load(k); exists {
+					values[k] = v.(string)
+					w.logger.Write(fmt.Sprintf("Static $%s$: %s\n", k, v.(string)))
+					continue
+				}
+			}
+			missing = append(missing, k)
 		}
 		if len(missing) == 0 {
 			return true
@@ -87,17 +134,19 @@ func waitForKeys(w *monkey, keys []string, done <-chan struct{}) bool {
 				return false
 			}
 			for k, v := range msg {
-				w.localBuffer[k] = append(w.localBuffer[k], v)
+				if limit == 0 || len(w.localBuffer[k]) < limit {
+					w.localBuffer[k] = append(w.localBuffer[k], v)
+				}
 			}
 		case <-ticker.C:
-			if wait_idx == max_wait {
-				w.logger.Write(fmt.Sprintf("Giving up FIFO keys: %v\n", missing))
+			if max_wait == 0 {
+				w.logger.Write(fmt.Sprintf("Giving up keys: %v\n", missing))
 				return false
 			}
-			wait_idx++
+			max_wait--
 			for p := range missing {
 				if len(prints) > p && missing[p] != prints[p] {
-					w.logger.Write(fmt.Sprintf("Waiting FIFO keys: %v\n", missing))
+					w.logger.Write(fmt.Sprintf("Waiting keys: %v\n", missing))
 				}
 				prints = missing
 			}
@@ -111,32 +160,12 @@ func waitForKeys(w *monkey, keys []string, done <-chan struct{}) bool {
 func checkMissingKeys(buffer map[string][]string, keys []string) []string {
 	var missing []string
 	for _, k := range keys {
-		if len(buffer[k]) == 0 {
-			missing = append(missing, k)
+		if len(buffer[k]) > 0 {
+			continue
 		}
+		missing = append(missing, k)
 	}
 	return missing
-}
-
-// extractKeys - extracts all $key$ patterns from request string
-func extractKeys(req string) []string {
-	matches := keyPatternRe.FindAllStringSubmatch(req, -1)
-	keys := make([]string, 0, len(matches))
-	for _, m := range matches {
-		key := "$" + m[1] + "$"
-		// Linear search - faster for small N due to cache
-		found := false
-		for _, k := range keys {
-			if k == key {
-				found = true
-				break
-			}
-		}
-		if !found {
-			keys = append(keys, key)
-		}
-	}
-	return keys
 }
 
 // generateCombinations - generates cartesian product of values for keys
@@ -182,7 +211,7 @@ func generateCombinations(buffer map[string][]string, keys []string) []map[strin
 // consumeValues - removes used values from localBuffer
 func consumeValues(buffer map[string][]string, keys []string, count int) {
 	for _, k := range keys {
-		if len(buffer[k]) > 0 && k[1] != '_' {
+		if len(buffer[k]) > 0 && k[0] != '_' {
 			if count >= len(buffer[k]) {
 				delete(buffer, k)
 			} else {
@@ -190,25 +219,6 @@ func consumeValues(buffer map[string][]string, keys []string, count int) {
 			}
 		}
 	}
-}
-
-func countKeys(req string) int {
-	i := 0
-	cnt := make(map[string]int)
-	for {
-		start := strings.Index(req[i:], "$")
-		if start < 0 {
-			break
-		}
-		i += start + 1
-		end := strings.Index(req[i:], "$")
-		if end < 0 {
-			break
-		}
-		cnt[req[i:i+end]]++
-		i += end + 1
-	}
-	return len(cnt)
 }
 
 func FormatConfig(threads, delay, loopStart, loopTimes, cliHello, fbck int,
@@ -428,7 +438,6 @@ func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot read action file: %v", err)
 	}
-
 	result := make(map[int]*actionPattern)
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 
@@ -471,19 +480,16 @@ func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 		if err != nil {
 			return nil, fmt.Errorf("line %d: invalid regex: %v", lineNum+1, err)
 		}
-
 		// Parse actions
 		actions, err := parseActions(rest)
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %v", lineNum+1, err)
 		}
-
 		// Create pattern
 		ap := &actionPattern{
 			re:      re,
 			actions: actions,
 		}
-
 		// Assign to each index (error if duplicate)
 		for idx := range indices {
 			if result[idx] != nil {
@@ -492,7 +498,6 @@ func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 			result[idx] = ap
 		}
 	}
-
 	return result, nil
 }
 
@@ -549,7 +554,6 @@ func parseActions(s string) ([]respAction, error) {
 		default:
 			return nil, fmt.Errorf("unknown action at position %d: %s", i, s[i:])
 		}
-
 		i += consumed
 
 		var arg string
@@ -559,7 +563,6 @@ func parseActions(s string) ([]respAction, error) {
 				return nil, fmt.Errorf("expected '\"' after action at position %d", i)
 			}
 			i++ // skip opening "
-
 			// Find closing ")
 			endQuote := strings.Index(s[i:], "\")")
 			if endQuote < 0 {
@@ -568,7 +571,6 @@ func parseActions(s string) ([]respAction, error) {
 			arg = s[i : i+endQuote]
 			i += endQuote + 2 // skip content + ")
 		}
-
 		actions = append(actions, respAction{
 			actionType: actionType,
 			arg:        arg,
@@ -582,34 +584,44 @@ func parseActions(s string) ([]respAction, error) {
 			i++
 		}
 	}
-
 	if len(actions) == 0 {
 		return nil, errors.New("no valid actions found")
 	}
-
 	return actions, nil
 }
 
-// saveToFile - saves content to file with _idx_epoch suffix
-func saveToFile(basePath string, idx int, content string) error {
-	epoch := time.Now().Unix()
-	var finalPath string
-
-	dotIdx := strings.LastIndexByte(basePath, '.')
-	if dotIdx > 0 {
-		// Insert before extension: /path/file.txt -> /path/file_idx_epoch.txt
-		finalPath = fmt.Sprintf("%s_%d_%d%s", basePath[:dotIdx], idx, epoch, basePath[dotIdx:])
-	} else {
-		// No extension: /path/file -> /path/file_idx_epoch
-		finalPath = fmt.Sprintf("%s_%d_%d", basePath, idx, epoch)
+// setupValDist - creates and initializes value distributor
+func setupValDist(univFlag string, fmodeFlag, totalThreads int, logger LogWriter) *ValDist {
+	if univFlag == "" {
+		return NewValDist("", 1, totalThreads)
 	}
-
-	return os.WriteFile(finalPath, []byte(content), 0644)
+	if !strings.Contains(univFlag, "=") {
+		vd := NewValDist(univFlag, fmodeFlag, totalThreads)
+		if err := vd.EnsureFifo(); err != nil {
+			exitErr(fmt.Sprintf("FIFO error: %v", err))
+		}
+		vd.Start(logger)
+		return vd
+	}
+	parts := strings.Split(univFlag, "=")
+	if len(parts) != 2 {
+		exitErr("Universal must be key=val or file (FIFO) path")
+	}
+	return NewValDistStatic(parts[0], parts[1])
 }
 
-// formatH2ResponseAsH1 - converts H2 response headers to HTTP/1.1 format
-func formatH2ResponseAsH1(resp string, status string) string {
-	// H2 response from readResponse is already: "header: value\r\n...\r\n\r\nbody"
-	// Just prepend HTTP/1.1 status line
-	return fmt.Sprintf("HTTP/1.1 %s \r\n%s", status, resp)
+// loadMTLSCert - loads mTLS certificate if specified
+func loadMTLSCert(mtlsFlag string) *utls.Certificate {
+	if mtlsFlag == "" {
+		return nil
+	}
+	certAndPass := strings.Split(mtlsFlag, ":")
+	if len(certAndPass) != 2 {
+		exitErr("Client Certificate (mTLS) must be file:pass!")
+	}
+	cert, err := loadPKCS12Certificate(certAndPass[0], certAndPass[1])
+	if err != nil {
+		exitErr(err.Error())
+	}
+	return &cert
 }
