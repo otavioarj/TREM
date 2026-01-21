@@ -123,9 +123,9 @@ func main() {
 	thrFlag := flag.Int("thr", 1, "Thread count (single mode only)")
 	listFlag := flag.String("l", "", "Request files list, comma separated")
 	reFlag := flag.String("re", "", "Regex definitions file. Format for each line: regex`:key $ regex2`:key2 ... regexK`:keyK\n"+
-		"Where line N will apply regexes on response N to populate the request N+1 $key$ placeholder.\nNote: A blank line break (\\n)"+
+		"Where line N will apply regexes on response N to populate the request N+1 $key$ placeholder.\nNote: A line with only :"+
 		" means the given request will not wait for the response! Example, -l r1,r2,r3 -re re.txt, with re.txt as:\n"+
-		" regex1`:key1\n\n regex3`:key3\nMeans request r2 is sent and then request r3, r2 response is never read.")
+		" regex1`:key1\n :\n regex3`:key3\nMeans request r2 is sent and then request r3, r2 response is never read.")
 	modeFlag := flag.String("mode", "async", "Mode: async, sync, or block.\n"+
 		"  async = independent threads\n"+
 		"  sync  = barrier synchronization\n"+

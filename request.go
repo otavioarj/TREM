@@ -525,8 +525,8 @@ func loadPatterns(path string) ([][]pattern, error) {
 	for i, line := range lines {
 		line = strings.TrimSpace(line)
 
-		// Empty line = fire-and-forget marker, keep empty slice for indexing
-		if line == "" {
+		// Line with only : is fire-and-forget marker, keep empty slice for indexing
+		if line == ":" {
 			patterns[i] = []pattern{}
 			continue
 		}
