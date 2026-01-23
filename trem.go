@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.6.0"
+var version = "v1.6.2"
 
 // Global flags
 var verbose bool
@@ -35,9 +35,6 @@ type pattern struct {
 	re      *regexp.Regexp
 	keyword string
 }
-
-// httpVersionRe - matches HTTP/x.x at end of request line
-var httpVersionRe = regexp.MustCompile(`HTTP/\d\.\d`)
 
 // LogWriter - Interface for async logging
 type LogWriter interface {
@@ -71,8 +68,9 @@ type monkey struct {
 	localBuffer map[string][]string    // accumulated values for consumption
 
 	// Block mode fields
-	blockBuf     []byte // accumulated requests for block mode
-	blockOffsets []int  // offset of each request start in blockBuf
+	blockBuf     []byte       // HTTP/1.1: accumulated requests for pipelining
+	blockOffsets []int        // HTTP/1.1: offset of each request start in blockBuf
+	blockH2Reqs  []*ParsedReq // HTTP/2: accumulated requests for multiplexing
 }
 
 // Orch - orchestrator for sync/async/block modes
@@ -129,14 +127,15 @@ func main() {
 	modeFlag := flag.String("mode", "async", "Mode: async, sync, or block.\n"+
 		"  async = independent threads\n"+
 		"  sync  = barrier synchronization\n"+
-		"  block = HTTP/1.1 pipelining (accumulate requests, single TCP write)")
+		"  block = HTTP/1.1 pipelining or HTTP/2 multiplexing (single TCP write)")
 	delayFlag := flag.Int("d", 0, "Delay ms between requests")
 	hostFlag := flag.String("h", "", "Host override: host:port")
 	outFlag := flag.Bool("o", false, "Output last response to file")
 	kaFlag := flag.Bool("k", true, "Keep-alive: reuse TLS connection for chain")
 	verboseFlag := flag.Bool("v", false, "Verbose: show debug info")
 	proxyFlag := flag.String("px", "", "Proxy URL (http://host:port)")
-	cliFlag := flag.Int("cli", 0, "uTLS Client Hello ID. 0=Go default, 1=Chrome 124, 2=Firefox 120, 3=Safari 18.0")
+	cliFlag := flag.Int("cli", 0, "uTLS Client Hello ID:\n"+
+		"0: Random(No)ALPN\n1: Chrome_Auto\n2: Firefox_Auto\n3: iOS_Auto\n4: Edge_Auto\n5: Safari_Auto")
 	loopStartFlag := flag.Int("x", -1, "Loop from request index (1-based). -1 = no loop")
 	loopTimesFlag := flag.Int("xt", 1, "Loop count. 0 = infinite")
 	touFlag := flag.Int("tou", 10000, "TLS dial timeout (ms)")
@@ -179,11 +178,6 @@ func main() {
 	// Validate mode flag
 	if *modeFlag != "async" && *modeFlag != "sync" && *modeFlag != "block" {
 		exitErr("mode must be 'async', 'sync', or 'block'")
-	}
-
-	// Validate block mode + http2 incompatibility
-	if *modeFlag == "block" && *httpFlag {
-		exitErr("mode=block is incompatible with -http2 (HTTP/1.1 pipelining only)")
 	}
 
 	// Stats collection window size
@@ -279,7 +273,7 @@ func main() {
 			if err != nil {
 				exitErr(err.Error())
 			}
-			if len(allPatterns) < len(reqFiles) {
+			if len(allPatterns) < len(reqFiles)-1 {
 				exitErr(fmt.Sprintf("regex file must have %d lines, got %d", len(reqFiles)-1, len(allPatterns)))
 			}
 		}

@@ -54,7 +54,7 @@ func createSingleGroup(reqCount, threadCount int, mode string,
 
 // parseGroupsFile - parses -thrG file and returns validated groups
 // Format per line, i.e: 1,3,5 thr=25 mode=async s_delay=25 r_delay=10 x=1 xt=2 sb=1,3 re=patterns.txt
-// httpH2 is passed to validate block mode incompatibility
+// httpH2 is passed for future validation needs
 func parseGroupsFile(path string, totalReqs int, httpH2 bool) ([]*ThreadGroup, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -139,7 +139,7 @@ func parseGroupsFile(path string, totalReqs int, httpH2 bool) ([]*ThreadGroup, e
 }
 
 // parseGroupLine - parses single group definition line
-// httpH2 is passed to validate block mode incompatibility
+// httpH2 is passed for future validation needs
 func parseGroupLine(line string, groupID, lineNum int, httpH2 bool) (*ThreadGroup, error) {
 	// Split into tokens
 	tokens := strings.Fields(line)
@@ -185,10 +185,6 @@ func parseGroupLine(line string, groupID, lineNum int, httpH2 bool) (*ThreadGrou
 		case "mode":
 			if value != "sync" && value != "async" && value != "block" {
 				return nil, fmt.Errorf("line %d: mode must be 'sync', 'async', or 'block'", lineNum)
-			}
-			// Validate block mode + http2 incompatibility
-			if value == "block" && httpH2 {
-				return nil, fmt.Errorf("line %d: mode=block is incompatible with -http2 (HTTP/1.1 pipelining only)", lineNum)
 			}
 			group.Mode = value
 			foundMode = true

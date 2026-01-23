@@ -18,6 +18,26 @@ type ParsedReq struct {
 	Body    []byte
 }
 
+// String - reconstructs raw HTTP request from ParsedReq (used for actions/logging)
+func (p *ParsedReq) String() string {
+	var sb strings.Builder
+	sb.WriteString(p.Method)
+	sb.WriteString(" ")
+	sb.WriteString(p.Path)
+	sb.WriteString(" HTTP/2\r\nHost: ")
+	sb.WriteString(p.Host)
+	sb.WriteString("\r\n")
+	for _, h := range p.Headers {
+		sb.WriteString(h[0])
+		sb.WriteString(": ")
+		sb.WriteString(h[1])
+		sb.WriteString("\r\n")
+	}
+	sb.WriteString("\r\n")
+	sb.Write(p.Body)
+	return sb.String()
+}
+
 // parseRawReq2H2 - parses HTTP/1.1 raw text into HTTP2 ParsedReq
 // TREM always get request as HTTP/1.1, so pseudo-headers ARE IGNORED here!
 func parseRawReq2H2(raw string) *ParsedReq {
@@ -298,10 +318,37 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	return nil
 }
 
-// appendToBlock - accumulates request in buffer for block mode (HTTP/1.1 pipelining)
-// Validates host consistency. Triggers flushBlock when buffer exceeds maxDataSize or last request in the chain.
+// appendToBlock - accumulates request in buffer for block mode
+// HTTP/1.1: raw bytes pipelining | HTTP/2: ParsedReq multiplexing
+// Validates host consistency. Triggers flushBlock when buffer exceeds maxDataSize or last request.
 func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) error {
-	// First request: establish connection and store addr
+	if o.httpH2 {
+		// HTTP/2 block mode: accumulate ParsedReq for multiplexing
+		if w.h2conn == nil {
+			w.logger.Write(fmt.Sprintf("Block-Conn H2: %s\n", addr))
+			if err := o.dialWithRetry(w, addr); err != nil {
+				return fmt.Errorf("dial: %v", err)
+			}
+		} else if addr != w.connAddr {
+			return fmt.Errorf("block mode: host mismatch %s vs %s. Multiplexing requires same host!", addr, w.connAddr)
+		}
+
+		parsed := parseRawReq2H2(req)
+		if parsed == nil {
+			return fmt.Errorf("failed to parse H2 request")
+		}
+		w.blockH2Reqs = append(w.blockH2Reqs, parsed)
+
+		isLastReq := relIdx == len(w.reqIndices)-1
+		if isLastReq {
+			return o.flushBlock(w)
+		}
+
+		w.logger.Write(fmt.Sprintf("Queued r%d (H2)\n", absIdx+1))
+		return nil
+	}
+
+	// HTTP/1.1 block mode: accumulate raw bytes for pipelining
 	if len(w.blockOffsets) == 0 {
 		if w.conn == nil {
 			w.logger.Write(fmt.Sprintf("Block-Conn: %s\n", addr))
@@ -312,7 +359,7 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 	} else {
 		// Validate same host for pipelining
 		if addr != w.connAddr {
-			return fmt.Errorf("block mode: host mismatch %s vs %s .Pipelining requires same host!", addr, w.connAddr)
+			return fmt.Errorf("block mode: host mismatch %s vs %s. Pipelining requires same host!", addr, w.connAddr)
 		}
 	}
 
@@ -332,10 +379,65 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 	return nil
 }
 
-// flushBlock - sends accumulated requests in single TCP write, reads responses in order.
-// This read trusts that the target webserver is following RFC7230 correctly:
-// |-> Responses are in the same order as request from FIFO <-
+// flushBlock - sends accumulated requests in single TCP write, reads responses
+// HTTP/1.1: pipelining (RFC7230 FIFO order) | HTTP/2: multiplexing (correlate by streamID)
 func (o *Orch) flushBlock(w *monkey) error {
+	if o.httpH2 {
+		// HTTP/2 block mode: multiplexed requests
+		if len(w.blockH2Reqs) == 0 {
+			return nil
+		}
+
+		reqCount := len(w.blockH2Reqs)
+		w.logger.Write(fmt.Sprintf("Flush %d reqs (H2 multiplex)\n", reqCount))
+
+		// Single TCP write with all requests
+		streamIDs, bytesOut, err := w.h2conn.sendBatchH2(w.blockH2Reqs)
+		if err != nil {
+			return fmt.Errorf("H2 batch send: %v", err)
+		}
+
+		// Map streamID → index for response correlation
+		streamToIdx := make(map[uint32]int, reqCount)
+		for i, sid := range streamIDs {
+			streamToIdx[sid] = i
+		}
+
+		// Read responses (order may vary due to H2 multiplexing)
+		for i := 0; i < reqCount; i++ {
+			streamID, resp, status, bytesIn, err := w.h2conn.readResponse(0) // 0 = any stream
+			if err != nil {
+				return fmt.Errorf("H2 read resp %d: %v", i+1, err)
+			}
+
+			idx, ok := streamToIdx[streamID]
+			if !ok {
+				return fmt.Errorf("H2 unknown streamID %d", streamID)
+			}
+			absIdx := w.reqIndices[idx]
+
+			w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
+			w.prevResp = resp
+			stats.ReportRequest(w.id, 0, uint32(bytesIn), 0)
+
+			// Apply response actions if configured
+			if w.actionPatterns != nil && w.actionPatterns[absIdx] != nil {
+				reqStr := w.blockH2Reqs[idx].String()
+				if err := o.applyResponseActions(w, absIdx, reqStr, resp, status); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Report aggregate bytes out
+		stats.ReportRequest(w.id, 0, 0, uint32(bytesOut))
+
+		// Clear buffer for next batch
+		w.blockH2Reqs = w.blockH2Reqs[:0]
+		return nil
+	}
+
+	// HTTP/1.1 block mode: pipelined requests
 	if len(w.blockBuf) == 0 {
 		return nil
 	}
