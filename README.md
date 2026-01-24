@@ -397,20 +397,32 @@ Replaces every `$token$` in all requests with `abc123`.
 # Terminal 1: Start TREM
 ./trem -l "login.txt" -re patterns.txt -u /tmp/fifo -thr 50 -fmode 2
 
-# Terminal 2: Feed credentials
+# Terminal 2: Feed credentials from a file
 cat passwords.txt > /tmp/fifo
+# Or from another program
+python generate_spraypass.py -in passwords_masks.txt -out /tmp/fifo
 ```
 
 **FIFO file format:**
 ```
-$pass$=password123
+pass=password123
 admin123
 letmein
 qwerty
 123456
 ```
 
-The first line defines the key (`$pass$`), subsequent lines are values for that key. Each value of `$pass$` generates a new request when matching and replacing the key in a given request.
+The first line defines the key (`pass`), subsequent lines are values for that key. Each value of `pass` generates a new request when matching and replacing the key in a given request. Although FIFO keys don't use `$key$` format in feed/consumption, the find&replace algorithm always uses key in format `$key$` in requests! So the FIFO key `pass` will replace request key `$pass$`. FIFO also accept static keys and mutators, as:
+
+```
+_user=admin
+pass=password123
+admin123
+letmein
+qwerty
+123456
+```
+The key `_user` is globally available (see [Cross-Group Value Sharing](#cross-group-value-sharing)) to all groups threads (see [Thread Groups](#thread-groups--thrg)), while the values of `pass`are shared following the FIFO Distribution Modes. 
 
 ### FIFO Distribution Modes (`-fmode`)
 
@@ -427,28 +439,28 @@ Thread 1: pass2, pass5
 Thread 2: pass3, pass6
 ```
 
-### Persistent Keys (`$_key$`)
+### Persistent Keys (`_key`)
 
-Keys starting with underscore are never consumed and persist across all loops:
+Keys starting with underscore (globally static values) are also never consumed in the FIFO, persisting across all loops, with the updated value if needed:
 
 ```
-$_bearer$=eyJhbGciOiJIUzI1NiIs...
-$pin$=1234
+_bearer=eyJhbGciOiJIUzI1NiIs...
+pin=1234
 5678
 9012
 ```
 
-- `$_bearer$` is set once and used in every request
-- `$pin$` values are consumed normally (one per request)
+- `_bearer` is set once and used in every request
+- `pin` values are consumed normally (one per request)
 
-This enables scenarios like: authenticate once, then spray PINs. The `$_key$` can still be updated later:
+This enables scenarios like: authenticate once, then spray PINs. The `_key` can still be updated later:
 ```
-$_bearer$=eyJhbGciOiJIUzI1NiIs...
-$pin$=1234
+_bearer=eyJhbGciOiJIUzI1NiIs...
+pin=1234
 5678
 9012
 ....
-$_bearer$=eyJhbGciOiJSUzI1NiIsIn...
+_bearer=eyJhbGciOiJSUzI1NiIsIn...
 ```
 
 ### Key Combinations
@@ -456,9 +468,9 @@ $_bearer$=eyJhbGciOiJSUzI1NiIsIn...
 When multiple keys have multiple values in the same batch (64 lines), TREM generates all combinations:
 
 ```
-$user$=admin
+user=admin
 guest
-$pass$=123
+pass=123
 456
 ```
 
