@@ -475,10 +475,11 @@ pass=123
 ```
 
 Generates 4 requests:
-- admin + 123
-- admin + 456
-- guest + 123
-- guest + 456
+- admin, pass=123
+- admin, pass=456
+- guest, pass=123
+- guest, pass=456
+
 
 ### FIFO Wait (`-fw`)
 
@@ -542,7 +543,7 @@ Loops infinitely until a response action triggers exit.
 
 ## mTLS Support
 
-For targets requiring client certificates:
+For targets requiring client certificates (Mutual TLS):
 
 ```bash
 ./trem -l "req1.txt,req2.txt" -re patterns.txt -mtls /path/cert.p12:password
@@ -685,8 +686,8 @@ The UI displays a **TreeView** on the left showing all groups and their threads.
 **Infinite spray with persistent auth token and auto-exit:**
 ```bash
 # passwords.txt (feed to FIFO):
-# $_token$=eyJhbG...
-# $pass$=123456
+# _token=eyJhbG...
+# pass=123456
 # password
 # admin123
 
