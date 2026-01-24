@@ -55,33 +55,27 @@ const (
 // HTTP/2 connection preface
 var h2Preface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 
-// Pre-built SETTINGS frame with client parameters, expected by some H2 servers
-// Settings: HEADER_TABLE_SIZE=4096, ENABLE_PUSH=0, MAX_CONCURRENT_STREAMS=100,
-
-// INITIAL_WINDOW_SIZE=65535, MAX_FRAME_SIZE=16384
+// Pre-built SETTINGS frame matching curl behavior
+// Settings: MAX_CONCURRENT_STREAMS=100, INITIAL_WINDOW_SIZE=10485760, ENABLE_PUSH=0
 var h2SettingsFrame = []byte{
-	0, 0, 30, // length: 30 bytes (5 settings * 6 bytes each)
+	0, 0, 18, // length: 18 bytes (3 settings * 6 bytes)
 	frameSettings, 0, // type=SETTINGS, flags=0
 	0, 0, 0, 0, // stream ID = 0
-	// SETTINGS_HEADER_TABLE_SIZE = 4096
-	0, settingsHeaderTableSize, 0, 0, 0x10, 0x00,
-	// SETTINGS_ENABLE_PUSH = 0
-	0, settingsEnablePush, 0, 0, 0, 0,
 	// SETTINGS_MAX_CONCURRENT_STREAMS = 100
 	0, settingsMaxConcurrentStreams, 0, 0, 0, 100,
-	// SETTINGS_INITIAL_WINDOW_SIZE = 65535
-	0, settingsInitialWindowSize, 0, 0, 0xFF, 0xFF,
-	// SETTINGS_MAX_FRAME_SIZE = 16384
-	0, settingsMaxFrameSize, 0, 0, 0x40, 0x00,
+	// SETTINGS_INITIAL_WINDOW_SIZE = 10485760 (10MB)
+	0, settingsInitialWindowSize, 0, 0xa0, 0, 0,
+	// SETTINGS_ENABLE_PUSH = 0
+	0, settingsEnablePush, 0, 0, 0, 0,
 }
 
-// Pre-built WINDOW_UPDATE frame for connection (stream 0)
-// Increment: 15MB (15728640 = 0x00F00000) - gives server plenty of send window
+// Pre-built WINDOW_UPDATE frame matching curl behavior
+// Increment: 1048510465 (~1GB)
 var h2WindowUpdate = []byte{
 	0, 0, 4, // length: 4 bytes
 	frameWindowUpdate, 0, // type=WINDOW_UPDATE, flags=0
 	0, 0, 0, 0, // stream ID = 0 (connection-level)
-	0x00, 0xF0, 0x00, 0x00, // increment = 15728640
+	0x3e, 0x7f, 0x00, 0x01, // increment = 1048510465
 }
 
 // H2Conn - wraps net.Conn with HTTP/2 state
@@ -113,115 +107,17 @@ func (h *H2Conn) handshake() error {
 
 	// Send preface + SETTINGS + WINDOW_UPDATE in single write
 	// This is more efficient
-	buf := make([]byte, len(h2Preface)+len(h2SettingsFrame)) //+len(h2WindowUpdate))
+	buf := make([]byte, len(h2Preface)+len(h2SettingsFrame)+len(h2WindowUpdate))
 	n := copy(buf, h2Preface)
 	n += copy(buf[n:], h2SettingsFrame)
-	//copy(buf[n:], h2WindowUpdate)
+	n += copy(buf[n:], h2WindowUpdate)
 
-	if k, err := h.conn.Write(buf); err != nil || k != n {
-		return fmt.Errorf("%w: cannot write H2 tunnel! Buffer:%d Wrote:%d", err, n, k)
-	}
-
-	// Read server SETTINGS and send ACK
-	if err := h.readAndAckSettings(); err != nil {
-		return err
+	if wrote, err := h.conn.Write(buf); err != nil || wrote != n {
+		return fmt.Errorf("%w: cannot write H2 tunnel! Buffer:%d Wrote:%d", err, n, wrote)
 	}
 
 	h.handshook = true
 	return nil
-}
-
-// readAndAckSettings - reads frames until server SETTINGS, then sends ACK
-// Returns errH2NotSupported if server sends invalid H2 data (e.g. HTTP/1.1 response)
-func (h *H2Conn) readAndAckSettings() error {
-	buf := make([]byte, 9)
-
-	// Set read deadline for handshake (short timeout)
-	h.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	defer h.conn.SetReadDeadline(time.Time{})
-
-	// Read first frame header with validation
-	n, err := h.conn.Read(buf)
-	if err != nil {
-		return fmt.Errorf("%w: cannot read H2 tunnel! B:%d", err, n)
-	}
-
-	// Need at least 5 bytes to detect HTTP/1.1 or validate H2 frame
-	if n < 5 {
-		return fmt.Errorf("%w: server responded invalid data!", errH2NotSupported)
-	} else if bytes.HasPrefix(buf[:n], []byte("HTTP/")) {
-		return fmt.Errorf("%w: server supports ONLY HTTP/1.1", errH2NotSupported)
-	}
-
-	// Validate first frame header
-	if err := validateH2FrameHeader(buf[:n]); err != nil {
-		return err
-	}
-
-	// Complete reading if we don't have full 9 bytes yet
-	if n < 9 {
-		if _, err := io.ReadFull(h.conn, buf[n:]); err != nil {
-			return err
-		}
-	}
-
-	// Process first frame and continue loop
-	hdr := buf
-	for {
-		length := int(hdr[0])<<16 | int(hdr[1])<<8 | int(hdr[2])
-		ftype := hdr[3]
-		flags := hdr[4]
-
-		// Read payload if any
-		var payload []byte
-		if length > 0 {
-			payload = make([]byte, length)
-			if _, err := io.ReadFull(h.conn, payload); err != nil {
-				return err
-			}
-		}
-
-		switch ftype {
-		case frameSettings:
-			// If it's SETTINGS (not ACK), send ACK
-			if flags&0x1 == 0 {
-				ack := []byte{0, 0, 0, frameSettings, 0x1, 0, 0, 0, 0}
-				if _, err := h.conn.Write(ack); err != nil {
-					return err
-				}
-			}
-			return nil // Got SETTINGS, handshake complete
-
-		case frameWindowUpdate:
-			// Consume and continue waiting for SETTINGS
-			break
-
-		case framePing:
-			// Respond to PING if not ACK
-			if flags&0x1 == 0 {
-				pong := buildFrame(framePing, 0x1, 0, payload)
-				h.conn.Write(pong)
-			}
-			break
-
-		case frameGoAway:
-			errCode := uint32(0)
-			if len(payload) >= 8 {
-				errCode = uint32(payload[4])<<24 | uint32(payload[5])<<16 | uint32(payload[6])<<8 | uint32(payload[7])
-			}
-			return fmt.Errorf("GOAWAY during handshake, error code: %d", errCode)
-		}
-
-		// Read next frame header
-		if _, err := io.ReadFull(h.conn, hdr); err != nil {
-			return err
-		}
-
-		// Validate subsequent frames too
-		if err := validateH2FrameHeader(hdr); err != nil {
-			return err
-		}
-	}
 }
 
 // validateH2FrameHeader - validates H2 frame header bytes
@@ -286,7 +182,6 @@ func (h *H2Conn) encodeReqFrames(dst *bytes.Buffer, req *ParsedReq, streamID uin
 	}
 }
 
-// sendReqH2 - sends HTTP/2 request, returns response
 func (h *H2Conn) sendReqH2(req *ParsedReq, threadID int, waitRsp bool) (resp, status string, err error) {
 	var startTime time.Time
 	if verbose {
@@ -366,7 +261,8 @@ func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, statu
 	var body bytes.Buffer
 	var encoding string
 
-	respStreamID = streamID // if 0, will be set by first frame
+	respStreamID = streamID
+	firstRead := true
 
 	// Reuse header buffer across frame reads
 	hdr := make([]byte, 9)
@@ -376,6 +272,17 @@ func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, statu
 		bytesIn += n
 		if err != nil {
 			return 0, "", "", bytesIn, err
+		}
+
+		// First frame validation: detect HTTP/1.1 fallback or invalid H2
+		if firstRead {
+			if bytes.HasPrefix(hdr, []byte("HTTP/")) {
+				return 0, "", "", bytesIn, fmt.Errorf("%w: server responded HTTP/1.1", errH2NotSupported)
+			}
+			if err := validateH2FrameHeader(hdr); err != nil {
+				return 0, "", "", bytesIn, err
+			}
+			firstRead = false
 		}
 
 		// H2 uses size in BIGEndian, lets bitwise it :)
@@ -443,11 +350,12 @@ func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, statu
 			body.Write(payload)
 
 		case frameSettings:
-			// ACK if not already ACK
+			// Server SETTINGS - ACK if not already ACK
 			if flags&0x1 == 0 {
 				ack := []byte{0, 0, 0, frameSettings, 0x1, 0, 0, 0, 0}
 				h.conn.Write(ack)
 			}
+			continue
 
 		case frameWindowUpdate:
 			// Ignored - we don't track send window
@@ -459,16 +367,22 @@ func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, statu
 				pong := buildFrame(framePing, 0x1, 0, payload)
 				h.conn.Write(pong)
 			}
+			continue
 
 		case frameGoAway:
-			return 0, "", "", bytesIn, fmt.Errorf("GOAWAY received")
+			errCode := uint32(0)
+			if len(payload) >= 8 {
+				errCode = uint32(payload[4])<<24 | uint32(payload[5])<<16 | uint32(payload[6])<<8 | uint32(payload[7])
+			}
+			return 0, "", "", bytesIn, fmt.Errorf("GOAWAY received, error code: %d", errCode)
 
 		case frameRstStream:
-			if fStreamID == respStreamID {
+			if fStreamID == respStreamID && len(payload) >= 4 {
 				// 4 bytes into correct endian
 				errCode := uint32(payload[0])<<24 | uint32(payload[1])<<16 | uint32(payload[2])<<8 | uint32(payload[3])
 				return 0, "", "", bytesIn, fmt.Errorf("RST_STREAM: %d", errCode)
 			}
+			continue
 
 		case framePushPromise:
 			// Server push ignored - just consume and discard
@@ -484,7 +398,9 @@ func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, statu
 	// Build response string (headers + body)
 	var sb strings.Builder
 	for _, hdr := range headers {
-		sb.WriteString(hdr[0])
+		// Normalize header name to Title-Case for H2 <=> HTTP/1.1 compatibility
+		// H2 sends lowercase headers, but regexes may expect Title-Case as on HTTP/1.1
+		sb.WriteString(toTitleCase(hdr[0]))
 		sb.WriteString(": ")
 		sb.WriteString(hdr[1])
 		sb.WriteString("\r\n")

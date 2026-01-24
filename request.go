@@ -545,8 +545,7 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 	}
 
 	// fire-and-forget detection uses relIdx (group patterns)
-	fireAndForget := w.patterns != nil && relIdx < len(w.patterns) && len(w.patterns[relIdx]) == 0
-
+	fireAndForget := w.patterns != nil && relIdx < len(w.patterns) && w.patterns[relIdx] != nil && len(w.patterns[relIdx]) == 0
 	var resp, status string
 	var err error
 
@@ -613,7 +612,7 @@ func loadPatterns(path string) ([][]pattern, error) {
 	}
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 
-	// Filter comment lines (keep empty for fire-and-forget)
+	// Filter comment lines (# cmt)
 	var filtered []string
 	for _, line := range lines {
 		if strings.HasPrefix(strings.TrimSpace(line), "#") {
@@ -627,8 +626,12 @@ func loadPatterns(path string) ([][]pattern, error) {
 	for i, line := range lines {
 		line = strings.TrimSpace(line)
 
-		// Line with only : is fire-and-forget marker, keep empty slice for indexing
-		if line == ":" {
+		// Empty line: read response but skip regex match
+		if line == "" {
+			patterns[i] = nil
+			continue
+		} else if line == ":" {
+			// Line with only : is fire-and-forget marker, keep empty slice for indexing
 			patterns[i] = []pattern{}
 			continue
 		}

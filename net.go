@@ -270,7 +270,8 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) error {
 		}
 
 		host, port, _ := net.SplitHostPort(addr)
-		if port == "443" {
+		// default is TLS!
+		if port != "8080" || port != "80" {
 			tlsConn, err := tlsHandshakeDo(conn, host, o.clientHelloID, o.tlsTimeout, w.logger, w.id, o.tlsCert, h2)
 			if err != nil {
 				conn.Close()

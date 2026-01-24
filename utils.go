@@ -423,3 +423,20 @@ func setupValDist(univFlag string, fmodeFlag, totalThreads int, logger LogWriter
 	}
 	return NewValDistStatic(parts[0], parts[1])
 }
+
+// toTitleCase - converts header name to Title-Case (e.g., "set-cookie" -> "Set-Cookie")
+func toTitleCase(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	upper := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if upper && c >= 'a' && c <= 'z' {
+			sb.WriteByte(c - 32) // to uppercase
+		} else {
+			sb.WriteByte(c)
+		}
+		upper = (c == '-')
+	}
+	return sb.String()
+}

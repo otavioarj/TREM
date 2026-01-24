@@ -69,7 +69,8 @@ func tlsHandshakeDo(conn net.Conn, host string, cliMode int, timeout time.Durati
 	h2 bool) (*utls.UConn, error) {
 	alpn := []string{"http/1.1"}
 	if h2 {
-		alpn = []string{"h2"}
+		alpn = []string{"h2", "http/1.1"}
+
 	}
 
 	var startTime time.Time
