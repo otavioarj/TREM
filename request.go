@@ -338,6 +338,7 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 			return fmt.Errorf("failed to parse H2 request")
 		}
 		w.blockH2Reqs = append(w.blockH2Reqs, parsed)
+		w.blockAbsIdx = append(w.blockAbsIdx, absIdx)
 
 		isLastReq := relIdx == len(w.reqIndices)-1
 		if isLastReq {
@@ -364,8 +365,8 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 	}
 
 	// Record offsets and append request
-	// Trick to fast-parser returned responses (HTTP-pipeline FIFO) for actions if needed :)
 	w.blockOffsets = append(w.blockOffsets, len(w.blockBuf))
+	w.blockAbsIdx = append(w.blockAbsIdx, absIdx)
 	w.blockBuf = append(w.blockBuf, req...)
 
 	isLastReq := relIdx == len(w.reqIndices)-1
@@ -414,7 +415,7 @@ func (o *Orch) flushBlock(w *monkey) error {
 			if !ok {
 				return fmt.Errorf("H2 unknown streamID %d", streamID)
 			}
-			absIdx := w.reqIndices[idx]
+			absIdx := w.blockAbsIdx[idx]
 
 			w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
 			w.prevResp = resp
@@ -432,8 +433,9 @@ func (o *Orch) flushBlock(w *monkey) error {
 		// Report aggregate bytes out
 		stats.ReportRequest(w.id, 0, 0, uint32(bytesOut))
 
-		// Clear buffer for next batch
+		// Clear buffers for next batch
 		w.blockH2Reqs = w.blockH2Reqs[:0]
+		w.blockAbsIdx = w.blockAbsIdx[:0]
 		return nil
 	}
 
@@ -451,21 +453,20 @@ func (o *Orch) flushBlock(w *monkey) error {
 		return fmt.Errorf("block write: %v", err)
 	}
 	reader := bufio.NewReader(w.conn)
+
 	// Read responses in FIFO order (HTTP/1.1 pipelining RFC7230 guarantees order)
 	for i := 0; i < reqCount; i++ {
-		absIdx := w.reqIndices[i]
+		absIdx := w.blockAbsIdx[i]
 		stats.ReportRequest(w.id, 0, 0, 0)
 		resp, status, _, err := readHTTP1Resp(w.id, reader)
 		if err != nil {
 			return fmt.Errorf("block read resp %d: %v", i+1, err)
 		}
 
-		//w.logger.Write(fmt.Sprintf("RESP: \n\n %s\n", resp))
 		w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
 		w.prevResp = resp
 
-		// Apply response actions if configured for this request
-		// Here goes the trick, we stored request indices to fast-parser response for this action :)
+		// Apply response actions if configured
 		if w.actionPatterns != nil && w.actionPatterns[absIdx] != nil {
 			req := o.extractReq(w, i)
 			if err := o.applyResponseActions(w, absIdx, req, resp, status); err != nil {
@@ -480,6 +481,7 @@ func (o *Orch) flushBlock(w *monkey) error {
 	// Clear buffers for next batch
 	w.blockBuf = w.blockBuf[:0]
 	w.blockOffsets = w.blockOffsets[:0]
+	w.blockAbsIdx = w.blockAbsIdx[:0]
 
 	return nil
 }

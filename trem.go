@@ -71,6 +71,7 @@ type monkey struct {
 	blockBuf     []byte       // HTTP/1.1: accumulated requests for pipelining
 	blockOffsets []int        // HTTP/1.1: offset of each request start in blockBuf
 	blockH2Reqs  []*ParsedReq // HTTP/2: accumulated requests for multiplexing
+	blockAbsIdx  []int        // absIdx for each queued request (H1 and H2)
 }
 
 // Orch - orchestrator for sync/async/block modes
@@ -246,7 +247,7 @@ func main() {
 			}
 		}
 
-		configBanner = formatGroupsBanner(groups, *univFlag)
+		configBanner = formatGroupsBanner(groups, *cliFlag, *fbckFlag, verbose, *httpFlag, *proxyFlag, *mtlsFlag, *hostFlag, *univFlag)
 	} else {
 		// Single mode
 		isBlockMode := *modeFlag == "block"
@@ -572,16 +573,21 @@ func (o *Orch) runSyncOrchestration() {
 }
 
 // formatGroupsBanner - creates config banner for group mode
-func formatGroupsBanner(groups []*ThreadGroup, univFlag string) string {
+func formatGroupsBanner(groups []*ThreadGroup, cliHello, fbck int,
+	verbose, httpVer bool,
+	proxy, mtls, host, univFlag string) string {
 	var lines []string
-	lines = append(lines, fmt.Sprintf("Groups: %d | Total Threads: %d", len(groups), getTotalThreads(groups)))
+	lines = append(lines, fmt.Sprintf("Groups: %d | Total Threads: %d | HTTP2: %v", len(groups), getTotalThreads(groups), httpVer))
 	lines = append(lines, formatGroupsSummary(groups))
-	if univFlag != "" {
-		if strings.Contains(univFlag, "=") {
-			lines = append(lines, fmt.Sprintf("Univ: %s", univFlag))
-		} else {
-			lines = append(lines, fmt.Sprintf("FIFO: %s", univFlag))
-		}
+	lines = append(lines, fmt.Sprintf("Verbose: %v | CliHello: %s | FIFO Block: %d. ", verbose, clientHelloNames[cliHello], fbck))
+	if mtls != "" {
+		lines = append(lines, fmt.Sprintf("ClientCert: %s\n", mtls))
+	}
+	if proxy != "" {
+		lines = append(lines, fmt.Sprintf("Proxy: %s", proxy))
+	}
+	if host != "" {
+		lines = append(lines, fmt.Sprintf("Forced Host: %s", host))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -658,7 +664,7 @@ func (o *Orch) runWorker(w *monkey) {
 			// Clear non-static buffers for fresh loop iteration
 			// Static values (keys starting with _) are preserved in globalStaticVals
 			for k := range w.localBuffer {
-				if len(k) > 1 && k[0] != '_' {
+				if len(k) > 0 && k[0] != '_' {
 					delete(w.localBuffer, k)
 				}
 			}
