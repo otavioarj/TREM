@@ -14,6 +14,7 @@ import (
 )
 
 // Pre-compiled regex for parseHost
+// The (?m) flag enables multiline mode where ^ matches at line start
 var hostHeaderRe = regexp.MustCompile(`(?im)^Host:\s*([^:\r\n]+)(?::(\d+))?`)
 
 // httpVersionRe - matches HTTP/x.x at end of request line
@@ -56,20 +57,21 @@ func decodeBody(body *bytes.Buffer, encoding string) ([]byte, error) {
 }
 
 // parseHost - extracts host:port from request Host header or override
+// Uses regex with (?m) multiline flag to match directly without splitting lines
+// This is more efficient than iterating over all lines
 func parseHost(req, override string) (string, error) {
 	if override != "" {
 		return override, nil
 	}
 
-	for _, line := range strings.Split(req, "\n") {
-		if m := hostHeaderRe.FindStringSubmatch(line); m != nil {
-			h := m[1]
-			port := m[2]
-			if port == "" {
-				return h + ":443", nil
-			}
-			return h + ":" + port, nil
+	// hostHeaderRe has (?m) flag, so ^ matches line start in multiline string
+	if m := hostHeaderRe.FindStringSubmatch(req); m != nil {
+		h := m[1]
+		port := m[2]
+		if port == "" {
+			return h + ":443", nil
 		}
+		return h + ":" + port, nil
 	}
 	return "", errors.New("no Host header found")
 }

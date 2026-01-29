@@ -228,15 +228,13 @@ func (sc *StatsCollector) processEvent(e StatEvent) {
 		sc.reqTimestamps = append(sc.reqTimestamps, now)
 		sc.reqCount++
 
-		// Prune old timestamps (older than 2 seconds)
+		// Prune old timestamps (older than 2 seconds) using binary search
+		// Timestamps are always in ascending order, so binary search is valid
+		// This is O(log n) vs O(n) for the previous linear scan
 		cutoff := now.Add(-2 * time.Second)
-		idx := 0
-		for i, t := range sc.reqTimestamps {
-			if t.After(cutoff) {
-				idx = i
-				break
-			}
-		}
+		idx := sort.Search(len(sc.reqTimestamps), func(i int) bool {
+			return sc.reqTimestamps[i].After(cutoff)
+		})
 		if idx > 0 {
 			sc.reqTimestamps = sc.reqTimestamps[idx:]
 		}

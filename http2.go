@@ -55,7 +55,7 @@ const (
 // HTTP/2 connection preface
 var h2Preface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 
-// Pre-built SETTINGS frame matching curl behavior
+// Pre-built SETTINGS frame
 // Settings: MAX_CONCURRENT_STREAMS=100, INITIAL_WINDOW_SIZE=10485760, ENABLE_PUSH=0
 var h2SettingsFrame = []byte{
 	0, 0, 18, // length: 18 bytes (3 settings * 6 bytes)
@@ -69,13 +69,26 @@ var h2SettingsFrame = []byte{
 	0, settingsEnablePush, 0, 0, 0, 0,
 }
 
-// Pre-built WINDOW_UPDATE frame matching curl behavior
-// Increment: 1048510465 (~1GB)
+// Pre-built WINDOW_UPDATE
+// Increment: 1048510465 (~1GB) Yep :). Protocol allows, but TREM don't need to comply \o/
 var h2WindowUpdate = []byte{
 	0, 0, 4, // length: 4 bytes
 	frameWindowUpdate, 0, // type=WINDOW_UPDATE, flags=0
 	0, 0, 0, 0, // stream ID = 0 (connection-level)
 	0x3e, 0x7f, 0x00, 0x01, // increment = 1048510465
+}
+
+// h2HandshakeData - pre-built handshake buffer (preface + settings + window update)
+// Initialized once at startup to avoid repeated allocations and copies
+var h2HandshakeData []byte
+
+// init - default single allocated copy-on-write on h2HandshakeData for H2 handshake
+func init() {
+	// Pre-allocate and copy all handshake data into single buffer
+	h2HandshakeData = make([]byte, len(h2Preface)+len(h2SettingsFrame)+len(h2WindowUpdate))
+	n := copy(h2HandshakeData, h2Preface)
+	n += copy(h2HandshakeData[n:], h2SettingsFrame)
+	copy(h2HandshakeData[n:], h2WindowUpdate)
 }
 
 // H2Conn - wraps net.Conn with HTTP/2 state
@@ -100,20 +113,15 @@ func newH2Conn(conn net.Conn) *H2Conn {
 }
 
 // handshake - sends connection preface and settings
+// Uses pre-built h2HandshakeData buffer to avoid allocations
 func (h *H2Conn) handshake() error {
 	if h.handshook {
 		return nil
 	}
 
-	// Send preface + SETTINGS + WINDOW_UPDATE in single write
-	// This is more efficient
-	buf := make([]byte, len(h2Preface)+len(h2SettingsFrame)+len(h2WindowUpdate))
-	n := copy(buf, h2Preface)
-	n += copy(buf[n:], h2SettingsFrame)
-	n += copy(buf[n:], h2WindowUpdate)
-
-	if wrote, err := h.conn.Write(buf); err != nil || wrote != n {
-		return fmt.Errorf("%w: cannot write H2 tunnel! Buffer:%d Wrote:%d", err, n, wrote)
+	// Single write with pre-built buffer (preface + settings + window update)
+	if _, err := h.conn.Write(h2HandshakeData); err != nil {
+		return fmt.Errorf("H2 handshake write: %w", err)
 	}
 
 	h.handshook = true
@@ -263,8 +271,6 @@ func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, statu
 
 	respStreamID = streamID
 	firstRead := true
-
-	// Reuse header buffer across frame reads
 	hdr := make([]byte, 9)
 
 	for {

@@ -24,8 +24,9 @@ type ValDist struct {
 	fifoPath string
 	popMode  int
 
-	// Thread channels - one per thread
-	threadChans []chan map[string]string
+	// Thread channels - only for threads that use FIFO
+	threadChans map[int]chan map[string]string
+	threadIDs   []int // ordered list for round-robin
 
 	// Round-robin index for Pop mode
 	rrIndex atomic.Uint64
@@ -38,18 +39,19 @@ type ValDist struct {
 }
 
 // NewValDist - creates new distributor for FIFO mode
-func NewValDist(path string, popMode int, numThreads int) *ValDist {
+func NewValDist(path string, popMode int, fifoThreadIDs []int) *ValDist {
 	d := &ValDist{
 		fifoPath:    path,
 		popMode:     popMode,
-		threadChans: make([]chan map[string]string, numThreads),
+		threadChans: make(map[int]chan map[string]string),
+		threadIDs:   fifoThreadIDs,
 		firstData:   make(chan struct{}),
 		done:        make(chan struct{}),
 	}
 
-	// Create buffered channel for each thread
-	for i := 0; i < numThreads; i++ {
-		d.threadChans[i] = make(chan map[string]string, 1000)
+	// Create buffered channel only for threads that use FIFO
+	for _, id := range fifoThreadIDs {
+		d.threadChans[id] = make(chan map[string]string, 1000)
 	}
 
 	emptyKV := [2]string{"", ""}
@@ -71,12 +73,12 @@ func NewValDistStatic(key, val string) *ValDist {
 	return d
 }
 
-// GetThreadChan - returns channel for specific thread
+// GetThreadChan - returns channel for specific thread (nil if thread doesn't use FIFO)
 func (d *ValDist) GetThreadChan(threadID int) chan map[string]string {
-	if d.threadChans == nil || threadID >= len(d.threadChans) {
+	if d.threadChans == nil {
 		return nil
 	}
-	return d.threadChans[threadID]
+	return d.threadChans[threadID] // returns nil if not in map
 }
 
 // EnsureFifo - creates FIFO if not exists
@@ -205,28 +207,31 @@ func (d *ValDist) dispatchThread(key, value string, thrchan chan map[string]stri
 
 // dispatchBatch - sends batch to thread channels based on mode
 func (d *ValDist) dispatchBatch(batch []kv) {
-	var threadIdx int
+	if len(d.threadIDs) == 0 {
+		return
+	}
+
 	if d.popMode == 2 {
 		// Round-robin: each kv goes to one thread
 		// Except if the key starts with '_', ie., _key from FIFO
 		// Keys with this format are always broadcasted to threads and never consumed
-		// Its value can be updated as normal key, although.
 		for _, item := range batch {
 			if item.k[0] == '_' {
-				for threadIdx = range len(d.threadChans) {
-					d.dispatchThread(item.k, item.v, d.threadChans[threadIdx])
+				for _, id := range d.threadIDs {
+					d.dispatchThread(item.k, item.v, d.threadChans[id])
 				}
 			} else {
 				idx := d.rrIndex.Add(1) - 1
-				threadIdx = int(idx % uint64(len(d.threadChans)))
-				d.dispatchThread(item.k, item.v, d.threadChans[threadIdx])
+				threadIdx := int(idx % uint64(len(d.threadIDs)))
+				id := d.threadIDs[threadIdx]
+				d.dispatchThread(item.k, item.v, d.threadChans[id])
 			}
 		}
 	} else {
 		// Broadcast: each kv goes to ALL threads
 		for _, item := range batch {
-			for threadIdx = range len(d.threadChans) {
-				d.dispatchThread(item.k, item.v, d.threadChans[threadIdx])
+			for _, id := range d.threadIDs {
+				d.dispatchThread(item.k, item.v, d.threadChans[id])
 			}
 		}
 	}

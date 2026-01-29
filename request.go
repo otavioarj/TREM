@@ -167,6 +167,28 @@ func (o *Orch) doBarrier(w *monkey, relIdx int, addr string) error {
 	return nil
 }
 
+// buildAndDispatch - builds request, normalizes, and dispatches to appropriate handler
+// Used to consolidate the flow -> normalize -> parseHost -> dispatch for any TREM mode (sync, async and block)
+// checkBarrier: if true, checks sync barrier before sending (false for subsequent combo requests)
+// Returns error from any step; nil on success
+func (o *Orch) buildAndDispatch(w *monkey, relIdx, absIdx int, tmpl *TemplateReq, values map[string]string, checkBarrier bool) error {
+	req := buildRequest(tmpl, values)
+	req = normalizeReq(req, o.blockMode)
+	addr, err := parseHost(req, o.hostFlag)
+	if err != nil {
+		return err
+	}
+	if o.blockMode {
+		return o.appendToBlock(w, relIdx, absIdx, req, addr)
+	}
+	if checkBarrier && o.mode == "sync" && o.syncBarriers[relIdx] {
+		if err := o.doBarrier(w, relIdx, addr); err != nil {
+			return err
+		}
+	}
+	return o.sendReq(w, relIdx, absIdx, req, addr)
+}
+
 // processReq - unified request processor for sync/async/block modes
 // relIdx = relative index within group (for patterns and barriers)
 // absIdx = absolute index in reqFiles (for loading request and response actions)
@@ -183,56 +205,30 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 		if k != "" {
 			values[k] = v
 		}
-		req := buildRequest(tmpl, values)
-		req = normalizeReq(req, o.blockMode)
-		addr, err := parseHost(req, o.hostFlag)
-		if err != nil {
-			return err
-		}
-		// Block mode: route to appendToBlock
-		if o.blockMode {
-			return o.appendToBlock(w, relIdx, absIdx, req, addr)
-		}
-		if o.mode == "sync" && o.syncBarriers[relIdx] {
-			if err := o.doBarrier(w, relIdx, addr); err != nil {
-				return err
-			}
-		}
-		return o.sendReq(w, relIdx, absIdx, req, addr)
+		return o.buildAndDispatch(w, relIdx, absIdx, tmpl, values, true)
 	}
 
-	// Phase 3: handle FIFO mode - drain channel first
-	if o.valDist != nil && o.valDist.IsFifo() {
-		drainChannel(w, o.fifoBlockSize)
-	}
-
-	// Phase 4: get keys still needing values
+	// Phase 3: get non-static keys (key[0]!='_') needing values for request
 	keyNames := getUniqueKeyNames(tmpl)
 	var keys []string
+	var needsFifo bool
 	for _, key := range keyNames {
 		if _, hasVal := values[key]; !hasVal {
 			keys = append(keys, key)
+			if len(key) > 0 && key[0] != '_' {
+				needsFifo = true
+			}
 		}
 	}
 
 	// No additional keys needed, send directly
 	if len(keys) == 0 {
-		req := buildRequest(tmpl, values)
-		req = normalizeReq(req, o.blockMode)
-		addr, err := parseHost(req, o.hostFlag)
-		if err != nil {
-			return err
-		}
-		// Block mode: route to appendToBlock
-		if o.blockMode {
-			return o.appendToBlock(w, relIdx, absIdx, req, addr)
-		}
-		if o.mode == "sync" && o.syncBarriers[relIdx] {
-			if err := o.doBarrier(w, relIdx, addr); err != nil {
-				return err
-			}
-		}
-		return o.sendReq(w, relIdx, absIdx, req, addr)
+		return o.buildAndDispatch(w, relIdx, absIdx, tmpl, values, true)
+	}
+
+	// Phase 4: handle FIFO mode - drain channel only if it's needed
+	if needsFifo && o.valDist != nil && o.valDist.IsFifo() {
+		drainChannel(w, o.fifoBlockSize)
 	}
 
 	// Phase 5: check for missing keys in FIFO buffer and globalStatic
@@ -254,22 +250,7 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	combinations := generateCombinations(w.localBuffer, keys)
 	if len(combinations) == 0 {
 		// no values available, send as-is
-		req := buildRequest(tmpl, values)
-		req = normalizeReq(req, o.blockMode)
-		addr, err := parseHost(req, o.hostFlag)
-		if err != nil {
-			return err
-		}
-		// Block mode: route to appendToBlock
-		if o.blockMode {
-			return o.appendToBlock(w, relIdx, absIdx, req, addr)
-		}
-		if o.mode == "sync" && o.syncBarriers[relIdx] {
-			if err := o.doBarrier(w, relIdx, addr); err != nil {
-				return err
-			}
-		}
-		return o.sendReq(w, relIdx, absIdx, req, addr)
+		return o.buildAndDispatch(w, relIdx, absIdx, tmpl, values, true)
 	}
 
 	// Phase 7: send request for each combination
@@ -285,32 +266,12 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 			w.logger.Write(fmt.Sprintf("Val %s: %s\n", k, v))
 		}
 
-		req := buildRequest(tmpl, mergedVals)
-		req = normalizeReq(req, o.blockMode)
-		addr, err := parseHost(req, o.hostFlag)
-		if err != nil {
+		if err := o.buildAndDispatch(w, relIdx, absIdx, tmpl, mergedVals, firstReq); err != nil {
 			return err
 		}
-
-		// Block mode: route to appendToBlock
-		if o.blockMode {
-			if err := o.appendToBlock(w, relIdx, absIdx, req, addr); err != nil {
-				return err
-			}
-			continue
-		}
-
-		// barrier only on first request of combinations
-		if firstReq && o.mode == "sync" && o.syncBarriers[relIdx] {
-			if err := o.doBarrier(w, relIdx, addr); err != nil {
-				return err
-			}
-			firstReq = false
-		}
-
-		if err := o.sendReq(w, relIdx, absIdx, req, addr); err != nil {
-			return err
-		}
+		// After first request, disable barrier check for subsequent combinations
+		// In blockMode this has no effect (barrier not checked when blockMode=true)
+		firstReq = false
 	}
 
 	// consume used values
@@ -404,7 +365,7 @@ func (o *Orch) flushBlock(w *monkey) error {
 			streamToIdx[sid] = i
 		}
 
-		// Read responses (order may vary due to H2 multiplexing)
+		// Read responses (order may vary due to H2 multiplexing!)
 		for i := 0; i < reqCount; i++ {
 			streamID, resp, status, bytesIn, err := w.h2conn.readResponse(0) // 0 = any stream
 			if err != nil {
@@ -683,7 +644,11 @@ func (o *Orch) applyResponseActions(w *monkey, idx int, req, resp, status string
 			o.checkPause(w)
 
 		case ActionPrintThread:
-			// Print to this thread only and pause it
+			// Print to this thread only
+			w.logger.Write(fmt.Sprintf(">>> RA: %s <<<\n", action.arg))
+
+		case ActionPrintPauseThread:
+			// Print to this thread only AND pause it
 			w.logger.Write(fmt.Sprintf(">>> RA: %s <<<\n", action.arg))
 			o.pauseThread(w.id)
 			o.checkPause(w)

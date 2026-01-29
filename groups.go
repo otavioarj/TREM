@@ -23,6 +23,7 @@ type ThreadGroup struct {
 	PatternsFile  string       // regex file path for this group
 	Patterns      [][]pattern  // loaded patterns for group transitions
 	StartThreadID int          // first global threadID for this group
+	UsesFifo      bool         // whether this group needs FIFO access
 }
 
 // createSingleGroup - creates synthetic ThreadGroup for single mode (no -thrG)
@@ -231,6 +232,9 @@ func parseGroupLine(line string, groupID, lineNum int, httpH2 bool) (*ThreadGrou
 		case "re":
 			group.PatternsFile = value
 
+		case "fifo":
+			group.UsesFifo = true
+
 		default:
 			return nil, fmt.Errorf("line %d: unknown parameter '%s'", lineNum, key)
 		}
@@ -302,10 +306,14 @@ func parseIndicesToken(s string) ([]int, error) {
 	return indices, nil
 }
 
-// parseKeyValue - parses "key=value" token
+// parseKeyValue - parses "key=value" or "key" (boolean flag) token
 func parseKeyValue(token string) (string, string, error) {
 	idx := strings.Index(token, "=")
-	if idx < 1 {
+	if idx < 0 {
+		// Boolean flag (no value)
+		return strings.ToLower(token), "true", nil
+	}
+	if idx == 0 {
 		return "", "", fmt.Errorf("invalid parameter format: %s (expected key=value)", token)
 	}
 	return strings.ToLower(token[:idx]), token[idx+1:], nil
@@ -367,4 +375,17 @@ func formatGroupsSummary(groups []*ThreadGroup) string {
 			g.LoopStart, loopStr))
 	}
 	return strings.Join(lines, " | ")
+}
+
+// getFifoThreadIDs - returns global thread IDs for groups that use FIFO
+func getFifoThreadIDs(groups []*ThreadGroup) []int {
+	var ids []int
+	for _, g := range groups {
+		if g.UsesFifo {
+			for i := 0; i < g.ThreadCount; i++ {
+				ids = append(ids, g.StartThreadID+i)
+			}
+		}
+	}
+	return ids
 }

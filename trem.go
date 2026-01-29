@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.6.2"
+var version = "v1.6.4"
 
 // Global flags
 var verbose bool
@@ -160,7 +160,8 @@ func main() {
 	raFlag := flag.String("ra", "", "Response action file. Applies regex on response in a given request indexes (',' separated), and then, execute actions.\nExample: "+
 		"-l r1,r2,r3 -ra ra.txt. With ra.txt as:\n  2,3:token.*`:sre(\"/tmp/req.txt\"), e \n"+
 		"Will try to match in r2 and r3 responses \"token.*\", then save request that *first* generated the match to \"/tmp/req.txt\" and exit.\n"+
-		"The following actions, are implemented:\n pa(\"msg\") - print msg on match and pause ALL threads.\n pt(\"msg\") - print msg on match and pause the thread.\n"+
+		"The following actions, are implemented:\n pa(\"msg\") - print msg on match and pause ALL threads.\n ppt(\"msg\") - print msg on match and pause the thread.\n"+
+		"pt(\"msg\") - print msg on match and DON'T pause the thread.\n"+
 		" sr  - save request that generated the match, and pause thread.\n sre - save response that generated the match, and pause thread.\n"+
 		" sa  - save request and response that generated the match, and pause thread.\n e   - gracefully exit on match, use as last action if combined with others!")
 	fbckFlag := flag.Int("fbck", 64, "FIFO block consumption: max values to drain per request (0=unlimited).")
@@ -328,7 +329,8 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 	ui.Build()
 
 	// Setup value distributor
-	valDist := setupValDist(univFlag, fmodeFlag, totalThreads, ui.GetLogger(0))
+	fifoThreadIDs := getFifoThreadIDs(groups)
+	valDist := setupValDist(univFlag, fmodeFlag, fifoThreadIDs, ui.GetLogger(0))
 
 	// Init stats
 	stats = NewStatsCollector(windowSize, verbose)

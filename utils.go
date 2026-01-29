@@ -12,12 +12,13 @@ import (
 
 // Action types for response actions
 const (
-	ActionPrintThread = iota // pt - print + pause thread
-	ActionPrintAll           // pa - print all + pause all
-	ActionSaveReq            // sre - save request + pause thread
-	ActionSaveResp           // srp - save response + pause thread
-	ActionSaveAll            // sa - save both + pause thread
-	ActionExit               // e - graceful exit
+	ActionPrintThread      = iota // pt - print in thread
+	ActionPrintPauseThread        // ppt - print + pause thread
+	ActionPrintAll                // pa - print all + pause all
+	ActionSaveReq                 // sre - save request + pause thread
+	ActionSaveResp                // srp - save response + pause thread
+	ActionSaveAll                 // sa - save both + pause thread
+	ActionExit                    // e - graceful exit
 )
 
 type respAction struct {
@@ -128,7 +129,8 @@ func checkMissingKeys(buffer map[string][]string, keys []string) []string {
 func generateCombinations(buffer map[string][]string, keys []string) []map[string]string {
 	if len(keys) == 0 {
 		return nil
-	} // Filter keys that exist in buffer
+	}
+	// Filter keys that exist in buffer
 	var validKeys []string
 	for _, k := range keys {
 		if len(buffer[k]) > 0 {
@@ -147,7 +149,9 @@ func generateCombinations(buffer map[string][]string, keys []string) []map[strin
 	}
 	combinations := make([]map[string]string, total)
 	for i := range combinations {
-		combinations[i] = make(map[string]string)
+		// Pre-allocate map with exact capacity needed
+		// This avoids map growth/reallocation during filling
+		combinations[i] = make(map[string]string, len(validKeys))
 	}
 
 	// Fill combinations (cartesian product)
@@ -257,7 +261,7 @@ func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 
 	for lineNum, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" || line[0] == '#' {
 			continue
 		}
 
@@ -345,6 +349,10 @@ func parseActions(s string) ([]respAction, error) {
 			actionType = ActionPrintThread
 			needsArg = true
 			consumed = 3
+		case strings.HasPrefix(s[i:], "ppt("):
+			actionType = ActionPrintPauseThread
+			needsArg = true
+			consumed = 4
 		case strings.HasPrefix(s[i:], "pa("):
 			actionType = ActionPrintAll
 			needsArg = true
@@ -405,12 +413,12 @@ func parseActions(s string) ([]respAction, error) {
 }
 
 // setupValDist - creates and initializes value distributor
-func setupValDist(univFlag string, fmodeFlag, totalThreads int, logger LogWriter) *ValDist {
+func setupValDist(univFlag string, fmodeFlag int, fifoThreadIDs []int, logger LogWriter) *ValDist {
 	if univFlag == "" {
-		return NewValDist("", 1, totalThreads)
+		return NewValDist("", 1, fifoThreadIDs)
 	}
 	if !strings.Contains(univFlag, "=") {
-		vd := NewValDist(univFlag, fmodeFlag, totalThreads)
+		vd := NewValDist(univFlag, fmodeFlag, fifoThreadIDs)
 		if err := vd.EnsureFifo(); err != nil {
 			exitErr(fmt.Sprintf("FIFO error: %v", err))
 		}
