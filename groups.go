@@ -23,7 +23,7 @@ type ThreadGroup struct {
 	PatternsFile  string       // regex file path for this group
 	Patterns      [][]pattern  // loaded patterns for group transitions
 	StartThreadID int          // first global threadID for this group
-	UsesFifo      bool         // whether this group needs FIFO access
+	NoFifo        bool         // whether this group needs FIFO access
 }
 
 // createSingleGroup - creates synthetic ThreadGroup for single mode (no -thrG)
@@ -232,8 +232,8 @@ func parseGroupLine(line string, groupID, lineNum int, httpH2 bool) (*ThreadGrou
 		case "re":
 			group.PatternsFile = value
 
-		case "fifo":
-			group.UsesFifo = true
+		case "nofifo":
+			group.NoFifo = true
 
 		default:
 			return nil, fmt.Errorf("line %d: unknown parameter '%s'", lineNum, key)
@@ -381,7 +381,7 @@ func formatGroupsSummary(groups []*ThreadGroup) string {
 func getFifoThreadIDs(groups []*ThreadGroup) []int {
 	var ids []int
 	for _, g := range groups {
-		if g.UsesFifo {
+		if !g.NoFifo {
 			for i := 0; i < g.ThreadCount; i++ {
 				ids = append(ids, g.StartThreadID+i)
 			}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -25,6 +26,8 @@ type ValDist struct {
 	popMode  int
 
 	// Thread channels - only for threads that use FIFO
+	// Protected by mu for concurrent access
+	mu          sync.RWMutex
 	threadChans map[int]chan map[string]string
 	threadIDs   []int // ordered list for round-robin
 
@@ -44,12 +47,13 @@ func NewValDist(path string, popMode int, fifoThreadIDs []int) *ValDist {
 		fifoPath:    path,
 		popMode:     popMode,
 		threadChans: make(map[int]chan map[string]string),
-		threadIDs:   fifoThreadIDs,
+		threadIDs:   make([]int, len(fifoThreadIDs)),
 		firstData:   make(chan struct{}),
 		done:        make(chan struct{}),
 	}
 
-	// Create buffered channel only for threads that use FIFO
+	// Copy thread IDs and create buffered channel for each
+	copy(d.threadIDs, fifoThreadIDs)
 	for _, id := range fifoThreadIDs {
 		d.threadChans[id] = make(chan map[string]string, 1000)
 	}
@@ -75,10 +79,37 @@ func NewValDistStatic(key, val string) *ValDist {
 
 // GetThreadChan - returns channel for specific thread (nil if thread doesn't use FIFO)
 func (d *ValDist) GetThreadChan(threadID int) chan map[string]string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	if d.threadChans == nil {
 		return nil
 	}
 	return d.threadChans[threadID] // returns nil if not in map
+}
+
+// RemoveThread - removes thread from round-robin distribution
+// Called when a thread finishes execution to prevent blocking the FIFO reader
+func (d *ValDist) RemoveThread(threadID int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Remove channel from map and drain it
+	if ch, exists := d.threadChans[threadID]; exists {
+		// Drain remaining values to prevent memory leak
+		for len(ch) > 0 {
+			<-ch
+		}
+		close(ch)
+		delete(d.threadChans, threadID)
+	}
+
+	// Remove from threadIDs slice
+	for i, id := range d.threadIDs {
+		if id == threadID {
+			d.threadIDs = append(d.threadIDs[:i], d.threadIDs[i+1:]...)
+			break
+		}
+	}
 }
 
 // EnsureFifo - creates FIFO if not exists
@@ -187,6 +218,10 @@ func (d *ValDist) reader(fifo *os.File, logger LogWriter) {
 
 			if k != "" {
 				batch = append(batch, kv{k, v})
+				// Persist _keys to globalStaticVals immediately for cross-thread access
+				if len(k) > 0 && k[0] == '_' {
+					globalStaticVals.Store(k, v)
+				}
 			}
 		}
 
@@ -197,17 +232,29 @@ func (d *ValDist) reader(fifo *os.File, logger LogWriter) {
 	}
 }
 
-func (d *ValDist) dispatchThread(key, value string, thrchan chan map[string]string) {
+// dispatchThread - sends kv to thread channel (non-blocking)
+// Returns true if sent successfully, false if channel full or closed
+func (d *ValDist) dispatchThread(key, value string, thrchan chan map[string]string) bool {
 	select {
 	case thrchan <- map[string]string{key: value}:
+		return true
 	case <-d.done:
-		return
+		return false
+	default:
+		// Channel full, skip to avoid blocking
+		return false
 	}
 }
 
 // dispatchBatch - sends batch to thread channels based on mode
+// Non-blocking: if a channel is full, tries next thread (round-robin)
+// or skips that thread (broadcast). Never blocks the reader.
 func (d *ValDist) dispatchBatch(batch []kv) {
-	if len(d.threadIDs) == 0 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	numThreads := len(d.threadIDs)
+	if numThreads == 0 {
 		return
 	}
 
@@ -217,21 +264,35 @@ func (d *ValDist) dispatchBatch(batch []kv) {
 		// Keys with this format are always broadcasted to threads and never consumed
 		for _, item := range batch {
 			if item.k[0] == '_' {
+				// Broadcast _keys to all threads (non-blocking)
 				for _, id := range d.threadIDs {
-					d.dispatchThread(item.k, item.v, d.threadChans[id])
+					if ch := d.threadChans[id]; ch != nil {
+						d.dispatchThread(item.k, item.v, ch)
+					}
 				}
 			} else {
-				idx := d.rrIndex.Add(1) - 1
-				threadIdx := int(idx % uint64(len(d.threadIDs)))
-				id := d.threadIDs[threadIdx]
-				d.dispatchThread(item.k, item.v, d.threadChans[id])
+				// Round-robin with fallback: try next thread if current is full
+				for attempts := 0; attempts < numThreads; attempts++ {
+					idx := d.rrIndex.Add(1) - 1
+					threadIdx := int(idx % uint64(numThreads))
+					id := d.threadIDs[threadIdx]
+					if ch := d.threadChans[id]; ch != nil {
+						if d.dispatchThread(item.k, item.v, ch) {
+							break // success, move to next item
+						}
+					}
+					// Channel full or removed, try next thread
+				}
+				// If all channels full, value is dropped (better than blocking)
 			}
 		}
 	} else {
-		// Broadcast: each kv goes to ALL threads
+		// Broadcast: each kv goes to ALL threads (non-blocking)
 		for _, item := range batch {
 			for _, id := range d.threadIDs {
-				d.dispatchThread(item.k, item.v, d.threadChans[id])
+				if ch := d.threadChans[id]; ch != nil {
+					d.dispatchThread(item.k, item.v, ch)
+				}
 			}
 		}
 	}

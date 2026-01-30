@@ -37,19 +37,14 @@ func drainChannel(w *monkey, limit int) {
 	if w.valChan == nil {
 		return
 	}
-	count := 0
-	for {
-		if limit > 0 && count >= limit {
-			return // reached limit
-		}
+	for i := 0; limit == 0 || i < limit; i++ {
 		select {
-		case msg := <-w.valChan:
-			for k, v := range msg {
+		case m := <-w.valChan:
+			for k, v := range m {
 				w.localBuffer[k] = append(w.localBuffer[k], v)
 			}
-			count++
 		default:
-			return // no more messages
+			return
 		}
 	}
 }
@@ -57,57 +52,98 @@ func drainChannel(w *monkey, limit int) {
 // waitForKeys - blocks (for wait_time) until all required keys are available in localBuffer
 // Emits periodic messages about missing keys
 func waitForKeys(w *monkey, keys []string, values map[string]string, limit int, done <-chan struct{}) bool {
+	if verbose {
+		w.logger.Write(fmt.Sprintf("DEBUG wait: START keys=%v, limit=%d, chanLen=%d\n", keys, limit, len(w.valChan)))
+	}
 	wait_time := 10 // in milliseconds
 	ticker := time.NewTicker(time.Duration(wait_time) * time.Millisecond)
 	defer ticker.Stop()
-	var prints []string
-	max_wait := 2 * (1000 / wait_time) //left operand is seconds :)
-	for {
-		// Check if all keys present (in localBuffer OR globalStaticVals)
-		var missing []string
-		for _, k := range keys {
-			if len(w.localBuffer[k]) > 0 {
-				continue
-			}
-			// For _key patterns, also check globalStaticVals and insert it to values
-			if len(k) > 0 && k[0] == '_' {
-				if v, exists := globalStaticVals.Load(k); exists {
-					values[k] = v.(string)
-					w.logger.Write(fmt.Sprintf("Static $%s$: %s\n", k, v.(string)))
-					continue
-				}
-			}
-			missing = append(missing, k)
+	max_wait := 2 * (1000 / wait_time)
+	iteration := 0
+
+	// Separate keys into static (_prefix) and FIFO keys
+	var staticKeys, fifoKeys []string
+	for _, k := range keys {
+		if len(k) > 0 && k[0] == '_' {
+			staticKeys = append(staticKeys, k)
+		} else {
+			fifoKeys = append(fifoKeys, k)
 		}
+	}
+	if verbose {
+		w.logger.Write(fmt.Sprintf("DEBUG wait: staticKeys=%v, fifoKeys=%v\n", staticKeys, fifoKeys))
+	}
+
+	for {
+		iteration++
+
+		// Check static keys in globalStaticVals
+		var missingStatic []string
+		for _, k := range staticKeys {
+			if v, exists := globalStaticVals.Load(k); exists {
+				values[k] = v.(string)
+				w.logger.Write(fmt.Sprintf("Static $%s$: %s\n", k, v.(string)))
+			} else {
+				missingStatic = append(missingStatic, k)
+			}
+		}
+
+		// Check FIFO keys in localBuffer
+		var missingFifo []string
+		for _, k := range fifoKeys {
+			if len(w.localBuffer[k]) == 0 {
+				missingFifo = append(missingFifo, k)
+			}
+		}
+
+		missing := append(missingStatic, missingFifo...)
+		if verbose {
+			w.logger.Write(fmt.Sprintf("DEBUG wait[%d]: missingStatic=%v, missingFifo=%v, chanLen=%d\n",
+				iteration, missingStatic, missingFifo, len(w.valChan)))
+		}
+
 		if len(missing) == 0 {
+			if verbose {
+				w.logger.Write(fmt.Sprintf("DEBUG wait: SUCCESS after %d iterations\n", iteration))
+			}
 			return true
 		}
 
-		// Wait for more data or emit status
-		select {
-		case msg, ok := <-w.valChan:
-			if !ok {
+		// Only read from channel if we need FIFO keys
+		// If only static keys missing, just wait on ticker (polling globalStaticVals)
+		if len(missingFifo) > 0 && w.valChan != nil {
+			select {
+			case msg, ok := <-w.valChan:
+				if !ok {
+					return false
+				}
+				for k, v := range msg {
+					bufLenBefore := len(w.localBuffer[k])
+					if limit == 0 || bufLenBefore < limit {
+						w.localBuffer[k] = append(w.localBuffer[k], v)
+					}
+				}
+			case <-ticker.C:
+				if max_wait == 0 {
+					w.logger.Write(fmt.Sprintf("Giving up keys: %s\n", strings.Join(missing, ", ")))
+					return false
+				}
+				max_wait--
+			case <-done:
 				return false
 			}
-			for k, v := range msg {
-				if limit == 0 || len(w.localBuffer[k]) < limit {
-					w.localBuffer[k] = append(w.localBuffer[k], v)
+		} else {
+			// Only waiting for static keys - just poll globalStaticVals
+			select {
+			case <-ticker.C:
+				if max_wait == 0 {
+					w.logger.Write(fmt.Sprintf("Giving up keys: %s\n", strings.Join(missing, ", ")))
+					return false
 				}
-			}
-		case <-ticker.C:
-			if max_wait == 0 {
-				w.logger.Write(fmt.Sprintf("Giving up keys: %v\n", missing))
+				max_wait--
+			case <-done:
 				return false
 			}
-			max_wait--
-			for p := range missing {
-				if len(prints) > p && missing[p] != prints[p] {
-					w.logger.Write(fmt.Sprintf("Waiting keys: %v\n", missing))
-				}
-				prints = missing
-			}
-		case <-done:
-			return false
 		}
 	}
 }

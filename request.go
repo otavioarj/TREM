@@ -193,6 +193,10 @@ func (o *Orch) buildAndDispatch(w *monkey, relIdx, absIdx int, tmpl *TemplateReq
 // relIdx = relative index within group (for patterns and barriers)
 // absIdx = absolute index in reqFiles (for loading request and response actions)
 func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
+	if verbose {
+		w.logger.Write(fmt.Sprintf("DEBUG: valChan len=%d, localBuffer[n]=%d\n",
+			len(w.valChan), len(w.localBuffer["n"])))
+	}
 	// Phase 1: load template and apply patterns
 	tmpl, values, err := o.prepareReq(w, relIdx, absIdx)
 	if err != nil {
@@ -237,7 +241,7 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 		if o.fifoWait {
 			// Replaces globalStatic replacing on-the-go
 			if !waitForKeys(w, keys, values, o.fifoBlockSize, o.quitChan) {
-				return fmt.Errorf("FIFO timeout waiting for keys: %v", missing)
+				return fmt.Errorf("FIFO timeout waiting for keys: %s", strings.Join(missing, ", "))
 			}
 		} else {
 			for _, k := range missing {
