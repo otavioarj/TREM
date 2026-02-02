@@ -449,12 +449,12 @@ func parseActions(s string) ([]respAction, error) {
 }
 
 // setupValDist - creates and initializes value distributor
-func setupValDist(univFlag string, fmodeFlag int, fifoThreadIDs []int, logger LogWriter) *ValDist {
+func setupValDist(univFlag string, fmodeFlag int, fifoThreadIDs []int, keySubscriptions map[int][]string, logger LogWriter) *ValDist {
 	if univFlag == "" {
-		return NewValDist("", 1, fifoThreadIDs)
+		return NewValDist("", 1, fifoThreadIDs, keySubscriptions)
 	}
 	if !strings.Contains(univFlag, "=") {
-		vd := NewValDist(univFlag, fmodeFlag, fifoThreadIDs)
+		vd := NewValDist(univFlag, fmodeFlag, fifoThreadIDs, keySubscriptions)
 		if err := vd.EnsureFifo(); err != nil {
 			exitErr(fmt.Sprintf("FIFO error: %v", err))
 		}

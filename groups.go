@@ -23,7 +23,7 @@ type ThreadGroup struct {
 	PatternsFile  string       // regex file path for this group
 	Patterns      [][]pattern  // loaded patterns for group transitions
 	StartThreadID int          // first global threadID for this group
-	NoFifo        bool         // whether this group needs FIFO access
+	NoFifo        bool         // whether this group does NOT need FIFO access
 }
 
 // createSingleGroup - creates synthetic ThreadGroup for single mode (no -thrG)
@@ -388,4 +388,61 @@ func getFifoThreadIDs(groups []*ThreadGroup) []int {
 		}
 	}
 	return ids
+}
+
+// extractKeySubscriptions - extracts non-static FIFO keys from templates for each thread
+// Returns map[threadID][]keys where keys are the non-static ($key$, not $_key$) placeholders
+// that the thread will need based on its group's request templates.
+// Returns nil if no subscriptions needed (all groups use NoFifo).
+func extractKeySubscriptions(groups []*ThreadGroup, reqFiles []string) map[int][]string {
+	result := make(map[int][]string)
+	hasAny := false
+
+	for _, g := range groups {
+		// Skip groups that don't use FIFO
+		if g.NoFifo {
+			continue
+		}
+
+		// Collect unique non-static keys from all request templates in this group
+		groupKeys := make(map[string]bool)
+
+		for _, reqIdx := range g.ReqIndices {
+			// Read request file
+			data, err := os.ReadFile(reqFiles[reqIdx])
+			if err != nil {
+				// Skip files that can't be read (will error later during execution)
+				continue
+			}
+
+			// Parse template and extract keys (reuses existing parseTemplate)
+			tmpl := parseTemplate(string(data))
+			for _, keyInfo := range tmpl.Keys {
+				// Only non-static keys (not starting with _)
+				if len(keyInfo.Name) > 0 && keyInfo.Name[0] != '_' {
+					groupKeys[keyInfo.Name] = true
+				}
+			}
+		}
+
+		// Convert to slice
+		if len(groupKeys) > 0 {
+			keys := make([]string, 0, len(groupKeys))
+			for k := range groupKeys {
+				keys = append(keys, k)
+			}
+
+			// Assign same keys to all threads in this group
+			for i := 0; i < g.ThreadCount; i++ {
+				threadID := g.StartThreadID + i
+				result[threadID] = keys
+				hasAny = true
+			}
+		}
+	}
+
+	if !hasAny {
+		return nil
+	}
+	return result
 }

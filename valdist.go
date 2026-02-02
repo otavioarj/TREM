@@ -19,8 +19,8 @@ type kv struct {
 
 // ValDist - distributes key=value pairs from FIFO to threads
 // Supports two modes:
-//   - Get mode (popMode=false): broadcast to all threads
-//   - Pop mode (popMode=true): round-robin to threads
+//   - Get mode (popMode=1): broadcast to all threads
+//   - Pop mode (popMode=2): round-robin to threads
 type ValDist struct {
 	fifoPath string
 	popMode  int
@@ -31,7 +31,13 @@ type ValDist struct {
 	threadChans map[int]chan map[string]string
 	threadIDs   []int // ordered list for round-robin
 
-	// Round-robin index for Pop mode
+	// Key subscription model: key -> list of threadIDs that need this key
+	// If nil, all threads receive all keys (legacy behavior for single mode)
+	keySubscribers map[string][]int
+	// Per-key round-robin index for fair distribution among subscribers
+	keyRRIndex map[string]*atomic.Uint64
+
+	// Round-robin index for Pop mode (used when keySubscribers is nil)
 	rrIndex atomic.Uint64
 
 	// Status tracking
@@ -42,7 +48,8 @@ type ValDist struct {
 }
 
 // NewValDist - creates new distributor for FIFO mode
-func NewValDist(path string, popMode int, fifoThreadIDs []int) *ValDist {
+// keySubscriptions: map of threadID -> []keys that thread needs (nil = all threads get all keys)
+func NewValDist(path string, popMode int, fifoThreadIDs []int, keySubscriptions map[int][]string) *ValDist {
 	d := &ValDist{
 		fifoPath:    path,
 		popMode:     popMode,
@@ -56,6 +63,23 @@ func NewValDist(path string, popMode int, fifoThreadIDs []int) *ValDist {
 	copy(d.threadIDs, fifoThreadIDs)
 	for _, id := range fifoThreadIDs {
 		d.threadChans[id] = make(chan map[string]string, 1000)
+	}
+
+	// Build reverse map: key -> []threadIDs (only if subscriptions provided)
+	if keySubscriptions != nil && len(keySubscriptions) > 0 {
+		d.keySubscribers = make(map[string][]int)
+		d.keyRRIndex = make(map[string]*atomic.Uint64)
+
+		for threadID, keys := range keySubscriptions {
+			for _, key := range keys {
+				d.keySubscribers[key] = append(d.keySubscribers[key], threadID)
+			}
+		}
+
+		// Initialize per-key round-robin counters
+		for key := range d.keySubscribers {
+			d.keyRRIndex[key] = &atomic.Uint64{}
+		}
 	}
 
 	emptyKV := [2]string{"", ""}
@@ -108,6 +132,18 @@ func (d *ValDist) RemoveThread(threadID int) {
 		if id == threadID {
 			d.threadIDs = append(d.threadIDs[:i], d.threadIDs[i+1:]...)
 			break
+		}
+	}
+
+	// Remove from all key subscriptions
+	if d.keySubscribers != nil {
+		for key, subs := range d.keySubscribers {
+			for i, id := range subs {
+				if id == threadID {
+					d.keySubscribers[key] = append(subs[:i], subs[i+1:]...)
+					break
+				}
+			}
 		}
 	}
 }
@@ -259,19 +295,42 @@ func (d *ValDist) dispatchBatch(batch []kv) {
 	}
 
 	if d.popMode == 2 {
-		// Round-robin: each kv goes to one thread
-		// Except if the key starts with '_', ie., _key from FIFO
-		// Keys with this format are always broadcasted to threads and never consumed
+		// Round-robin mode
 		for _, item := range batch {
-			if item.k[0] == '_' {
+			if len(item.k) > 0 && item.k[0] == '_' {
 				// Broadcast _keys to all threads (non-blocking)
 				for _, id := range d.threadIDs {
 					if ch := d.threadChans[id]; ch != nil {
 						d.dispatchThread(item.k, item.v, ch)
 					}
 				}
+			} else if d.keySubscribers != nil {
+				// Subscription mode: only send to threads that subscribed to this key
+				subscribers := d.keySubscribers[item.k]
+				if len(subscribers) == 0 {
+					// No one subscribed to this key, skip
+					continue
+				}
+
+				// Round-robin among subscribers only
+				rrIndex := d.keyRRIndex[item.k]
+				numSubs := len(subscribers)
+
+				for attempts := 0; attempts < numSubs; attempts++ {
+					idx := rrIndex.Add(1) - 1
+					subIdx := int(idx % uint64(numSubs))
+					threadID := subscribers[subIdx]
+
+					if ch := d.threadChans[threadID]; ch != nil {
+						if d.dispatchThread(item.k, item.v, ch) {
+							break // success, move to next item
+						}
+					}
+					// Channel full or removed, try next subscriber
+				}
+				// If all subscriber channels full, value is dropped (better than blocking)
 			} else {
-				// Round-robin with fallback: try next thread if current is full
+				// Legacy mode: round-robin among all threads
 				for attempts := 0; attempts < numThreads; attempts++ {
 					idx := d.rrIndex.Add(1) - 1
 					threadIdx := int(idx % uint64(numThreads))
@@ -287,11 +346,21 @@ func (d *ValDist) dispatchBatch(batch []kv) {
 			}
 		}
 	} else {
-		// Broadcast: each kv goes to ALL threads (non-blocking)
+		// Broadcast mode: each kv goes to ALL threads (non-blocking)
 		for _, item := range batch {
-			for _, id := range d.threadIDs {
-				if ch := d.threadChans[id]; ch != nil {
-					d.dispatchThread(item.k, item.v, ch)
+			if d.keySubscribers != nil && len(item.k) > 0 && item.k[0] != '_' {
+				// Subscription mode: only broadcast to subscribers
+				for _, threadID := range d.keySubscribers[item.k] {
+					if ch := d.threadChans[threadID]; ch != nil {
+						d.dispatchThread(item.k, item.v, ch)
+					}
+				}
+			} else {
+				// Legacy mode or _keys: broadcast to all
+				for _, id := range d.threadIDs {
+					if ch := d.threadChans[id]; ch != nil {
+						d.dispatchThread(item.k, item.v, ch)
+					}
 				}
 			}
 		}

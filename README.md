@@ -56,6 +56,7 @@ TREM is engineered for minimal overhead and maximum throughput:
 | Key Extraction | Regex with linear dedup | O(n) amortized|
 | Key combination & seek | In-place combination generation | O(log<sub>k</sub>v) for v values, k keys |
 | Connection Pooling | Keep-alive with TLS session reuse | O(1) |
+| Key Subscription | Per-key round-robin among subscribers | O(S) where S = subscribers |
 
 The architecture eliminates mutex contention through **copy-on-write semantics** and atomic operations, enabling thousands of concurrent requests with sub-millisecond coordination overhead.
 
@@ -130,6 +131,7 @@ go build -ldflags="-s -w" -trimpath
 | `-fw` | true | FIFO wait: block until first value written to named pipe |
 | `-fmode` | 2 | FIFO distribution: 1=Broadcast (all threads), 2=Round-robin |
 | `-fbck` | 64 | FIFO block consumption: max values to drain per request (0=unlimited) |
+| `-fkdist` | true | FIFO key distribution: threads only receive keys from their templates (group mode only, see [FIFO Key Distribution](#fifo-key-distribution--fkdist)) |
 | `-mtls` | | Client certificate for mTLS: `/path/cert.p12:password` |
 | `-dump` | false | Dump thread tab output to files (`g<G>_t<T>_<H-M>.txt`) |
 | `-sb` | 1 | Sync barrier indices (1-based, comma-separated, see [Sync Barriers](#sync-barriers--sb)) |
@@ -252,7 +254,7 @@ When `-thrG` is used, the following flags are **ignored** (they're defined per g
 
 Each line defines one group:
 ```
-req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N,M] [re=file]
+req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N,M] [re=file] [nofifo]
 ```
 
 | Parameter | Required | Description |
@@ -266,6 +268,7 @@ req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N
 | `xt=N` | No | Loop count (0=infinite) |
 | `sb=N,M` | No | Sync barriers (1-based, relative to group) |
 | `re=file` | No | Regex patterns file for this group |
+| `nofifo` | No | Boolean flag - group doesn't receive FIFO values (see [NoFifo Groups](#nofifo-groups)) |
 
 > **Note**: `mode=block` ignores `r_delay` and `re=` parameters.
 
@@ -298,6 +301,25 @@ Groups can share values using **static keys** (keys prefixed with `_`):
 3. Group 2 automatically receives `$_session$` in its requests
 
 This enables patterns like: authenticate once in Group 1, spray exploits in Group 2.
+
+### NoFifo Groups
+
+Groups with `nofifo` flag don't participate in FIFO value distribution. Their threads:
+- Don't receive FIFO channel (no buffered values)
+- Still have access to static keys (`_key`) via `globalStaticVals`
+- Useful for groups that only use regex-extracted values or static keys
+
+**Example:**
+```
+# groups.txt
+# Group 1: Auth - doesn't need FIFO values, only extracts session
+1,2 thr=5 mode=async s_delay=0 re=auth.txt nofifo
+
+# Group 2: Spray - uses FIFO for passwords
+3 thr=50 mode=async s_delay=100 x=1 xt=0
+```
+
+Group 1 extracts `$_session$` which Group 2 uses, but Group 1 threads don't waste channel capacity receiving FIFO values they don't need.
 
 ## Regex Patterns File (`-re`)
 
@@ -360,7 +382,8 @@ Where:
 
 | Action | Description |
 |--------|-------------|
-| `pt("msg")` | Print message to the matching thread's tab and pause that thread |
+| `pt("msg")` | Print message to the matching thread's tab (no pause) |
+| `ppt("msg")` | Print message to the matching thread's tab and pause that thread |
 | `pa("msg")` | Print message to ALL thread tabs and pause ALL threads |
 | `sre("path")` | Save the request that generated the match to file and pause thread |
 | `srp("path")` | Save the response that generated the match to file and pause thread |
@@ -487,6 +510,56 @@ Generates 4 requests:
 |---------|----------|
 | `-fw=true` (default) | Block threads until first FIFO value arrives |
 | `-fw=false` | Start immediately; missing keys left unsubstituted |
+
+### FIFO Key Distribution (`-fkdist`)
+
+By default in group mode, TREM analyzes each group's request templates and only sends FIFO keys to threads that actually need them. This **subscription-based distribution** prevents threads from receiving keys they never use, optimizing channel capacity and reducing overhead.
+
+| Setting | Behavior |
+|---------|----------|
+| `-fkdist=true` (default) | Threads only receive keys present in their group's request templates |
+| `-fkdist=false` | All threads receive all keys (legacy behavior) |
+
+> **Note**: In single mode (without `-thrG`), key distribution is always disabled (all threads process all requests, so they need all keys).
+
+**How it works:**
+
+1. Before starting, TREM parses all request templates for each group
+2. Extracts non-static keys (`$key$`, not `$_key$`) from each group's requests
+3. Builds a subscription map: which threads need which keys
+4. FIFO dispatcher only sends keys to subscribed threads
+
+**Example scenario:**
+
+```
+# groups.txt
+# Group 1: Auth - uses $_session$ (static, always available)
+1,2 thr=5 mode=async s_delay=0 re=auth.txt
+
+# Group 2: Spray - uses $pass$ from FIFO  
+3 thr=50 mode=async s_delay=100 x=1 xt=0
+```
+
+With `-fkdist=true`:
+- Group 1 threads (0-4): Don't receive `pass` values (not in their templates)
+- Group 2 threads (5-54): Receive `pass` values via round-robin
+
+With `-fkdist=false`:
+- All 55 threads receive `pass` values, but Group 1 threads waste them
+
+**Benefits:**
+- Reduced channel congestion for threads that don't need certain keys
+- More efficient round-robin distribution (values go only to threads that use them)
+- Lower memory usage (smaller per-thread buffers)
+
+**Complexity:**
+
+| Operation | Without Subscription | With Subscription |
+|-----------|---------------------|-------------------|
+| Dispatch key | O(T) all threads | O(S) subscribers only |
+| Round-robin | Global index | Per-key index among subscribers |
+
+Where T = total threads, S = subscribers for that key (typically S << T).
 
 ## HTTP/2 Support
 
@@ -666,6 +739,17 @@ The UI displays a **TreeView** on the left showing all groups and their threads.
 # 3,4,5 thr=50 mode=sync s_delay=50 sb=1 x=1 xt=0
 
 ./trem -l "login.txt,setup.txt,race1.txt,race2.txt,race3.txt" -thrG groups.txt -ra actions.txt
+```
+
+**Multi-group with nofifo optimization:**
+```bash
+# groups.txt:
+# 1,2 thr=5 mode=async s_delay=0 re=auth.txt nofifo
+# 3 thr=100 mode=async s_delay=100 x=1 xt=0
+
+./trem -l "login.txt,setup.txt,spray.txt" -thrG groups.txt -u /tmp/fifo -fmode 2
+# Group 1: Auth only, doesn't need FIFO values
+# Group 2: Spray with all 100 threads receiving passwords via round-robin
 ```
 
 **mTLS with client certificate:**

@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.6.8"
+var version = "v1.7.0"
 
 // Global flags
 var verbose bool
@@ -173,6 +173,9 @@ func main() {
 		"  r_delay = request delay (ms between requests, equals to -d flag if this omitted)\n"+
 		"  Note: mode=block ignores r_delay and re= (patterns)!!\n"+
 		"Example:\n  1,3,5 thr=25 mode=async s_delay=25 r_delay=10 x=1 xt=2\n  2,4 thr=10 mode=sync s_delay=0 x=2 xt=10 sb=1")
+	fkdistFlag := flag.Bool("fkdist", true, "FIFO key distribution: send keys only to threads groups that need them (group mode only).\n"+
+		"When enabled, threads only receive FIFO keys that appear in their requests list templates!\n"+
+		"Disabled automatically in Single Mode: all threads get all keys.")
 	flag.Parse()
 
 	verbose = *verboseFlag
@@ -215,6 +218,7 @@ func main() {
 
 	// Build groups: either from -thrG file or synthetic single group
 	var groups []*ThreadGroup
+	var keySubscriptions map[int][]string
 
 	if *thrGFlag != "" {
 		// Group mode: parse groups file
@@ -246,6 +250,11 @@ func main() {
 				// No patterns file = fire-and-forget for all transitions
 				g.Patterns = make([][]pattern, numTransitions)
 			}
+		}
+
+		// Extract key subscriptions for FIFO distribution
+		if *fkdistFlag {
+			keySubscriptions = extractKeySubscriptions(groups, reqFiles)
 		}
 
 		configBanner = formatGroupsBanner(groups, *cliFlag, *fbckFlag, verbose, *httpFlag, *proxyFlag, *mtlsFlag, *hostFlag, *univFlag)
@@ -305,6 +314,10 @@ func main() {
 
 		groups = []*ThreadGroup{group}
 
+		// Single mode: disable key subscriptions (all threads get all keys)
+		// This will always ignore fkdistFlag!
+		keySubscriptions = nil
+
 		configBanner = FormatConfig(*thrFlag, *delayFlag, loopStart, *loopTimesFlag, *cliFlag, *fbckFlag,
 			*kaFlag, verbose, *httpFlag, *proxyFlag, *hostFlag, *mtlsFlag, *modeFlag, *univFlag)
 	}
@@ -312,25 +325,25 @@ func main() {
 	// Run orchestration
 	runOrchestration(groups, reqFiles, actionPatterns, *univFlag, *fmodeFlag,
 		*hostFlag, *outFlag, *kaFlag, *proxyFlag, *cliFlag, *touFlag,
-		*retryFlag, *httpFlag, *fwFlag, *fbckFlag, *mtlsFlag, *dumpFlag, windowSize, *delayFlag, *dsizeFlag)
+		*retryFlag, *httpFlag, *fwFlag, *fbckFlag, *mtlsFlag, *dumpFlag, windowSize, *delayFlag, *dsizeFlag, keySubscriptions)
 }
 
 // runOrchestration - unified execution for both single and group modes
 func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns map[int]*actionPattern,
 	univFlag string, fmodeFlag int, hostFlag string, outFlag, kaFlag bool,
 	proxyFlag string, cliFlag, touFlag, retryFlag int, httpFlag, fwFlag bool,
-	fbckFlag int, mtlsFlag string, dumpFlag bool, windowSize int, defaultDelay int, maxDataSize int) {
+	fbckFlag int, mtlsFlag string, dumpFlag bool, windowSize int, defaultDelay int, maxDataSize int, keySubscriptions map[int][]string) {
 
 	totalThreads := getTotalThreads(groups)
 
-	// Init UI with groups (always uses group-based layout)
+	// Init UI with groups
 	ui := NewUIManager(totalThreads, dumpFlag)
 	ui.SetupGroups(groups)
 	ui.Build()
 
 	// Setup value distributor
 	fifoThreadIDs := getFifoThreadIDs(groups)
-	valDist := setupValDist(univFlag, fmodeFlag, fifoThreadIDs, ui.GetLogger(0))
+	valDist := setupValDist(univFlag, fmodeFlag, fifoThreadIDs, keySubscriptions, ui.GetLogger(0))
 
 	// Init stats
 	stats = NewStatsCollector(windowSize, verbose)
@@ -598,6 +611,13 @@ func formatGroupsBanner(groups []*ThreadGroup, cliHello, fbck int,
 func (o *Orch) runWorker(w *monkey) {
 	defer o.wg.Done()
 	defer o.closeWorkerConn(w)
+
+	// Remove thread from FIFO distribution when done to unblock reader
+	defer func() {
+		if w.valChan != nil && o.valDist != nil {
+			o.valDist.RemoveThread(w.id)
+		}
+	}()
 
 	// Use reqIndices to determine which requests to process
 	reqIndices := w.reqIndices
