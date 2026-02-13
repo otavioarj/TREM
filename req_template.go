@@ -196,6 +196,7 @@ func normalizeReq(req string, blockMode bool) string {
 	if blockMode && !hasConn {
 		headers = append(headers, connKeep)
 	}
+	body = strings.TrimRight(body, "\r\n")
 	bodyLen := len(body)
 	// set Content-Length (skip if Transfer-Encoding present)
 	if !hasTransferEnc {

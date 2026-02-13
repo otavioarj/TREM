@@ -51,6 +51,7 @@ func drainChannel(w *monkey, limit int) {
 
 // waitForKeys - blocks (for wait_time) until all required keys are available in localBuffer
 // Emits periodic messages about missing keys
+// Keys in w.wait2Keys never timeout (infinite wait)
 func waitForKeys(w *monkey, keys []string, values map[string]string, limit int, done <-chan struct{}) bool {
 	if verbose {
 		w.logger.Write(fmt.Sprintf("DEBUG wait: START keys=%v, limit=%d, chanLen=%d\n", keys, limit, len(w.valChan)))
@@ -76,15 +77,17 @@ func waitForKeys(w *monkey, keys []string, values map[string]string, limit int, 
 
 	for {
 		iteration++
-
 		// Check static keys in globalStaticVals
 		var missingStatic []string
 		for _, k := range staticKeys {
-			if v, exists := globalStaticVals.Load(k); exists {
-				values[k] = v.(string)
-				w.logger.Write(fmt.Sprintf("Static $%s$: %s\n", k, v.(string)))
-			} else {
-				missingStatic = append(missingStatic, k)
+			// Only use globalStaticVals if not already in values (regex extraction has priority)
+			if _, exists := values[k]; !exists {
+				if v, found := globalStaticVals.Load(k); found {
+					values[k] = v.(string)
+					w.logger.Write(fmt.Sprintf("Static $%s$: %s\n", k, v.(string)))
+				} else {
+					missingStatic = append(missingStatic, k)
+				}
 			}
 		}
 
@@ -109,6 +112,26 @@ func waitForKeys(w *monkey, keys []string, values map[string]string, limit int, 
 			return true
 		}
 
+		// Determine if timeout applies (skip if ALL missing keys are in wait2Keys)
+		shouldTimeout := true
+		if len(w.wait2Keys) > 0 {
+			allInWait2 := true
+			for _, m := range missing {
+				found := false
+				for _, wk := range w.wait2Keys {
+					if m == wk {
+						found = true
+						break
+					}
+				}
+				if !found {
+					allInWait2 = false
+					break
+				}
+			}
+			shouldTimeout = !allInWait2
+		}
+
 		// Only read from channel if we need FIFO keys
 		// If only static keys missing, just wait on ticker (polling globalStaticVals)
 		if len(missingFifo) > 0 && w.valChan != nil {
@@ -124,11 +147,13 @@ func waitForKeys(w *monkey, keys []string, values map[string]string, limit int, 
 					}
 				}
 			case <-ticker.C:
-				if max_wait == 0 {
-					w.logger.Write(fmt.Sprintf("Giving up keys: %s\n", strings.Join(missing, ", ")))
-					return false
+				if shouldTimeout {
+					if max_wait == 0 {
+						w.logger.Write(fmt.Sprintf("Giving up keys: %s\n", strings.Join(missing, ", ")))
+						return false
+					}
+					max_wait--
 				}
-				max_wait--
 			case <-done:
 				return false
 			}
@@ -136,11 +161,13 @@ func waitForKeys(w *monkey, keys []string, values map[string]string, limit int, 
 			// Only waiting for static keys - just poll globalStaticVals
 			select {
 			case <-ticker.C:
-				if max_wait == 0 {
-					w.logger.Write(fmt.Sprintf("Giving up keys: %s\n", strings.Join(missing, ", ")))
-					return false
+				if shouldTimeout {
+					if max_wait == 0 {
+						w.logger.Write(fmt.Sprintf("Giving up keys: %s\n", strings.Join(missing, ", ")))
+						return false
+					}
+					max_wait--
 				}
-				max_wait--
 			case <-done:
 				return false
 			}

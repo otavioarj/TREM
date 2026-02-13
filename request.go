@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -203,13 +204,15 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 		return err
 	}
 
-	// Phase 2: handle static mode (-u key=val) - direct send
+	// Phase 2: handle static mode (-u key=val)
 	if o.valDist != nil && o.valDist.IsStatic() {
 		k, v := o.valDist.StaticKV()
 		if k != "" {
-			values[k] = v
+			// Only use -u value if not already set (allows regex extraction to override)
+			if _, exists := values[k]; !exists {
+				values[k] = v
+			}
 		}
-		return o.buildAndDispatch(w, relIdx, absIdx, tmpl, values, true)
 	}
 
 	// Phase 3: get non-static keys (key[0]!='_') needing values for request
@@ -286,16 +289,20 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 // appendToBlock - accumulates request in buffer for block mode
 // HTTP/1.1: raw bytes pipelining | HTTP/2: ParsedReq multiplexing
 // Validates host consistency. Triggers flushBlock when buffer exceeds maxDataSize or last request.
+// In keepAll mode: only accumulates, never flushes (coordinator handles flush)
 func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) error {
 	if o.httpH2 {
 		// HTTP/2 block mode: accumulate ParsedReq for multiplexing
-		if w.h2conn == nil {
-			w.logger.Write(fmt.Sprintf("Block-Conn H2: %s\n", addr))
-			if err := o.dialWithRetry(w, addr); err != nil {
-				return fmt.Errorf("dial: %v", err)
+		if !o.keepAll {
+			// Normal mode: each thread has own connection
+			if w.h2conn == nil {
+				w.logger.Write(fmt.Sprintf("Block-Conn H2: %s\n", addr))
+				if err := o.dialWithRetry(w, addr); err != nil {
+					return fmt.Errorf("dial: %v", err)
+				}
+			} else if addr != w.connAddr {
+				return fmt.Errorf("block mode: host mismatch %s vs %s. Multiplexing requires same host!", addr, w.connAddr)
 			}
-		} else if addr != w.connAddr {
-			return fmt.Errorf("block mode: host mismatch %s vs %s. Multiplexing requires same host!", addr, w.connAddr)
 		}
 
 		parsed := parseRawReq2H2(req)
@@ -304,6 +311,12 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 		}
 		w.blockH2Reqs = append(w.blockH2Reqs, parsed)
 		w.blockAbsIdx = append(w.blockAbsIdx, absIdx)
+
+		// keepAll mode: never flush here, coordinator handles it
+		if o.keepAll {
+			w.logger.Write(fmt.Sprintf("Queued r%d (H2 KA)\n", absIdx+1))
+			return nil
+		}
 
 		isLastReq := relIdx == len(w.reqIndices)-1
 		if isLastReq {
@@ -315,17 +328,20 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 	}
 
 	// HTTP/1.1 block mode: accumulate raw bytes for pipelining
-	if len(w.blockOffsets) == 0 {
-		if w.conn == nil {
-			w.logger.Write(fmt.Sprintf("Block-Conn: %s\n", addr))
-			if err := o.dialWithRetry(w, addr); err != nil {
-				return fmt.Errorf("dial: %v", err)
+	if !o.keepAll {
+		// Normal mode: each thread has own connection
+		if len(w.blockOffsets) == 0 {
+			if w.conn == nil {
+				w.logger.Write(fmt.Sprintf("Block-Conn: %s\n", addr))
+				if err := o.dialWithRetry(w, addr); err != nil {
+					return fmt.Errorf("dial: %v", err)
+				}
 			}
-		}
-	} else {
-		// Validate same host for pipelining
-		if addr != w.connAddr {
-			return fmt.Errorf("block mode: host mismatch %s vs %s. Pipelining requires same host!", addr, w.connAddr)
+		} else {
+			// Validate same host for pipelining
+			if addr != w.connAddr {
+				return fmt.Errorf("block mode: host mismatch %s vs %s. Pipelining requires same host!", addr, w.connAddr)
+			}
 		}
 	}
 
@@ -333,6 +349,12 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 	w.blockOffsets = append(w.blockOffsets, len(w.blockBuf))
 	w.blockAbsIdx = append(w.blockAbsIdx, absIdx)
 	w.blockBuf = append(w.blockBuf, req...)
+
+	// keepAll mode: never flush here, coordinator handles it
+	if o.keepAll {
+		w.logger.Write(fmt.Sprintf("Queued r%d (%d bytes, KA)\n", absIdx+1, len(req)))
+		return nil
+	}
 
 	isLastReq := relIdx == len(w.reqIndices)-1
 	bufferFull := len(w.blockBuf) >= o.maxDataSize
@@ -448,6 +470,168 @@ func (o *Orch) flushBlock(w *monkey) error {
 	w.blockOffsets = w.blockOffsets[:0]
 	w.blockAbsIdx = w.blockAbsIdx[:0]
 
+	return nil
+}
+
+// doGlobalFlush - flushes all monkey buffers in single TCP write (keepAll mode)
+// Uses monkey[0].conn/h2conn as shared connection
+func (o *Orch) doGlobalFlush() error {
+	if o.httpH2 {
+		return o.doGlobalFlushH2()
+	}
+	return o.doGlobalFlushH1()
+}
+
+// doGlobalFlushH1 - HTTP/1.1 global flush: concatenate all buffers, single write
+func (o *Orch) doGlobalFlushH1() error {
+	// Calculate total size
+	var totalSize int
+	var totalReqs int
+	for _, m := range o.monkeys {
+		totalSize += len(m.blockBuf)
+		totalReqs += len(m.blockOffsets)
+	}
+
+	if totalSize == 0 {
+		return nil
+	}
+
+	// Concatenate all buffers
+	totalBuf := make([]byte, 0, totalSize)
+	for _, m := range o.monkeys {
+		totalBuf = append(totalBuf, m.blockBuf...)
+	}
+
+	conn := o.monkeys[0].conn
+	o.monkeys[0].logger.Write(fmt.Sprintf("Global flush %d reqs (%d bytes) from %d threads\n",
+		totalReqs, totalSize, len(o.monkeys)))
+
+	// Single TCP write
+	if _, err := conn.Write(totalBuf); err != nil {
+		return fmt.Errorf("global flush write: %v", err)
+	}
+
+	reader := bufio.NewReader(conn)
+
+	// Read responses in order (requests were concatenated in monkey order)
+	for _, m := range o.monkeys {
+		for i := 0; i < len(m.blockOffsets); i++ {
+			absIdx := m.blockAbsIdx[i]
+			resp, status, _, err := readHTTP1Resp(m.id, reader)
+			if err != nil {
+				return fmt.Errorf("global read resp m%d r%d: %v", m.id, absIdx+1, err)
+			}
+
+			m.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
+			m.prevResp = resp
+
+			// Apply response actions if configured
+			if m.actionPatterns != nil && m.actionPatterns[absIdx] != nil {
+				req := o.extractReq(m, i)
+				if err := o.applyResponseActions(m, absIdx, req, resp, status); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Clear monkey's buffers
+		m.blockBuf = m.blockBuf[:0]
+		m.blockOffsets = m.blockOffsets[:0]
+		m.blockAbsIdx = m.blockAbsIdx[:0]
+	}
+
+	stats.ReportRequest(o.monkeys[0].id, 0, 0, uint32(totalSize))
+	return nil
+}
+
+// doGlobalFlushH2 - HTTP/2 global flush: encode all requests, single write
+func (o *Orch) doGlobalFlushH2() error {
+	// Count total requests
+	var totalReqs int
+	for _, m := range o.monkeys {
+		totalReqs += len(m.blockH2Reqs)
+	}
+
+	if totalReqs == 0 {
+		return nil
+	}
+
+	h2 := o.monkeys[0].h2conn
+	if err := h2.handshake(); err != nil {
+		return fmt.Errorf("H2 handshake: %v", err)
+	}
+
+	// Metadata for response correlation
+	type reqMeta struct {
+		monkey   *monkey
+		idx      int // index in monkey's blockH2Reqs
+		absIdx   int
+		streamID uint32
+	}
+	metas := make([]reqMeta, 0, totalReqs)
+	streamToMeta := make(map[uint32]*reqMeta, totalReqs)
+
+	// Encode all requests into single buffer
+	var buf bytes.Buffer
+	for _, m := range o.monkeys {
+		for i, req := range m.blockH2Reqs {
+			streamID := h2.streamID
+			h2.streamID += 2
+			h2.encodeReqFrames(&buf, req, streamID)
+
+			meta := reqMeta{
+				monkey:   m,
+				idx:      i,
+				absIdx:   m.blockAbsIdx[i],
+				streamID: streamID,
+			}
+			metas = append(metas, meta)
+			streamToMeta[streamID] = &metas[len(metas)-1]
+		}
+	}
+
+	o.monkeys[0].logger.Write(fmt.Sprintf("Global flush %d reqs (H2) from %d threads\n",
+		totalReqs, len(o.monkeys)))
+
+	// Single TCP write
+	bytesOut := buf.Len()
+	if _, err := h2.conn.Write(buf.Bytes()); err != nil {
+		return fmt.Errorf("H2 global flush write: %v", err)
+	}
+
+	// Read responses (may arrive out of order)
+	for i := 0; i < totalReqs; i++ {
+		streamID, resp, status, bytesIn, err := h2.readResponse(0)
+		if err != nil {
+			return fmt.Errorf("H2 global read resp %d: %v", i+1, err)
+		}
+
+		meta, ok := streamToMeta[streamID]
+		if !ok {
+			return fmt.Errorf("H2 unknown streamID %d", streamID)
+		}
+
+		m := meta.monkey
+		m.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", meta.absIdx+1, status))
+		m.prevResp = resp
+		stats.ReportRequest(m.id, 0, uint32(bytesIn), 0)
+
+		// Apply response actions if configured
+		if m.actionPatterns != nil && m.actionPatterns[meta.absIdx] != nil {
+			reqStr := m.blockH2Reqs[meta.idx].String()
+			if err := o.applyResponseActions(m, meta.absIdx, reqStr, resp, status); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Clear all monkey buffers
+	for _, m := range o.monkeys {
+		m.blockH2Reqs = m.blockH2Reqs[:0]
+		m.blockAbsIdx = m.blockAbsIdx[:0]
+	}
+
+	stats.ReportRequest(o.monkeys[0].id, 0, 0, uint32(bytesOut))
 	return nil
 }
 

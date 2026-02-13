@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.7.0"
+var version = "v1.7.6"
 
 // Global flags
 var verbose bool
@@ -72,6 +72,7 @@ type monkey struct {
 	blockOffsets []int        // HTTP/1.1: offset of each request start in blockBuf
 	blockH2Reqs  []*ParsedReq // HTTP/2: accumulated requests for multiplexing
 	blockAbsIdx  []int        // absIdx for each queued request (H1 and H2)
+	wait2Keys    []string     // keys to wait indefinitely (from group wk=)
 }
 
 // Orch - orchestrator for sync/async/block modes
@@ -116,6 +117,12 @@ type Orch struct {
 	// Block mode fields
 	blockMode   bool // true if mode=block
 	maxDataSize int  // max buffer size before flush (-dsize)
+	// Keep-all mode: shared connection across all threads (block mode only)
+	keepAll     bool          // -ka flag: reuse single TLS conn for all threads
+	kaReadyChan chan int      // workers signal accumulation done
+	kaFlushDone chan struct{} // coordinator signals flush complete
+	kaIterMu    sync.Mutex    // protects iteration reset
+	kaIteration int           // current iteration number
 }
 
 func main() {
@@ -132,25 +139,25 @@ func main() {
 	delayFlag := flag.Int("d", 0, "Delay ms between requests")
 	hostFlag := flag.String("h", "", "Host override: host:port")
 	outFlag := flag.Bool("o", false, "Output last response to file")
-	kaFlag := flag.Bool("k", true, "Keep-alive: reuse TLS connection for chain")
+	kaFlag := flag.Bool("k", true, "Keep tunnels: reuse TCP/TLS connection (tunnels) in the same chain (per-thread)")
 	verboseFlag := flag.Bool("v", false, "Verbose: show debug info")
 	proxyFlag := flag.String("px", "", "Proxy URL (http://host:port)")
 	cliFlag := flag.Int("cli", 0, "uTLS Client Hello ID:\n"+
 		"0: Random(No)ALPN\n1: Chrome_Auto\n2: Firefox_Auto\n3: iOS_Auto\n4: Edge_Auto\n5: Safari_Auto")
-	loopStartFlag := flag.Int("x", -1, "Loop from request index (1-based). -1 = no loop")
-	loopTimesFlag := flag.Int("xt", 1, "Loop count. 0 = infinite")
-	touFlag := flag.Int("tou", 10000, "TLS dial timeout (ms)")
+	loopStartFlag := flag.Int("x", -1, "Loop from request index (1-based). -1 = no loop\n Example: \"-l r1,r2,r3,r4 -xt 10 -x2\" will loop r2 to r4.")
+	loopTimesFlag := flag.Int("xt", 1, "Loop count. 0 = infinite\n Example: \"-l r1,r2,r3,r4 -xt 10\" will loop 10 times r1-r4")
+	touFlag := flag.Int("tou", 5000, "TLS dial timeout (ms)")
 	retryFlag := flag.Int("retry", 3, "Max connection retries")
-	httpFlag := flag.Bool("http2", false, "Force HTTP/2")
+	httpFlag := flag.Bool("h2", false, "Force HTTP/2")
 	univFlag := flag.String("u", "", "Universaly replaces key=val.\nIf key=value, ie., num=179, will match/replace every"+
-		" $num$ (requests) to 179.\nIf a path. ie., /tmp/fifo, will create a named-pipe where other program can write key=value"+
+		" $num$ (requests) to 179.\nIf it's a path. ie., /tmp/fifo, will create a named-pipe where other program can write key=value"+
 		"\nExample of a password-spray racer: ./trem <params> -u /tmp/fifo || cat pass-spray.txt > /tmp/fifo\n"+
 		"    With pass-spray.txt as: pass=21938712\n"+
 		"                            32847832\n"+
 		"                            32473872\n"+
 		"                            ...")
 	fmodeFlag := flag.Int("fmode", 2, "FIFO distribution mode: \n 1 Broadcast: every value is sent to every thread\n 2 Round-robin:"+
-		" each value new value is sent to one thread.")
+		" each new value is sent to one thread.")
 	fwFlag := flag.Bool("fw", true, "FIFO wait: wait for first value before starting workers")
 	mtlsFlag := flag.String("mtls", "", "mTLS client cert: file.p12:password")
 	swFlag := flag.Int("sw", 10, "Stats window: sample size for RPS/jitter calculation")
@@ -161,21 +168,30 @@ func main() {
 		"-l r1,r2,r3 -ra ra.txt. With ra.txt as:\n  2,3:token.*`:sre(\"/tmp/req.txt\"), e \n"+
 		"Will try to match in r2 and r3 responses \"token.*\", then save request that *first* generated the match to \"/tmp/req.txt\" and exit.\n"+
 		"The following actions, are implemented:\n pa(\"msg\") - print msg on match and pause ALL threads.\n ppt(\"msg\") - print msg on match and pause the thread.\n"+
-		"pt(\"msg\") - print msg on match and DON'T pause the thread.\n"+
+		" pt(\"msg\") - print msg on match and DON'T pause the thread.\n"+
 		" sr  - save request that generated the match, and pause thread.\n sre - save response that generated the match, and pause thread.\n"+
 		" sa  - save request and response that generated the match, and pause thread.\n e   - gracefully exit on match, use as last action if combined with others!")
 	fbckFlag := flag.Int("fbck", 64, "FIFO block consumption: max values to drain per request (0=unlimited).")
 	dsizeFlag := flag.Int("dsize", 4096, "Block mode: max TCP data size in bytes before flush")
 	thrGFlag := flag.String("thrG", "", "Thread groups file. Defines independent request groups with separate threads.\n"+
-		"When present, -thr, -mode, -x, -xt, -sb, -re are ignored (defined per group).\n"+
-		"Format per line, [] are optionals: req indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N,M] [re=file]\n"+
-		"  s_delay = start delay (ms delay to start group chain)\n"+
-		"  r_delay = request delay (ms between requests, equals to -d flag if this omitted)\n"+
+		"When present, -thr, -mode, -x, -xt, -sb, -re and -ka are ignored (defined per group).\n"+
+		"Format per line, [] are optionals: 1,...,n (req indices) thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=1,..,n] [re=file] [nofifo] [ka] [wk=_k1,..,_kn]\n"+
+		"  s_delay: start delay (ms delay to start group chain).\n"+
+		"  r_delay: request delay (ms between requests, equals to -d flag if this omitted).\n"+
+		"  ka: if present share single TLS connection across all threads (block mode only).\n"+
+		"  nofifo: if present removes the group from FIFO (-u) work queues, reducing overhead if a group don't need FIFO.\n"+
+		"  wk: a list of global keys (i.e., _key) the group needs from an other group, blocking in waitForkeys() until the full list available.\n"+
 		"  Note: mode=block ignores r_delay and re= (patterns)!!\n"+
-		"Example:\n  1,3,5 thr=25 mode=async s_delay=25 r_delay=10 x=1 xt=2\n  2,4 thr=10 mode=sync s_delay=0 x=2 xt=10 sb=1")
-	fkdistFlag := flag.Bool("fkdist", true, "FIFO key distribution: send keys only to threads groups that need them (group mode only).\n"+
+		"Example:\n  1,3,5 thr=25 s_delay=125 mode=async\n  2,4 thr=10 mode=sync s_delay=0 x=2 xt=10 sb=1\n"+
+		"  # Commentaries are ignored :)\n"+
+		"  6 thr=100 mode=block s_delay=500 nofifo ka wk=_keyReq1,_keyReq5")
+	fkdistFlag := flag.Bool("fkdist", true, "FIFO key subscription and distribution: send keys only to threads groups that need them (group mode only).\n"+
 		"When enabled, threads only receive FIFO keys that appear in their requests list templates!\n"+
 		"Disabled automatically in Single Mode: all threads get all keys.")
+	keepAllFlag := flag.Bool("ka", false, "Keep a single TCP/TLS tunnel (single connection) across ALL threads in block mode. All threads will generate a single TCP-write!\n"+
+		"Requires mode=block. All requests must target same host:port.\n"+
+		"Enables true single-packet attack: one TCP write for all threads × all iterations.\n "+
+		"For example: \"-l req1 -xt 5 -mode block -thr 100 -ka\" a single TCP datagram will contain all 500 requests, if size(datagram) is less than -dsize value.")
 	flag.Parse()
 
 	verbose = *verboseFlag
@@ -183,6 +199,11 @@ func main() {
 	// Validate mode flag
 	if *modeFlag != "async" && *modeFlag != "sync" && *modeFlag != "block" {
 		exitErr("mode must be 'async', 'sync', or 'block'")
+	}
+
+	// Validate -ka requires mode=block (single mode)
+	if *keepAllFlag && *modeFlag != "block" {
+		exitErr("-ka requires mode=block")
 	}
 
 	// Stats collection window size
@@ -206,7 +227,7 @@ func main() {
 	}
 
 	reqFiles := strings.Split(*listFlag, ",")
-	if len(reqFiles) < 2 {
+	if len(reqFiles) < 2 && *modeFlag != "block" {
 		exitErr("Need at least 2 req files")
 	}
 
@@ -302,7 +323,7 @@ func main() {
 
 		// Create synthetic single group
 		group := createSingleGroup(len(reqFiles), *thrFlag, *modeFlag,
-			loopStart, *loopTimesFlag, syncBarriers, allPatterns)
+			loopStart, *loopTimesFlag, syncBarriers, allPatterns, *keepAllFlag)
 
 		// Block mode forces delay to 0
 		if isBlockMode {
@@ -326,6 +347,30 @@ func main() {
 	runOrchestration(groups, reqFiles, actionPatterns, *univFlag, *fmodeFlag,
 		*hostFlag, *outFlag, *kaFlag, *proxyFlag, *cliFlag, *touFlag,
 		*retryFlag, *httpFlag, *fwFlag, *fbckFlag, *mtlsFlag, *dumpFlag, windowSize, *delayFlag, *dsizeFlag, keySubscriptions)
+}
+
+// validateGroupHost - validates all requests in group target same host:port
+// Returns the common address or error if hosts differ
+func validateGroupHost(reqFiles []string, reqIndices []int, hostFlag string) (string, error) {
+	var expected string
+	for _, idx := range reqIndices {
+		data, err := os.ReadFile(reqFiles[idx])
+		if err != nil {
+			return "", fmt.Errorf("cannot read request file %d: %v", idx+1, err)
+		}
+		req := string(data)
+		req = normalizeReq(req, true)
+		addr, err := parseHost(req, hostFlag)
+		if err != nil {
+			return "", fmt.Errorf("request %d: %v", idx+1, err)
+		}
+		if expected == "" {
+			expected = addr
+		} else if addr != expected {
+			return "", fmt.Errorf("-ka requires same host:port, got %s vs %s", expected, addr)
+		}
+	}
+	return expected, nil
 }
 
 // runOrchestration - unified execution for both single and group modes
@@ -366,6 +411,14 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 
 	for _, g := range groups {
 		isBlockMode := g.Mode == "block"
+
+		// Validate -ka host requirement
+		if g.KeepAll {
+			_, err := validateGroupHost(reqFiles, g.ReqIndices, hostFlag)
+			if err != nil {
+				exitErr(fmt.Sprintf("group %d: %v", g.ID+1, err))
+			}
+		}
 
 		// Determine request delay: block mode forces 0, else group r_delay or default from -d flag
 		reqDelay := defaultDelay
@@ -419,7 +472,7 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 			maxRetries:    retryFlag,
 			httpH2:        httpFlag,
 			valDist:       valDist,
-			fifoWait:      fwFlag && valDist.IsFifo(),
+			fifoWait:      (fwFlag && valDist.IsFifo()) || len(g.Wait2Keys) > 0,
 			fifoBlockSize: fbckFlag,
 			syncBarriers:  g.SyncBarriers,
 			pauseThreads:  make(map[int]bool),
@@ -429,6 +482,7 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 			startDelay:    g.StartDelay,
 			blockMode:     isBlockMode,
 			maxDataSize:   maxDataSize,
+			keepAll:       g.KeepAll,
 		}
 		if isBlockMode {
 			orch.fifoBlockSize = 1
@@ -441,6 +495,12 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 				orch.loopChan = make(chan struct{})
 				orch.loopReadyChan = make(chan int, g.ThreadCount)
 			}
+		}
+
+		// Keep-all mode channels
+		if orch.keepAll {
+			orch.kaReadyChan = make(chan int, g.ThreadCount)
+			orch.kaFlushDone = make(chan struct{})
 		}
 
 		orchs[g.ID] = orch
@@ -469,6 +529,21 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 				stats.SetFifoWaiting(false)
 			}
 
+			// Keep-all mode: dial shared connection on monkey[0] before starting workers
+			if o.keepAll {
+				w := o.monkeys[0]
+				addr, _ := validateGroupHost(w.reqFiles, o.reqIndices, o.hostFlag)
+				w.connAddr = addr
+				if err := o.dialWithRetry(w, addr); err != nil {
+					w.logger.Write(fmt.Sprintf("ERR: shared conn dial: %v\n", err))
+					return
+				}
+				// Copy connAddr to all monkeys
+				for _, m := range o.monkeys[1:] {
+					m.connAddr = addr
+				}
+			}
+
 			// Start workers
 			for _, w := range o.monkeys {
 				go func(w *monkey) {
@@ -477,9 +552,11 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 				}(w)
 			}
 
-			// Run sync orchestration if needed
+			// Run coordination if needed
 			if o.mode == "sync" {
 				o.runSyncOrchestration()
+			} else if o.keepAll {
+				o.runKeepAllOrchestration()
 			}
 		}(orch)
 	}
@@ -498,6 +575,68 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 		fmt.Fprintf(os.Stderr, "TView error: %v\n", err)
 	}
 	defer ui.app.Stop()
+}
+
+// runKeepAllOrchestration - coordinates shared connection flush for -ka mode
+func (o *Orch) runKeepAllOrchestration() {
+	iteration := 0
+	maxIterations := o.loopTimes
+	if o.loopStart < 1 {
+		maxIterations = 1 // no loop, single iteration
+	}
+
+	for {
+		// Check loop limit
+		if maxIterations > 0 && iteration >= maxIterations {
+			if verbose {
+				fmt.Printf("[V] G%d keepAll: iteration limit reached\n", o.groupID+1)
+			}
+			return
+		}
+
+		// Wait for all workers to signal accumulation done
+		readyCount := 0
+		for readyCount < len(o.monkeys) {
+			select {
+			case <-o.quitChan:
+				return
+			case <-o.kaReadyChan:
+				readyCount++
+				if verbose {
+					fmt.Printf("[V] G%d keepAll: accum ready %d/%d\n", o.groupID+1, readyCount, len(o.monkeys))
+				}
+			}
+		}
+
+		// Global flush
+		if err := o.doGlobalFlush(); err != nil {
+			o.monkeys[0].logger.Write(fmt.Sprintf("ERR: global flush: %v\n", err))
+			// Try reconnect
+			if reconnErr := o.reconnectShared(); reconnErr != nil {
+				o.monkeys[0].logger.Write(fmt.Sprintf("ERR: reconnect failed: %v\n", reconnErr))
+				return
+			}
+		}
+
+		// Signal workers flush is done
+		close(o.kaFlushDone)
+
+		iteration++
+
+		// Reset channels for next iteration
+		o.kaIterMu.Lock()
+		o.kaReadyChan = make(chan int, len(o.monkeys))
+		o.kaFlushDone = make(chan struct{})
+		o.kaIteration = iteration
+		o.kaIterMu.Unlock()
+	}
+}
+
+// reconnectShared - reconnects shared connection (called from coordinator)
+func (o *Orch) reconnectShared() error {
+	w := o.monkeys[0]
+	o.closeWorkerConn(w)
+	return o.dialWithRetry(w, w.connAddr)
 }
 
 // runSyncOrchestration - handles sync barrier logic for a group
@@ -639,6 +778,12 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 	}
 
+	// Keep-all mode: run specialized loop
+	if o.keepAll {
+		o.runWorkerKeepAll(w)
+		return
+	}
+
 	// Execute request chain using group's request indices
 	for relIdx, absIdx := range reqIndices {
 		if err := o.processReq(w, relIdx, absIdx); err != nil {
@@ -703,6 +848,71 @@ func (o *Orch) runWorker(w *monkey) {
 				}
 			}
 		}
+	}
+
+	if o.outFlag {
+		filename := fmt.Sprintf("out_%s_g%d_t%d.txt", time.Now().Format("15:04:05"), w.groupID+1, w.localID+1)
+		os.WriteFile(filename, []byte(w.prevResp), 0666)
+		w.logger.Write(fmt.Sprintf("Saved: %s\n", filename))
+	}
+}
+
+// runWorkerKeepAll - specialized worker loop for -ka mode
+func (o *Orch) runWorkerKeepAll(w *monkey) {
+	reqIndices := w.reqIndices
+	iteration := 0
+	maxIterations := o.loopTimes
+	if o.loopStart < 1 {
+		maxIterations = 1
+	}
+
+	for {
+		// Check loop limit
+		if maxIterations > 0 && iteration >= maxIterations {
+			break
+		}
+
+		select {
+		case <-o.quitChan:
+			return
+		default:
+		}
+
+		if iteration > 0 {
+			if o.loopTimes == 0 {
+				w.logger.Write(fmt.Sprintf("\n[Loop %d]\n", iteration))
+			} else {
+				w.logger.Write(fmt.Sprintf("\n[Loop %d/%d]\n", iteration, o.loopTimes))
+			}
+		}
+
+		// Determine start index for this iteration
+		startIdx := 0
+		if iteration > 0 && o.loopStart > 0 {
+			startIdx = o.loopStart - 1
+		}
+
+		// Accumulate requests into blockBuf
+		for relIdx := startIdx; relIdx < len(reqIndices); relIdx++ {
+			absIdx := reqIndices[relIdx]
+			if err := o.processReq(w, relIdx, absIdx); err != nil {
+				w.logger.Write(fmt.Sprintf("ERR: %v\n", err))
+				return
+			}
+		}
+
+		// Signal accumulation done, wait for global flush
+		o.kaReadyChan <- w.id
+		<-o.kaFlushDone
+
+		// Clear non-static buffers for next iteration
+		for k := range w.localBuffer {
+			if len(k) > 0 && k[0] != '_' {
+				delete(w.localBuffer, k)
+			}
+		}
+
+		iteration++
 	}
 
 	if o.outFlag {

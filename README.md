@@ -31,6 +31,7 @@ Sends all requests in a single TCP write operation, exploiting the lowest possib
 - Maximizes request simultaneity at the wire level
 - Bypasses network-level timing variations
 - Ideal for critical race windows under 1ms
+- With [`-ka`](#keep-all-mode--ka): all threads share single TLS connection, enabling true single-packet attacks across entire thread groups
 
 **Rate Limiter & WAF Bypass**
 
@@ -57,6 +58,7 @@ TREM is engineered for minimal overhead and maximum throughput:
 | Key combination & seek | In-place combination generation | O(log<sub>k</sub>v) for v values, k keys |
 | Connection Pooling | Keep-alive with TLS session reuse | O(1) |
 | Key Subscription | Per-key round-robin among subscribers | O(S) where S = subscribers |
+| Keep-All Flush | Concatenate + single write | O(T×R) where T=threads, R=requests |
 
 The architecture eliminates mutex contention through **copy-on-write semantics** and atomic operations, enabling thousands of concurrent requests with sub-millisecond coordination overhead.
 
@@ -93,16 +95,32 @@ go build -ldflags="-s -w" -trimpath
 ## Table of Contents
 
 - [Flags](#flags)
+- [ClientHello Fingerprints](#clienthello-fingerprints--cli)
 - [Operation Modes](#operation-modes)
   - [Async Mode](#async-mode-default)
   - [Sync Mode](#sync-mode)
   - [Block Mode](#block-mode)
+  - [Keep-All Mode](#keep-all-mode--ka)
+  - [Sync Barriers](#sync-barriers--sb)
 - [Thread Groups](#thread-groups--thrg)
+  - [Groups File Format](#groups-file-format)
+  - [Cross-Group Value Sharing](#cross-group-value-sharing)
+  - [NoFifo Groups](#nofifo-groups)
+- [Cross-Group Synchronization](#cross-group-synchronization)
+  - [Wait Keys](#wait-keys-wk)
 - [Regex Patterns File](#regex-patterns-file--re)
 - [Response Actions](#response-actions--ra)
 - [Universal Replacement](#universal-replacement--u)
+  - [Static Mode](#static-mode)
+  - [FIFO Mode](#fifo-mode-dynamic-injection)
+  - [FIFO Distribution Modes](#fifo-distribution-modes--fmode)
+  - [FIFO Key Distribution](#fifo-key-distribution--fkdist)
 - [HTTP/2 Support](#http2-support)
 - [Looping](#looping)
+- [mTLS Support](#mtls-support)
+- [Proxy Support](#proxy-support)
+- [Verbose Mode](#verbose-mode)
+- [Stats Panel](#stats-panel)
 - [UI Controls](#ui-controls)
 - [Examples](#examples)
 
@@ -120,14 +138,15 @@ go build -ldflags="-s -w" -trimpath
 | `-px` | | HTTP proxy URL (e.g., `http://127.0.0.1:8080`) |
 | `-mode` | async | Execution mode: `sync`, `async`, or `block` (see [Operation Modes](#operation-modes)) |
 | `-k` | true | Keep-alive: persist TLS connections across requests |
+| `-ka` | false | Keep-all: share single TLS connection across all threads (requires `mode=block`, see [Keep-All Mode](#keep-all-mode--ka)) |
 | `-x` | -1 | Loop start index (1-based, -1 = no loop, see [Looping](#looping)) |
 | `-xt` | 1 | Loop count (0 = infinite) |
 | `-cli` | 0 | TLS ClientHello fingerprint (see [table below](#clienthello-fingerprints--cli)) |
-| `-tou` | 10000 | TLS handshake timeout in milliseconds |
+| `-tou` | 5000 | TLS handshake timeout in milliseconds |
 | `-retry` | 3 | Max retries on connection/TLS errors |
 | `-v` | false | Verbose debug output (see [Verbose Mode](#verbose-mode)) |
 | `-sw` | 10 | Stats window size (auto-set to 50 if verbose and < 50) |
-| `-http2` | false | Use HTTP/2 (default: HTTP/1.1, see [HTTP/2 Support](#http2-support)) |
+| `-h2` | false | Use HTTP/2 (default: HTTP/1.1, see [HTTP/2 Support](#http2-support)) |
 | `-fw` | true | FIFO wait: block until first value written to named pipe |
 | `-fmode` | 2 | FIFO distribution: 1=Broadcast (all threads), 2=Round-robin |
 | `-fbck` | 64 | FIFO block consumption: max values to drain per request (0=unlimited) |
@@ -181,7 +200,7 @@ Threads synchronize at [barrier points](#sync-barriers--sb) before sending reque
 Accumulates all requests and sends them in a **single TCP write**. This achieves the tightest possible timing window by eliminating network round-trip delays between requests.
 
 ```bash
-./trem -l "r1.txt,r2.txt,r3.txt" -thr 10 -mode block -http2
+./trem -l "r1.txt,r2.txt,r3.txt" -thr 10 -mode block -h2
 ```
 
 **Protocol behavior:**
@@ -193,11 +212,62 @@ Accumulates all requests and sends them in a **single TCP write**. This achieves
 - Ignores `-re` patterns (no inter-request value extraction)
 - Maximum buffer size controlled by `-dsize` (default 4KB)
 - Best for exploiting sub-millisecond race windows
+- With `-ka` flag: all threads share single TLS connection (see [Keep-All Mode](#keep-all-mode--ka))
 
 **Use Cases:**
 - Single-packet attacks where timing is critical
 - Bypassing rate limiters that count requests per TCP segment
 - Testing race conditions in stateless operations
+
+### Keep-All Mode (`-ka`)
+
+Extends block mode by sharing a **single TLS connection across all threads** in a group. Instead of each thread having its own connection, all threads accumulate requests into their local buffers, then a coordinator performs a **global flush** - concatenating all buffers and sending everything in one TCP write.
+
+```bash
+./trem -l "race.txt" -thr 50 -xt 100 -mode block -ka
+```
+
+**Requirements:**
+- Requires `mode=block`
+- All requests in the group must target the same `host:port`
+
+**Flow comparison:**
+```
+Without -ka (normal block):
+  Thread 1: buffer → flush → conn1    (50 connections)
+  Thread 2: buffer → flush → conn2
+  ...
+  Thread 50: buffer → flush → conn50
+
+With -ka:
+  Thread 1: buffer ─┐
+  Thread 2: buffer ─┼→ global flush → single conn (1 connection)
+  ...               │
+  Thread 50: buffer─┘
+```
+
+**Behavior:**
+1. Single TLS handshake for entire group (connection stored in first thread)
+2. Each thread accumulates requests in its local buffer
+3. Coordinator waits for all threads to finish accumulation
+4. Global flush: concatenate all buffers → single TCP write
+5. Read responses in order, dispatch to respective threads
+6. Repeat for each loop iteration (`-xt`)
+
+**Protocol details:**
+- **HTTP/1.1**: All requests concatenated, pipelined in single write
+- **HTTP/2**: All requests encoded as frames with unique stream IDs, multiplexed in single write
+
+**Use Cases:**
+- True single-packet attacks: 50 threads × 100 iterations = 5000 requests through minimal TCP writes
+- Maximum timing precision across thread groups
+- Bypassing per-connection rate limits
+
+**Example:** 100 threads, 50 iterations, all through single connection:
+```bash
+./trem -l "race.txt" -thr 100 -xt 50 -mode block -ka -h2
+```
+Sends 100 × 50 = 5000 requests through a single TLS connection, with each iteration's requests going out in one TCP write (if total size < `-dsize`).
 
 ### Sync Barriers (`-sb`)
 
@@ -248,18 +318,18 @@ Thread groups allow you to define **independent execution units** where differen
 - Multi-phase attacks with different timing requirements
 - Coordinated multi-endpoint race conditions
 
-When `-thrG` is used, the following flags are **ignored** (they're defined per group): `-thr`, `-mode`, `-x`, `-xt`, `-sb`, `-re`
+When `-thrG` is used, the following flags are **ignored** (they're defined per group): `-thr`, `-mode`, `-x`, `-xt`, `-sb`, `-re`, `-ka`
 
 ### Groups File Format
 
 Each line defines one group:
 ```
-req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N,M] [re=file] [nofifo]
+req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N,M] [re=file] [nofifo] [ka] [wk=_key1,_key2]
 ```
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `req_indices` | Yes | Comma-separated 1-based request indices (e.g., `1,3,5`) |
+| `req_indices` | Yes | Comma-separated 1-based request indices (e.g., `1,3,5`) - can overlap between groups |
 | `thr=N` | Yes | Thread count for this group |
 | `mode=` | Yes | `sync`, `async`, or `block` |
 | `s_delay=N` | Yes | Start delay in ms (delay before starting group threads) |
@@ -269,8 +339,12 @@ req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N
 | `sb=N,M` | No | Sync barriers (1-based, relative to group) |
 | `re=file` | No | Regex patterns file for this group |
 | `nofifo` | No | Boolean flag - group doesn't receive FIFO values (see [NoFifo Groups](#nofifo-groups)) |
+| `ka` | No | Boolean flag - share single TLS connection across all threads (requires `mode=block`, see [Keep-All Mode](#keep-all-mode--ka)) |
+| `wk=_k1,_k2` | No | Wait keys - block until these static keys exist (see [Cross-Group Synchronization](#cross-group-synchronization)) |
 
 > **Note**: `mode=block` ignores `r_delay` and `re=` parameters.
+
+> **Note**: Request indices can be **duplicated across groups**, allowing different groups to process the same request with different configurations.
 
 ### Groups File Example
 
@@ -320,6 +394,92 @@ Groups with `nofifo` flag don't participate in FIFO value distribution. Their th
 ```
 
 Group 1 extracts `$_session$` which Group 2 uses, but Group 1 threads don't waste channel capacity receiving FIFO values they don't need.
+
+## Cross-Group Synchronization
+
+The `wk=` (wait keys) parameter enables fine-grained synchronization between thread groups by blocking a group until specific static keys become available in `globalStaticVals`.
+
+### Wait Keys (`wk=`)
+
+When a group has `wk=_key1,_key2,...`, all threads in that group will **wait indefinitely** for those keys to appear before processing requests that need them. This creates a dependency chain between groups.
+
+**Format:** Comma-separated list of static keys (must start with `_`)
+
+```
+# groups.txt
+# Group 1: Auth flow - extracts _vtoken from response
+1,2 thr=1 mode=sync s_delay=0 re=auth.txt
+
+# Group 2: Exploit - waits for _vtoken, then races
+3 thr=50 mode=block s_delay=100 xt=100 ka wk=_vtoken
+```
+
+**Flow:**
+```
+Group 1: r1 → r2 → extracts _vtoken → globalStaticVals.Store("_vtoken", "eyJ...")
+                        ↓
+Group 2: [blocked waiting _vtoken]
+                        ↓
+Group 2: _vtoken available → r3 × 50 threads × 100 iterations
+```
+
+**Key characteristics:**
+- Only static keys (`_key`) can be waited on
+- Wait is infinite (no timeout) for keys in `wk=` list
+- Multiple keys can be specified: `wk=_token,_session,_csrf`
+- Group starts processing only after ALL wait keys exist
+
+### Use Cases
+
+**1. Dependent authentication flows:**
+```
+# r1: initial login (uses initial _token from -u)
+# r2: refresh token (extracts new _vtoken)
+# r3: exploit action (needs _vtoken from r2)
+
+1,2 thr=1 mode=sync s_delay=0 re=rx.txt
+3 thr=100 mode=block s_delay=0 xt=50 ka wk=_vtoken
+```
+
+**2. Multi-phase coordinated attacks:**
+```
+# Phase 1: Setup - extracts _session and _csrf
+1,2 thr=5 mode=async s_delay=0 re=setup.txt
+
+# Phase 2: Wait for setup, then race (waits for _session AND _csrf)
+3,4,5 thr=50 mode=sync s_delay=0 sb=1 wk=_session,_csrf
+```
+
+**3. Shared request with different tokens:**
+```
+# Same request (r1) used in both groups, but with different tokens
+
+# Group 1: Uses initial token, extracts new token
+1,2 thr=1 mode=async s_delay=0 re=auth.txt
+
+# Group 2: Same r1 but waits for extracted token
+1 thr=50 mode=block s_delay=100 xt=100 ka wk=_newtoken
+```
+
+### Combining `wk=` with `ka`
+
+The most powerful combination for race condition attacks:
+
+```
+# groups.txt
+1,2 thr=1 mode=sync s_delay=0 re=rx.txt
+3 thr=100 mode=block s_delay=500 xt=50 ka wk=_vtoken
+```
+
+```bash
+./trem -l "login.txt,refresh.txt,exploit.txt" -thrG groups.txt -u "_token=eyJ..."
+```
+
+**Result:**
+1. Group 1 authenticates and extracts `_vtoken`
+2. Group 2 waits for `_vtoken`
+3. Group 2 sends 100 × 50 = 5000 exploit requests through single TLS connection
+4. Each iteration's 100 requests sent in one TCP write (true single-packet attack)
 
 ## Regex Patterns File (`-re`)
 
@@ -413,6 +573,8 @@ Provides dynamic value injection into requests via static assignment or FIFO pip
 ```
 
 Replaces every `$token$` in all requests with `abc123`.
+
+> **Note**: Values extracted by regex patterns (via `-re`) take priority over `-u` static values. This allows `-u` to provide initial values that can be overridden by extracted values in subsequent requests or loops.
 
 ### FIFO Mode (Dynamic Injection)
 
@@ -566,7 +728,7 @@ Where T = total threads, S = subscribers for that key (typically S << T).
 TREM supports HTTP/2 natively with a handcrafted protocol implementation. Request files remain in HTTP/1.1 raw format - TREM automatically converts them to HTTP/2 frames.
 
 ```bash
-./trem -l "req1.txt,req2.txt" -re patterns.txt -http2 -thr 10 -mode sync
+./trem -l "req1.txt,req2.txt" -re patterns.txt -h2 -thr 10 -mode sync
 ```
 
 **Conversion process:**
@@ -590,6 +752,7 @@ TREM supports HTTP/2 natively with a handcrafted protocol implementation. Reques
 - Testing HTTP/2-specific race conditions
 - Leveraging multiplexed streams on single connection
 - Block mode attacks (better server compatibility than HTTP/1.1 pipelining)
+- Keep-All mode (`-ka`) for maximum single-connection throughput
 
 ## Looping
 
@@ -696,8 +859,14 @@ The UI displays a **TreeView** on the left showing all groups and their threads.
 
 **Single-packet attack (block mode with HTTP/2):**
 ```bash
-./trem -l "r1.txt,r2.txt,r3.txt" -thr 10 -mode block -http2
+./trem -l "r1.txt,r2.txt,r3.txt" -thr 10 -mode block -h2
 ```
+
+**True single-packet attack (keep-all with HTTP/2):**
+```bash
+./trem -l "race.txt" -thr 100 -xt 50 -mode block -ka -h2
+```
+Sends 100 × 50 = 5000 requests through single TLS connection, each iteration in one TCP write.
 
 **Multi-barrier sync race:**
 ```bash
@@ -716,7 +885,7 @@ The UI displays a **TreeView** on the left showing all groups and their threads.
 
 **HTTP/2 race condition with evidence collection:**
 ```bash
-./trem -l "req1.txt,req2.txt" -re patterns.txt -http2 -thr 10 -mode sync -ra actions.txt
+./trem -l "req1.txt,req2.txt" -re patterns.txt -h2 -thr 10 -mode sync -ra actions.txt
 ```
 
 **Fire & Forget with selective response reading:**
@@ -750,6 +919,28 @@ The UI displays a **TreeView** on the left showing all groups and their threads.
 ./trem -l "login.txt,setup.txt,spray.txt" -thrG groups.txt -u /tmp/fifo -fmode 2
 # Group 1: Auth only, doesn't need FIFO values
 # Group 2: Spray with all 100 threads receiving passwords via round-robin
+```
+
+**Cross-group synchronization with wait keys:**
+```bash
+# groups.txt:
+# 1,2 thr=1 mode=sync s_delay=0 re=auth.txt
+# 3 thr=100 mode=block s_delay=100 xt=50 ka wk=_vtoken
+
+./trem -l "login.txt,refresh.txt,exploit.txt" -thrG groups.txt -u "_token=eyJ..."
+# Group 1: Auth flow extracts _vtoken
+# Group 2: Waits for _vtoken, then races with 100×50=5000 requests via single connection
+```
+
+**Shared request across groups with different configs:**
+```bash
+# groups.txt:
+# 1,2 thr=1 mode=async s_delay=0 re=auth.txt
+# 1 thr=50 mode=block s_delay=500 xt=100 ka wk=_session
+
+./trem -l "action.txt,setup.txt" -thrG groups.txt
+# Group 1: Uses r1 (action.txt) with initial auth, extracts _session
+# Group 2: Same r1 but with extracted _session, races 50×100 times
 ```
 
 **mTLS with client certificate:**
@@ -790,6 +981,24 @@ The UI displays a **TreeView** on the left showing all groups and their threads.
 ./trem -l "login.txt,setup.txt,exploit.txt" -re patterns.txt \
   -thr 50 -mode sync -sb 1,3 -x 2 -xt 0 \
   -ra actions.txt
+```
+
+With `actions.txt`:
+```
+3:"exploited"\s*:\s*true`:sa("/tmp/poc.txt"), pa("SUCCESS!"), e
+```
+
+**Complete exploitation with keep-all and wait keys:**
+```bash
+# 1. Auth and extract token in Group 1
+# 2. Race exploit with keep-all in Group 2
+# 3. Auto-save evidence and exit on success
+
+# groups.txt:
+# 1,2 thr=1 mode=sync s_delay=0 re=auth.txt
+# 3 thr=50 mode=block s_delay=100 xt=0 ka wk=_token
+
+./trem -l "login.txt,setup.txt,exploit.txt" -thrG groups.txt -ra actions.txt
 ```
 
 With `actions.txt`:

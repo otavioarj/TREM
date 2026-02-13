@@ -24,13 +24,15 @@ type ThreadGroup struct {
 	Patterns      [][]pattern  // loaded patterns for group transitions
 	StartThreadID int          // first global threadID for this group
 	NoFifo        bool         // whether this group does NOT need FIFO access
+	KeepAll       bool         // -ka: share single TLS connection across all threads (block mode only)
+	Wait2Keys     []string     // wk= static keys to wait indefinitely (no timeout)
 }
 
 // createSingleGroup - creates synthetic ThreadGroup for single mode (no -thrG)
 // Used to unify execution path between single and group modes
 func createSingleGroup(reqCount, threadCount int, mode string,
 	loopStart, loopTimes int, syncBarriers map[int]bool,
-	patterns [][]pattern) *ThreadGroup {
+	patterns [][]pattern, keepAll bool) *ThreadGroup {
 
 	// Build request indices (all requests)
 	reqIndices := make([]int, reqCount)
@@ -50,6 +52,7 @@ func createSingleGroup(reqCount, threadCount int, mode string,
 		SyncBarriers:  syncBarriers,
 		Patterns:      patterns,
 		StartThreadID: 0,
+		KeepAll:       keepAll,
 	}
 }
 
@@ -64,7 +67,7 @@ func parseGroupsFile(path string, totalReqs int, httpH2 bool) ([]*ThreadGroup, e
 
 	lines := strings.Split(string(data), "\n")
 	var groups []*ThreadGroup
-	usedIndices := make(map[int]int) // reqIndex -> groupID (for duplicate detection)
+	usedIndices := make(map[int]int) // reqIndex -> groupID (coverage req index detection)
 	groupID := 0
 
 	for lineNum, line := range lines {
@@ -79,12 +82,8 @@ func parseGroupsFile(path string, totalReqs int, httpH2 bool) ([]*ThreadGroup, e
 			return nil, err
 		}
 
-		// Check for duplicate indices
+		// Track indices (allow duplicates across groups)
 		for _, idx := range group.ReqIndices {
-			if existingGroup, exists := usedIndices[idx]; exists {
-				return nil, fmt.Errorf("line %d: request index %d already used in group %d",
-					lineNum+1, idx+1, existingGroup+1)
-			}
 			usedIndices[idx] = groupID
 		}
 
@@ -235,6 +234,22 @@ func parseGroupLine(line string, groupID, lineNum int, httpH2 bool) (*ThreadGrou
 		case "nofifo":
 			group.NoFifo = true
 
+		case "ka":
+			group.KeepAll = true
+
+		case "wk":
+			keys := strings.Split(value, ",")
+			for _, k := range keys {
+				k = strings.TrimSpace(k)
+				if len(k) == 0 {
+					continue
+				}
+				if k[0] != '_' {
+					return nil, fmt.Errorf("line %d: wk keys must start with _ (got %s)", lineNum, k)
+				}
+				group.Wait2Keys = append(group.Wait2Keys, k)
+			}
+
 		default:
 			return nil, fmt.Errorf("line %d: unknown parameter '%s'", lineNum, key)
 		}
@@ -249,6 +264,11 @@ func parseGroupLine(line string, groupID, lineNum int, httpH2 bool) (*ThreadGrou
 	}
 	if !foundSDelay {
 		return nil, fmt.Errorf("line %d: missing required parameter 's_delay'", lineNum)
+	}
+
+	// Validate ka requires block mode
+	if group.KeepAll && group.Mode != "block" {
+		return nil, fmt.Errorf("line %d: ka requires mode=block", lineNum)
 	}
 
 	// If xt is set without x, default x=1 (loop from first request)
@@ -369,8 +389,13 @@ func formatGroupsSummary(groups []*ThreadGroup) string {
 			loopStr = "∞"
 		}
 
-		lines = append(lines, fmt.Sprintf("G%d: %s T:%d [%s] x%d→%s",
-			g.ID+1, g.Mode, g.ThreadCount,
+		kaStr := ""
+		if g.KeepAll {
+			kaStr = " KA"
+		}
+
+		lines = append(lines, fmt.Sprintf("G%d: %s%s T:%d [%s] x%d→%s",
+			g.ID+1, g.Mode, kaStr, g.ThreadCount,
 			strings.Join(reqNames, ","),
 			g.LoopStart, loopStr))
 	}
