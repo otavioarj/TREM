@@ -12,13 +12,14 @@ import (
 
 // Action types for response actions
 const (
-	ActionPrintThread      = iota // pt - print in thread
-	ActionPrintPauseThread        // ppt - print + pause thread
-	ActionPrintAll                // pa - print all + pause all
-	ActionSaveReq                 // sre - save request + pause thread
-	ActionSaveResp                // srp - save response + pause thread
-	ActionSaveAll                 // sa - save both + pause thread
-	ActionExit                    // e - graceful exit
+	ActionPrintThread     = iota // prt - print in thread
+	ActionPrintAll               // pra - print all
+	ActionSaveReq                // sre - save request
+	ActionSaveResp               // srp - save response
+	ActionSaveAll                // sa - save both
+	ActionPauseThread            // pt - pause thread
+	ActionPauseAllThreads        // pat - pause all threads
+	ActionExit                   // e - graceful exit
 )
 
 type respAction struct {
@@ -382,7 +383,7 @@ func loadActionPatterns(path string) (map[int]*actionPattern, error) {
 	return result, nil
 }
 
-// parseActions - parses "pt("msg"),sre("/path"),e" into []respAction
+// parseActions - parses "prt("msg"),sre("/path")" etc. into []respAction
 func parseActions(s string) ([]respAction, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -408,15 +409,11 @@ func parseActions(s string) ([]respAction, error) {
 		var consumed int
 
 		switch {
-		case strings.HasPrefix(s[i:], "pt("):
+		case strings.HasPrefix(s[i:], "prt("):
 			actionType = ActionPrintThread
 			needsArg = true
 			consumed = 3
-		case strings.HasPrefix(s[i:], "ppt("):
-			actionType = ActionPrintPauseThread
-			needsArg = true
-			consumed = 4
-		case strings.HasPrefix(s[i:], "pa("):
+		case strings.HasPrefix(s[i:], "pra("):
 			actionType = ActionPrintAll
 			needsArg = true
 			consumed = 3
@@ -432,6 +429,14 @@ func parseActions(s string) ([]respAction, error) {
 			actionType = ActionSaveAll
 			needsArg = true
 			consumed = 3
+		case strings.HasPrefix(s[i:], "pt"):
+			actionType = ActionPauseThread
+			needsArg = false
+			consumed = 1
+		case strings.HasPrefix(s[i:], "pat"):
+			actionType = ActionPauseAllThreads
+			needsArg = false
+			consumed = 1
 		case s[i] == 'e':
 			actionType = ActionExit
 			needsArg = false

@@ -546,9 +546,10 @@ Where:
 
 | Action | Description |
 |--------|-------------|
-| `pt("msg")` | Print message to the matching thread's tab (no pause) |
-| `ppt("msg")` | Print message to the matching thread's tab and pause that thread |
-| `pa("msg")` | Print message to ALL thread tabs and pause ALL threads |
+| `prt("msg")` | Print message to the matching thread's tab  |
+| `pra("msg")` | Print message to ALL thread tabs on first matching |
+| `pt`         | Pause the matching thread (Enter to continue) |
+| `pat`        | Pause ALL thread (Enter to continue)  |
 | `sre("path")` | Save the request that generated the match to file and pause thread |
 | `srp("path")` | Save the response that generated the match to file and pause thread |
 | `sa("path")` | Save both request and response to file and pause thread |
@@ -558,7 +559,7 @@ Where:
 
 ```
 # actions.txt
-2,3:"success":true`:sa("/tmp/poc.txt"), pa("EXPLOITED!"), e
+2,3:"success":true`:sa("/tmp/poc.txt"), pra("EXPLOITED!"),pat e
 ```
 
 When response 2 or 3 contains `"success":true`:

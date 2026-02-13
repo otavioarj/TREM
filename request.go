@@ -825,20 +825,22 @@ func (o *Orch) applyResponseActions(w *monkey, idx int, req, resp, status string
 	for _, action := range ap.actions {
 		switch action.actionType {
 		case ActionPrintAll:
-			// Broadcast message to all threads and pause all
+			// Broadcast message to all threads
 			msg := fmt.Sprintf("\n>>> RA (r%d) T%d: %s <<<\n", idx+1, w.id+1, action.arg)
 			o.uiManager.BroadcastMessage(msg)
-			o.pauseAllThreads()
-			o.checkPause(w)
 
 		case ActionPrintThread:
 			// Print to this thread only
 			w.logger.Write(fmt.Sprintf(">>> RA: %s <<<\n", action.arg))
 
-		case ActionPrintPauseThread:
-			// Print to this thread only AND pause it
-			w.logger.Write(fmt.Sprintf(">>> RA: %s <<<\n", action.arg))
+		case ActionPauseThread:
+			// Pause current thread
 			o.pauseThread(w.id)
+			o.checkPause(w)
+
+		case ActionPauseAllThreads:
+			// Pause ALL threads
+			o.pauseAllThreads()
 			o.checkPause(w)
 
 		case ActionSaveReq:
@@ -848,8 +850,6 @@ func (o *Orch) applyResponseActions(w *monkey, idx int, req, resp, status string
 			} else {
 				w.logger.Write(fmt.Sprintf("RA saved req to: %s\n", action.arg))
 			}
-			o.pauseThread(w.id)
-			o.checkPause(w)
 
 		case ActionSaveResp:
 			// Save response that generated match
@@ -858,8 +858,6 @@ func (o *Orch) applyResponseActions(w *monkey, idx int, req, resp, status string
 			} else {
 				w.logger.Write(fmt.Sprintf("RA saved resp to: %s\n", action.arg))
 			}
-			o.pauseThread(w.id)
-			o.checkPause(w)
 
 		case ActionSaveAll:
 			// Save both request and response
@@ -869,8 +867,6 @@ func (o *Orch) applyResponseActions(w *monkey, idx int, req, resp, status string
 			} else {
 				w.logger.Write(fmt.Sprintf("RA saved req+resp to: %s\n", action.arg))
 			}
-			o.pauseThread(w.id)
-			o.checkPause(w)
 
 		case ActionExit:
 			// Graceful exit - close quitChan to signal all workers
