@@ -76,6 +76,10 @@ go build
 # Release build :)
 go build -ldflags="-s -w" -trimpath
 ```
+# Notes:
+* Linux ARM64 build runs on Android too :)
+* Windows doesn't support FIFO mode yet :(
+
 
 ## Usage
 
