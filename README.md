@@ -547,12 +547,12 @@ Where:
 | Action | Description |
 |--------|-------------|
 | `prt("msg")` | Print message to the matching thread's tab  |
-| `pra("msg")` | Print message to ALL thread tabs on first matching |
+| `pra("msg")` | Print message to ALL threads tabs on first matching |
 | `pt`         | Pause the matching thread (Enter to continue) |
 | `pat`        | Pause ALL thread (Enter to continue)  |
-| `sre("path")` | Save the request that generated the match to file and pause thread |
-| `srp("path")` | Save the response that generated the match to file and pause thread |
-| `sa("path")` | Save both request and response to file and pause thread |
+| `sre("path")` | Save the request that generated the match to file  |
+| `srp("path")` | Save the response that generated the match to file  |
+| `sa("path")` | Save both request and response to file |
 | `e` | Graceful exit (always use as last action if combined) |
 
 ### Example
