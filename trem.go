@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.7.7"
+var version = "v1.7.8"
 
 // Global flags
 var verbose bool
@@ -445,6 +445,7 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 				actionPatterns: actionPatterns,
 				valChan:        valDist.GetThreadChan(globalID),
 				localBuffer:    make(map[string][]string),
+				wait2Keys:      g.Wait2Keys,
 			}
 
 			// Block mode: set patterns to nil to skip pattern extraction

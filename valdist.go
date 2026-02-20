@@ -84,6 +84,11 @@ func NewValDist(path string, popMode int, fifoThreadIDs []int, keySubscriptions 
 
 	emptyKV := [2]string{"", ""}
 	d.lastKV.Store(&emptyKV)
+
+	if path == "" {
+		d.hasData.Store(true)
+		close(d.firstData)
+	}
 	return d
 }
 

@@ -1,0 +1,7 @@
+POST /api/login HTTP/1.1
+Host: localhost
+User-Agent: TREM/1.0
+Accept: application/json
+Content-Type: application/json
+
+{"username":"bob","password":"bob123"}

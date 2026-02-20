@@ -241,8 +241,22 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	// Phase 5: check for missing keys in FIFO buffer and globalStatic
 	missing := checkMissingKeys(w.localBuffer, keys)
 	if len(missing) > 0 {
-		if o.fifoWait {
-			// Replaces globalStatic replacing on-the-go
+		// Check if any missing key is in wait2Keys (wk=)
+		hasWaitKey := false
+		for _, m := range missing {
+			for _, wk := range w.wait2Keys {
+				if m == wk {
+					hasWaitKey = true
+					break
+				}
+			}
+			if hasWaitKey {
+				break
+			}
+		}
+
+		if o.fifoWait || hasWaitKey {
+			// Wait for keys: -fw flag OR wk= match triggers wait
 			if !waitForKeys(w, keys, values, o.fifoBlockSize, o.quitChan) {
 				return fmt.Errorf("FIFO timeout waiting for keys: %s", strings.Join(missing, ", "))
 			}
@@ -282,7 +296,8 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	}
 
 	// consume used values
-	consumeValues(w.localBuffer, keys, o.fifoBlockSize)
+	consumeValues(w.localBuffer, keys, len(combinations))
+
 	return nil
 }
 

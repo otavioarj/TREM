@@ -1,0 +1,8 @@
+#Conf template:
+## 1,...,n (req indices) thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=1,..,n] [re=file] [nofifo] [ka] [wk=_k1,..,_kn]
+
+# Group 1: Authentication - extracts $_token$
+1 thr=1 mode=async s_delay=0 re=auth.txt nofifo
+
+# Group 2: Attack - WAITS for $_token$ before starting!
+2,3 thr=100 mode=block s_delay=500 xt=10 ka wk=_token

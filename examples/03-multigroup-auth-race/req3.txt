@@ -1,0 +1,4 @@
+GET /api/stats HTTP/1.1
+Host: localhost
+User-Agent: TREM/1.0
+Accept: application/json

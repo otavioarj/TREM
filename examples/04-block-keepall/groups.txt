@@ -1,0 +1,9 @@
+#Conf template:
+## 1,...,n (req indices) thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=1,..,n] [re=file] [nofifo] [ka] [wk=_k1,..,_kn]
+
+# Group 1: Authentication (single thread)
+1 thr=1 mode=async s_delay=0 re=auth.txt
+
+# Group 2: True single-packet attack with keep-all
+# All 20 threads share ONE TCP connection!
+2,3 thr=20 mode=block s_delay=200 xt=5 ka

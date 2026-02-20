@@ -1,0 +1,2 @@
+# Group 1 regex: Extract token from login
+"token": *"([^"]+)"`:_token

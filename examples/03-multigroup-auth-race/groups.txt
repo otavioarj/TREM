@@ -1,0 +1,10 @@
+#Conf template:
+## 1,...,n (req indices) thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=1,..,n] [re=file] [nofifo] [ka] [wk=_k1,..,_kn]
+
+# Group 1: Authentication (1 thread, async, extracts token)
+# Starts immediately, runs login once
+1 thr=1 mode=async s_delay=0 re=auth.txt
+
+# Group 2: Race attack (10 threads, sync mode, barrier on transfer)
+# Starts 200ms later (after auth completes), loops 5 times
+2,3 thr=10 mode=sync s_delay=200 sb=1 xt=5

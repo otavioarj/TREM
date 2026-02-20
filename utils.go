@@ -412,11 +412,11 @@ func parseActions(s string) ([]respAction, error) {
 		case strings.HasPrefix(s[i:], "prt("):
 			actionType = ActionPrintThread
 			needsArg = true
-			consumed = 3
+			consumed = 4
 		case strings.HasPrefix(s[i:], "pra("):
 			actionType = ActionPrintAll
 			needsArg = true
-			consumed = 3
+			consumed = 4
 		case strings.HasPrefix(s[i:], "sre("):
 			actionType = ActionSaveReq
 			needsArg = true
@@ -432,11 +432,11 @@ func parseActions(s string) ([]respAction, error) {
 		case strings.HasPrefix(s[i:], "pt"):
 			actionType = ActionPauseThread
 			needsArg = false
-			consumed = 1
+			consumed = 2
 		case strings.HasPrefix(s[i:], "pat"):
 			actionType = ActionPauseAllThreads
 			needsArg = false
-			consumed = 1
+			consumed = 3
 		case s[i] == 'e':
 			actionType = ActionExit
 			needsArg = false

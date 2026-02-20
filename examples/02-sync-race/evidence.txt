@@ -1,0 +1,17 @@
+=== REQUEST ===
+POST /api/transfer HTTP/1.1
+Host: localhost
+User-Agent: TREM/1.0
+Accept: application/json
+Content-Type: application/json
+Authorization: Bearer tok_1c2a90d7ad0247d9
+Content-Length: 37
+
+{"amount":500,"to":"attacker_wallet"}
+
+=== RESPONSE ===
+Content-Type: application/json
+Content-Length: 119
+Connection: keep-alive
+
+{"status": "success", "transactionId": "TX1771530820486102", "amount": 500, "newBalance": 500, "to": "attacker_wallet"}

@@ -1,0 +1,2 @@
+# Response Action: Detect successful exploit
+2:"status": *"success"`:prt("TRANSFER SUCCESS!"),sa("evidence.txt")

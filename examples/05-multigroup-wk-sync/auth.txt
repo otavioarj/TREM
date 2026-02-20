@@ -1,0 +1,2 @@
+# Extract token from login response
+"token": *"([^"]+)"`:_token

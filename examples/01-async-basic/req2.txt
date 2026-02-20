@@ -1,0 +1,8 @@
+POST /api/transfer HTTP/1.1
+Host: localhost
+User-Agent: TREM/1.0
+Accept: application/json
+Content-Type: application/json
+Authorization: Bearer $_token$
+
+{"amount":100,"to":"savings_account"}
