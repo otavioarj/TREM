@@ -96,9 +96,6 @@ go build -ldflags="-s -w" -trimpath
 ## Demo
 ![Demo](NullByte-2025/vid.gif)
 
-### Examples scenarios
-[Check here examples with confg templates :)](examples/README.md)
-
 ## Table of Contents
 
 - [Flags](#flags)
@@ -859,6 +856,8 @@ Real-time metrics in the UI, it uses a windows of events (`-sw`) to control how 
 The UI displays a **TreeView** on the left showing all groups and their threads. Click or navigate to select a thread and view its output.
 
 ## Examples
+
+[Here](examples/README.md) are examples with config templates to test locally. The following cmd line examples cover briefly TREM attack scenarios.
 
 **Basic race condition (sync mode):**
 ```bash
