@@ -23,7 +23,8 @@ sudo python3 server.py
 The server runs by default on port 443 and requires root/sudo for privileged port, to run 
 without root, use:
 
-```python server.py [port]
+```bash
+python server.py [port]
 ```
 On first run, it generates a self-signed certificate (server.crt, server.key).
 

@@ -94,7 +94,8 @@ go build -ldflags="-s -w" -trimpath
 ```
 
 ## Demo
-![Demo](NullByte-2025/vid.mp4)
+<video src="NullByte-2025/vid.mp4" controls width="800"></video>
+
 
 ### Examples scenarios
 [Check here examples with confg templates :)](examples/README.md)
