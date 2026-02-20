@@ -1,6 +1,6 @@
 # TREM Examples
 
-This directory contains 6 examples demonstrating TREM's parameters and capabilities 
+This directory contains 55555 examples demonstrating TREM's parameters and capabilities 
 across different modes and configurations. Configuration files from examples can be used
 as template for other scenarios :).
 
