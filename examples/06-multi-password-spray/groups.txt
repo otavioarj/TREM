@@ -1,0 +1,8 @@
+#Conf template:
+# 1,...,n (req indices) thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=1,..,n] [re=file] [nofifo] [ka] [wk=_k1,..,_kn]
+
+# G1: Attack admin user with req1.txt
+1 thr=2 mode=async s_delay=0 xt=4
+
+# G2: Attack alice user with req2.txt  
+2 thr=2 mode=async s_delay=0 xt=4

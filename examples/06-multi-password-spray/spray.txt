@@ -1,0 +1,8 @@
+pass=password
+123456
+admin
+letmein
+admin123
+alice123
+qwerty
+password123

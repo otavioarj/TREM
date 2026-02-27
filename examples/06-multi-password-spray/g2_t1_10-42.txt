@@ -1,0 +1,26 @@
+Val pass: password
+Conn-Keep (r2): localhost:443
+HTTP (r2) 401
+
+[Loop 1/4]
+Val pass: 123456
+HTTP (r2) 401
+
+[Loop 2/4]
+Val pass: admin
+HTTP (r2) 401
+
+[Loop 3/4]
+Val pass: letmein
+HTTP (r2) 401
+
+[Loop 4/4]
+Val pass: admin123
+HTTP (r2) 401
+
+>>> RA (r1) T1: LOGIN SUCCESS! <<<
+
+>>> RA (r1) T2: LOGIN SUCCESS! <<<
+
+=== All requests completed ===
+Press Q to quit, Ctrl+P:Groups, Tab:Threads

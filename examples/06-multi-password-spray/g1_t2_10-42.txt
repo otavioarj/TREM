@@ -1,0 +1,28 @@
+Val pass: password
+Conn-Keep (r1): localhost:443
+
+>>> RA (r1) T1: LOGIN SUCCESS! <<<
+HTTP (r1) 401
+
+[Loop 1/4]
+Val pass: 123456
+HTTP (r1) 401
+
+[Loop 2/4]
+Val pass: admin
+HTTP (r1) 401
+
+[Loop 3/4]
+Val pass: letmein
+HTTP (r1) 401
+
+[Loop 4/4]
+Val pass: admin123
+HTTP (r1) 200
+RA matched (r1): ["token": "tok_8050fa1b55a54915"]
+
+>>> RA (r1) T2: LOGIN SUCCESS! <<<
+RA saved req+resp to: evidence.txt
+
+=== All requests completed ===
+Press Q to quit, Ctrl+P:Groups, Tab:Threads

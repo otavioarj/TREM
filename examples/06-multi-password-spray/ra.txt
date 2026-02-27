@@ -1,0 +1,2 @@
+# Detect successful login and save evidence
+1,2:"token": *"[^"]+"`: pra("LOGIN SUCCESS!"),sa("evidence.txt")

@@ -1,0 +1,22 @@
+Val pass: password
+Conn-Keep (r1): localhost:443
+HTTP (r1) 401
+
+[Loop 1/4]
+Val pass: 123456
+HTTP (r1) 401
+
+[Loop 2/4]
+Val pass: admin
+HTTP (r1) 401
+
+[Loop 3/4]
+Val pass: letmein
+HTTP (r1) 401
+
+[Loop 4/4]
+Val pass: admin123
+HTTP (r1) 401
+
+=== All requests completed ===
+Press Q to quit, Ctrl+P:Groups, Tab:Threads
