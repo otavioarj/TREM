@@ -364,6 +364,7 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 	w.blockOffsets = append(w.blockOffsets, len(w.blockBuf))
 	w.blockAbsIdx = append(w.blockAbsIdx, absIdx)
 	w.blockBuf = append(w.blockBuf, req...)
+	w.blockBuf = append(w.blockBuf, '\r', '\n') 
 
 	// keepAll mode: never flush here, coordinator handles it
 	if o.keepAll {

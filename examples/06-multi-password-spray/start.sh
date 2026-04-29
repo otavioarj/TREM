@@ -35,7 +35,7 @@ cat spray.txt > "$FIFO" &
     -u "$FIFO" \
     -fmode 1 \
     -fbck 1 \
-    -ra ra.txt -dump
+    -ra ra.txt 
 
 
 

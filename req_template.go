@@ -166,7 +166,7 @@ func normalizeReq(req string, blockMode bool) string {
 	hasTransferEnc := false
 	hasConn := false
 	contentLenIdx := -1
-	connKeep := "Connection: keep-alive\r\n"
+	connKeep := "Connection: keep-alive"
 
 	for _, line := range headerLines {
 		line = strings.TrimRight(line, "\r")
