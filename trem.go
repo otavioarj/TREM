@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.7.9"
+var version = "v1.8.0"
 
 // Global flags
 var verbose bool
@@ -760,6 +760,14 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 	}()
 
+	if o.outFlag {
+		defer func() {
+			filename := fmt.Sprintf("out_%s_g%d_t%d.txt", time.Now().Format("15:04:05"), w.groupID+1, w.localID+1)
+			os.WriteFile(filename, []byte(w.prevResp), 0666)
+			w.logger.Write(fmt.Sprintf("Saved: %s\n", filename))
+		}()
+	}
+
 	// Use reqIndices to determine which requests to process
 	reqIndices := w.reqIndices
 	if len(reqIndices) == 0 {
@@ -852,11 +860,6 @@ func (o *Orch) runWorker(w *monkey) {
 		}
 	}
 
-	if o.outFlag {
-		filename := fmt.Sprintf("out_%s_g%d_t%d.txt", time.Now().Format("15:04:05"), w.groupID+1, w.localID+1)
-		os.WriteFile(filename, []byte(w.prevResp), 0666)
-		w.logger.Write(fmt.Sprintf("Saved: %s\n", filename))
-	}
 }
 
 // runWorkerKeepAll - specialized worker loop for -ka mode
@@ -866,6 +869,14 @@ func (o *Orch) runWorkerKeepAll(w *monkey) {
 	maxIterations := o.loopTimes
 	if o.loopStart < 1 {
 		maxIterations = 1
+	}
+
+	if o.outFlag {
+		defer func() {
+			filename := fmt.Sprintf("out_%s_g%d_t%d.txt", time.Now().Format("15:04:05"), w.groupID+1, w.localID+1)
+			os.WriteFile(filename, []byte(w.prevResp), 0666)
+			w.logger.Write(fmt.Sprintf("Saved: %s\n", filename))
+		}()
 	}
 
 	for {
@@ -915,12 +926,6 @@ func (o *Orch) runWorkerKeepAll(w *monkey) {
 		}
 
 		iteration++
-	}
-
-	if o.outFlag {
-		filename := fmt.Sprintf("out_%s_g%d_t%d.txt", time.Now().Format("15:04:05"), w.groupID+1, w.localID+1)
-		os.WriteFile(filename, []byte(w.prevResp), 0666)
-		w.logger.Write(fmt.Sprintf("Saved: %s\n", filename))
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -94,7 +95,7 @@ func readHTTP1Resp(threadID int, reader *bufio.Reader) (resp, status string, byt
 	if statusCode >= 400 {
 		stats.ReportHTTPError(threadID, statusCode)
 	}
-
+	sb.WriteString(line)
 	bytesIn += len(line)
 
 	for {
@@ -186,21 +187,108 @@ func readHTTP1Resp(threadID int, reader *bufio.Reader) (resp, status string, byt
 	return sb.String(), status, bytesIn, nil
 }
 
+// setupSOCKS5Proxy - performs SOCKS5 handshake on an already-connected proxy conn
+// After success, conn is ready to use as a tunnel to host:port
+func setupSOCKS5Proxy(proxy net.Conn, host string, port int) error {
+	// Handshake: version 5, 1 method, no auth
+	if _, err := proxy.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return err
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(proxy, resp); err != nil {
+		return err
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 handshake failed")
+	}
+
+	// Build connect request
+	req := []byte{0x05, 0x01, 0x00} // version, connect, reserved
+	ip := net.ParseIP(host)
+	if ip != nil && ip.To4() != nil {
+		req = append(req, 0x01) // IPv4
+		req = append(req, ip.To4()...)
+	} else if ip != nil {
+		req = append(req, 0x04) // IPv6
+		req = append(req, ip.To16()...)
+	} else {
+		req = append(req, 0x03) // Domain
+		req = append(req, byte(len(host)))
+		req = append(req, []byte(host)...)
+	}
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(port))
+	req = append(req, portBytes...)
+
+	if _, err := proxy.Write(req); err != nil {
+		return err
+	}
+
+	// Read response header
+	resp = make([]byte, 4)
+	if _, err := io.ReadFull(proxy, resp); err != nil {
+		return err
+	}
+	if resp[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 connect failed: %d", resp[1])
+	}
+
+	// Skip bind address based on type
+	switch resp[3] {
+	case 0x01: // IPv4
+		io.ReadFull(proxy, make([]byte, 4+2))
+	case 0x03: // Domain
+		var length byte
+		binary.Read(proxy, binary.BigEndian, &length)
+		io.ReadFull(proxy, make([]byte, int(length)+2))
+	case 0x04: // IPv6
+		io.ReadFull(proxy, make([]byte, 16+2))
+	}
+
+	if verbose {
+		fmt.Printf("[V] SOCKS5 tunnel established to %s:%d\n", host, port)
+	}
+	return nil
+}
+
+// dialWithProxy - dials target through proxy (HTTP CONNECT or SOCKS5) or directly
 func dialWithProxy(addr, proxyURL string) (net.Conn, error) {
 	if proxyURL == "" {
 		return net.DialTimeout("tcp", addr, 10*time.Second)
 	}
 
-	proxy, err := parseProxyAddr(proxyURL)
+	var isSocks5, isHTTP bool
+	switch {
+	case strings.HasPrefix(proxyURL, "socks5://") || strings.HasPrefix(proxyURL, "socks://"):
+		isSocks5 = true
+	case strings.HasPrefix(proxyURL, "http://"), strings.HasPrefix(proxyURL, "https://"):
+		isHTTP = true
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme (use http(s)://  or socks(5)://): %s", proxyURL)
+	}
+
+	proxyAddr, err := parseProxyAddr(proxyURL)
 	if err != nil {
 		return nil, err
 	}
 
-	proxyConn, err := net.DialTimeout("tcp", proxy, 5*time.Second)
+	proxyConn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
+	if isSocks5 {
+		host, portStr, _ := net.SplitHostPort(addr)
+		port, _ := strconv.Atoi(portStr)
+		if err := setupSOCKS5Proxy(proxyConn, host, port); err != nil {
+			proxyConn.Close()
+			return nil, err
+		}
+		return proxyConn, nil
+	}
+
+	// isHTTP: HTTP CONNECT
+	_ = isHTTP
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr, addr)
 	_, err = proxyConn.Write([]byte(connectReq))
 	if err != nil {
