@@ -86,6 +86,7 @@ type Orch struct {
 	wg            sync.WaitGroup
 	hostFlag      string
 	reqDelayMs    int // delay between requests (from -d or r_delay)
+	loopDelayMs   int // static delay before each xt loop cycle (from x_delay, cycle 0 excluded)
 	outFlag       bool
 	keepAlive     bool
 	proxyURL      string
@@ -176,9 +177,10 @@ func main() {
 	dsizeFlag := flag.Int("dsize", 4096, "Block mode: max TCP data size in bytes before flush")
 	thrGFlag := flag.String("thrG", "", "Thread groups file. Defines independent request groups with separate threads.\n"+
 		"When present, -thr, -mode, -x, -xt, -sb, -re and -ka are ignored (defined per group).\n"+
-		"Format per line, [] are optionals: 1,...,n (req indices) thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=1,..,n] [re=file] [nofifo] [ka] [wk=_k1,..,_kn]\n"+
+		"Format per line, [] are optionals: 1,...,n (req indices) thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [x_delay=N] [sb=1,..,n] [re=file] [nofifo] [ka] [wk=_k1,..,_kn]\n"+
 		"  s_delay: start delay (ms delay to start group chain).\n"+
 		"  r_delay: request delay (ms between requests, equals to -d flag if this omitted).\n"+
+		"  x_delay: static delay (ms) before each xt loop cycle (cycle 0 excluded); no-op without xt.\n"+
 		"  ka: if present share single TLS connection across all threads (block mode only).\n"+
 		"  nofifo: if present removes the group from FIFO (-u) work queues, reducing overhead if a group don't need FIFO.\n"+
 		"  wk: a list of global keys (i.e., _key) the group needs from an other group, blocking in waitForkeys() until the full list available.\n"+
@@ -462,6 +464,7 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 			monkeys:       monkeys,
 			hostFlag:      hostFlag,
 			reqDelayMs:    reqDelay,
+			loopDelayMs:   g.XDelay,
 			outFlag:       outFlag,
 			keepAlive:     kaFlag,
 			proxyURL:      proxyFlag,
@@ -594,6 +597,11 @@ func (o *Orch) runKeepAllOrchestration() {
 				fmt.Printf("[V] G%d keepAll: iteration limit reached\n", o.groupID+1)
 			}
 			return
+		}
+
+		// x_delay: static wait before each xt loop cycle (cycle 0 excluded)
+		if iteration > 0 && o.loopDelayMs > 0 {
+			time.Sleep(time.Duration(o.loopDelayMs) * time.Millisecond)
 		}
 
 		// Wait for all workers to signal accumulation done
@@ -817,6 +825,11 @@ func (o *Orch) runWorker(w *monkey) {
 			case <-o.quitChan:
 				return
 			default:
+			}
+
+			// x_delay: static wait before each xt loop cycle (cycle 0 excluded)
+			if o.loopDelayMs > 0 {
+				time.Sleep(time.Duration(o.loopDelayMs) * time.Millisecond)
 			}
 
 			// Sync mode: signal ready for loop, then wait for release

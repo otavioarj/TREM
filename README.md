@@ -258,6 +258,8 @@ With -ka:
 5. Read responses in order, dispatch to respective threads
 6. Repeat for each loop iteration (`-xt`)
 
+> **Note on `x_delay` + `ka`**: In keep-all mode the shared TLS connection is dialed **once** before the workers start and reused across every cycle — it is not re-dialed per iteration. An `x_delay` that exceeds the server's idle timeout can therefore cause the connection to be dropped **during** the inter-cycle wait; the following global flush will fail and fall back to a reconnect attempt. When pairing `x_delay` with `ka`, keep the delay below the target's idle timeout, or expect a reconnect (and its cost) on each cycle whose wait outlives the connection.
+
 **Protocol details:**
 - **HTTP/1.1**: All requests concatenated, pipelined in single write
 - **HTTP/2**: All requests encoded as frames with unique stream IDs, multiplexed in single write
@@ -328,7 +330,7 @@ When `-thrG` is used, the following flags are **ignored** (they're defined per g
 
 Each line defines one group:
 ```
-req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N,M] [re=file] [nofifo] [ka] [wk=_key1,_key2]
+req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [x_delay=N] [sb=N,M] [re=file] [nofifo] [ka] [wk=_key1,_key2]
 ```
 
 | Parameter | Required | Description |
@@ -340,6 +342,7 @@ req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N
 | `r_delay=N` | No | Request delay in ms between requests (defaults to `-d` flag) |
 | `x=N` | No | Loop start index (1-based, relative to group) |
 | `xt=N` | No | Loop count (0=infinite) |
+| `x_delay=N` | No | Static delay in ms before each `xt` loop cycle (cycle 0 excluded); no-op without `xt` (see [Looping](#looping) and note below) |
 | `sb=N,M` | No | Sync barriers (1-based, relative to group) |
 | `re=file` | No | Regex patterns file for this group |
 | `nofifo` | No | Boolean flag - group doesn't receive FIFO values (see [NoFifo Groups](#nofifo-groups)) |
@@ -347,6 +350,8 @@ req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [sb=N
 | `wk=_k1,_k2` | No | Wait keys - block until these static keys exist (see [Cross-Group Synchronization](#cross-group-synchronization)) |
 
 > **Note**: `mode=block` ignores `r_delay` and `re=` parameters.
+
+> **Note**: `x_delay=N` inserts a static wait of N ms **before each `xt` loop cycle**. Cycle 0 (the initial request chain) is excluded, mirroring how `xt` counts iterations, and there is no wait after the final cycle. It is optional and a no-op without `xt`. Unlike `s_delay` — which schedules group start/boot and inter-group ordering — `x_delay` is loop-scoped and repeats on every iteration. Typical use: give an external process (e.g. a database snapshot) a quiet window between iterations. See [Keep-All Mode](#keep-all-mode--ka) for a caveat when combined with `ka`.
 
 > **Note**: Request indices can be **duplicated across groups**, allowing different groups to process the same request with different configurations.
 

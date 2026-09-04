@@ -26,6 +26,7 @@ type ThreadGroup struct {
 	NoFifo        bool         // whether this group does NOT need FIFO access
 	KeepAll       bool         // -ka: share single TLS connection across all threads (block mode only)
 	Wait2Keys     []string     // wk= static keys to wait indefinitely (no timeout)
+	XDelay        int          // x_delay= static delay ms before each xt loop cycle (cycle 0 excluded)
 }
 
 // createSingleGroup - creates synthetic ThreadGroup for single mode (no -thrG)
@@ -219,6 +220,13 @@ func parseGroupLine(line string, groupID, lineNum int, httpH2 bool) (*ThreadGrou
 			}
 			group.LoopTimes = n
 			foundXt = true
+
+		case "x_delay":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("line %d: invalid x_delay=%s", lineNum, value)
+			}
+			group.XDelay = n
 
 		case "sb":
 			barriers, err := parseRelativeIndexList(value)

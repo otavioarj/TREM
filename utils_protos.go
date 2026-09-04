@@ -18,7 +18,7 @@ import (
 var hostHeaderRe = regexp.MustCompile(`(?im)^Host:\s*([^:\r\n]+)(?::(\d+))?`)
 
 // httpVersionRe - matches HTTP/x.x at end of request line
-var httpVersionRe = regexp.MustCompile(`HTTP/\d\.\d`)
+var httpVersionRe = regexp.MustCompile(`HTTP/\d(?:\.\d)?`)
 
 // decodeBody - decompresses gzip/deflate encoded body
 // Returns raw bytes if encoding is empty, identity, or unknown
