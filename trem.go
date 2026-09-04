@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.8.0"
+var version = "v1.8.2"
 
 // Global flags
 var verbose bool
