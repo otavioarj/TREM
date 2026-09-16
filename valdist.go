@@ -206,6 +206,7 @@ func (d *ValDist) reader(fifo *os.File, logger LogWriter) {
 	defer fifo.Close()
 	var lastKey string
 	buf := make([]byte, 4096)
+	warnedStatic := make(map[string]bool)
 	var leftover []byte
 
 	for {
@@ -255,6 +256,10 @@ func (d *ValDist) reader(fifo *os.File, logger LogWriter) {
 				}
 				k = lastKey
 				v = line
+				if len(lastKey) > 0 && lastKey[0] == '_' && !warnedStatic[lastKey] {
+					warnedStatic[lastKey] = true
+					logger.Write(fmt.Sprintf("WARN: static key %s is being used as volatile key! Only the last value will be used! \n", lastKey))
+				}
 			}
 
 			if k != "" {

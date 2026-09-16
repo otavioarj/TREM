@@ -112,6 +112,7 @@ go build -ldflags="-s -w" -trimpath
   - [NoFifo Groups](#nofifo-groups)
 - [Cross-Group Synchronization](#cross-group-synchronization)
   - [Wait Keys](#wait-keys-wk)
+- [Global Static Keys](#global-static-keys)
 - [Regex Patterns File](#regex-patterns-file--re)
 - [Response Actions](#response-actions--ra)
 - [Universal Replacement](#universal-replacement--u)
@@ -347,7 +348,7 @@ req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [x_de
 | `re=file` | No | Regex patterns file for this group |
 | `nofifo` | No | Boolean flag - group doesn't receive FIFO values (see [NoFifo Groups](#nofifo-groups)) |
 | `ka` | No | Boolean flag - share single TLS connection across all threads (requires `mode=block`, see [Keep-All Mode](#keep-all-mode--ka)) |
-| `wk=_k1,_k2` | No | Wait keys - block until these static keys exist (see [Cross-Group Synchronization](#cross-group-synchronization)) |
+| `wk=_k1,_k2` | No | Wait keys - block until these keys exist (see [Wait Keys](#wait-keys-wk) and [Global Static Keys](#global-static-keys)) |
 
 > **Note**: `mode=block` ignores `r_delay` and `re=` parameters.
 
@@ -377,19 +378,21 @@ req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [x_de
 
 ### Cross-Group Value Sharing
 
-Groups can share values using **static keys** (keys prefixed with `_`):
+Groups can share values using **[static keys](#global-static-keys)** (keys prefixed with `_`):
 
 1. Group 1 extracts `$_session$` from login response (via its `re=` file)
-2. Value is stored in `globalStaticVals`
+2. Value is stored in [`globalStaticVals`](#global-static-keys)
 3. Group 2 automatically receives `$_session$` in its requests
 
 This enables patterns like: authenticate once in Group 1, spray exploits in Group 2.
+
+> This is the cross-group facet only. For the full behavior of static keys (always-broadcast, single-value/last-wins, persistence), see [Global Static Keys](#global-static-keys).
 
 ### NoFifo Groups
 
 Groups with `nofifo` flag don't participate in FIFO value distribution. Their threads:
 - Don't receive FIFO channel (no buffered values)
-- Still have access to static keys (`_key`) via `globalStaticVals`
+- Still have access to [static keys](#global-static-keys) (`_key`) via `globalStaticVals`
 - Useful for groups that only use regex-extracted values or static keys
 
 **Example:**
@@ -406,13 +409,13 @@ Group 1 extracts `$_session$` which Group 2 uses, but Group 1 threads don't wast
 
 ## Cross-Group Synchronization
 
-The `wk=` (wait keys) parameter enables fine-grained synchronization between thread groups by blocking a group until specific static keys become available in `globalStaticVals`.
+The `wk=` (wait keys) parameter enables fine-grained synchronization between thread groups by blocking a group until specific keys become available — [static keys](#global-static-keys) in `globalStaticVals`, or plain FIFO keys in the thread buffer.
 
 ### Wait Keys (`wk=`)
 
 When a group has `wk=_key1,_key2,...`, all threads in that group will **wait indefinitely** for those keys to appear before processing requests that need them. This creates a dependency chain between groups.
 
-**Format:** Comma-separated list of static keys (must start with `_`)
+**Format:** Comma-separated list of keys. Both [static keys](#global-static-keys) (`_`-prefixed, waited on in `globalStaticVals`) and plain FIFO keys (waited on in the thread buffer) are accepted.
 
 ```
 # groups.txt
@@ -433,7 +436,7 @@ Group 2: _vtoken available → r3 × 50 threads × 100 iterations
 ```
 
 **Key characteristics:**
-- Only static keys (`_key`) can be waited on
+- Both [static keys](#global-static-keys) (`_`) and plain FIFO keys can be waited on
 - Wait is infinite (no timeout) for keys in `wk=` list
 - Multiple keys can be specified: `wk=_token,_session,_csrf`
 - Group starts processing only after ALL wait keys exist
@@ -490,6 +493,53 @@ The most powerful combination for race condition attacks:
 3. Group 2 sends 100 × 50 = 5000 exploit requests through single TLS connection
 4. Each iteration's 100 requests sent in one TCP write (true single-packet attack)
 
+## Global Static Keys
+
+**Global static keys** are keys whose name begins with an underscore (`_op`, `_token`, `_session`). They are TREM's mechanism for a value that must be **the same everywhere** — shared by every thread, across every group, and reused on every loop iteration. Internally they live in a single process-wide store, `globalStaticVals`, which holds exactly **one value per key**.
+
+This section is the complete reference for `globalStaticVals`. The scoped subsections elsewhere — [Cross-Group Value Sharing](#cross-group-value-sharing), [Wait Keys](#wait-keys-wk), [Persistent Keys](#persistent-keys-_key) — each describe one facet and point back here.
+
+### How a static key is created
+
+A `_`-key enters `globalStaticVals` from any of these sources:
+
+- **`-u` initial value:** `-u "_token=eyJ..."` seeds the key before any request (see [Static Mode](#static-mode)).
+- **FIFO feed:** a `_key=value` line written to the FIFO (see [FIFO Mode](#fifo-mode-dynamic-injection)).
+- **Regex extraction:** a capture whose placeholder name is `_`-prefixed, e.g. `` ...([^;]+)`_session `` (see [Regex Patterns File](#regex-patterns-file--re)). The extracted value is stored globally and becomes visible to every group.
+
+In requests a static key is referenced like any other: `$_token$`.
+
+### Peculiarities (read before using)
+
+These behaviors distinguish a static key from an ordinary FIFO key, and are the most common source of surprises:
+
+1. **Always broadcast — `-fmode` does not apply.** A static key is delivered to **every** thread, regardless of the [FIFO distribution mode](#fifo-distribution-modes--fmode). Round-robin (`-fmode 2`) and per-request draining (`-fbck`) govern **non-`_` keys only**. You cannot make a `_`-key hand a different value to each thread or each request.
+
+2. **Single value — last one wins.** `globalStaticVals` stores one value per key. Feeding a second value for the same `_`-key **overwrites** the first; only the last survives. This includes **continuation lines** in the FIFO: because a bare line (no `=`) inherits the previous key, writing
+
+   ```
+   _ee=valueA
+   valueB
+   valueC
+   ```
+
+   stores `_ee` three times and keeps only `valueC` — the earlier values are silently discarded. TREM emits a one-time `WARN` per key when a `_`-key receives continuation values, precisely to catch this. If you intended one value **per request**, the key must **not** be `_`-prefixed — use a plain FIFO key (see [FIFO Mode](#fifo-mode-dynamic-injection)), which round-robins and is consumed one value per request.
+
+3. **Resolved before the FIFO channel.** Static keys are read straight from `globalStaticVals` when a request is prepared, *before* the per-request FIFO drain runs. That is why `-fbck` and round-robin never touch them, and why a `_`-key is never "consumed" — it is read, not popped.
+
+4. **Persistent across loops.** Once set, a static key is reused by every request and every loop iteration (`xt`) until a new value for the same key overwrites it. Ideal for a token obtained once and replayed many times.
+
+### Waiting on a static key (`wk=`)
+
+A group can block until a key is present in `globalStaticVals` using `wk=` — the wait is infinite, with no timeout. See [Wait Keys](#wait-keys-wk) for the full mechanism and cross-group dependency chains.
+
+### Choosing static vs. FIFO
+
+| You want… | Use |
+|-----------|-----|
+| The same value for every thread/request (token, OTP, session) | `_`-prefixed **static** key |
+| A distinct value per request (password spray, unique IDs, round-robin) | plain (non-`_`) **FIFO** key |
+
 ## Regex Patterns File (`-re`)
 
 The patterns file defines how values are extracted from responses and injected into subsequent requests. Each line corresponds to a request transition (line N extracts from response N to populate request N+1).
@@ -531,7 +581,7 @@ token="([^"]+)"`token
 3. Line 3: Empty - verify.txt response read but no extraction
 4. Line 4: Extract `token` from verify response → used in action.txt (but line 3 is empty, so this extracts from verify.txt response for action.txt)
 
-> **Note**: Static keys (prefixed with `_`) persist globally and can be shared across thread groups.
+> **Note**: A capture named with a `_` prefix is stored as a [global static key](#global-static-keys) — it persists globally and is shared across thread groups (single value; the last extraction wins).
 
 ## Response Actions (`-ra`)
 
@@ -607,7 +657,7 @@ qwerty
 123456
 ```
 
-The first line defines the key (`pass`), subsequent lines are values for that key. Each value of `pass` generates a new request when matching and replacing the key in a given request. Although FIFO keys don't use `$key$` format in feed/consumption, the find&replace algorithm always uses key in format `$key$` in requests! So the FIFO key `pass` will replace request key `$pass$`. FIFO also accept static keys and mutators, as:
+The first line defines the key (`pass`), subsequent lines are values for that key. Each value of `pass` generates a new request when matching and replacing the key in a given request. Although FIFO keys don't use `$key$` format in feed/consumption, the find&replace algorithm always uses key in format `$key$` in requests! So the FIFO key `pass` will replace request key `$pass$`. FIFO also accept [static keys](#global-static-keys) and mutators, as:
 
 ```
 _user=admin
@@ -617,7 +667,7 @@ letmein
 qwerty
 123456
 ```
-The key `_user` is globally available (see [Cross-Group Value Sharing](#cross-group-value-sharing)) to all groups threads (see [Thread Groups](#thread-groups--thrg)), while the values of `pass`are shared following the FIFO Distribution Modes. 
+The key `_user` is a [global static key](#global-static-keys), globally available (see [Cross-Group Value Sharing](#cross-group-value-sharing)) to all groups threads (see [Thread Groups](#thread-groups--thrg)), while the values of `pass` are shared following the FIFO Distribution Modes. 
 
 ### FIFO Distribution Modes (`-fmode`)
 
@@ -634,9 +684,13 @@ Thread 1: pass2, pass5
 Thread 2: pass3, pass6
 ```
 
+> **Note**: `-fmode` governs **non-`_` keys only**. [Global static keys](#global-static-keys) (`_`-prefixed) ignore it entirely and are **always broadcast** to every thread.
+
 ### Persistent Keys (`_key`)
 
-Keys starting with underscore (globally static values) are also never consumed in the FIFO, persisting across all loops, with the updated value if needed:
+> This subsection covers the FIFO-feed facet only. For the full behavior of static keys — always-broadcast, single-value/last-wins, continuation collapse — see [Global Static Keys](#global-static-keys).
+
+Keys starting with underscore are [global static values](#global-static-keys): they are never consumed in the FIFO and persist across all loops. They hold a **single** value — to change it, feed a new `_key=value` line later, which **overwrites** the previous one (last value wins):
 
 ```
 _bearer=eyJhbGciOiJIUzI1NiIs...
@@ -697,7 +751,7 @@ By default in group mode, TREM analyzes each group's request templates and only 
 **How it works:**
 
 1. Before starting, TREM parses all request templates for each group
-2. Extracts non-static keys (`$key$`, not `$_key$`) from each group's requests
+2. Extracts non-static keys (`$key$`, not `$_key$` — see [Global Static Keys](#global-static-keys)) from each group's requests
 3. Builds a subscription map: which threads need which keys
 4. FIFO dispatcher only sends keys to subscribed threads
 

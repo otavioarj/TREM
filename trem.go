@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.8.2"
+var version = "v1.8.4"
 
 // Global flags
 var verbose bool
@@ -183,7 +183,7 @@ func main() {
 		"  x_delay: static delay (ms) before each xt loop cycle (cycle 0 excluded); no-op without xt.\n"+
 		"  ka: if present share single TLS connection across all threads (block mode only).\n"+
 		"  nofifo: if present removes the group from FIFO (-u) work queues, reducing overhead if a group don't need FIFO.\n"+
-		"  wk: a list of global keys (i.e., _key) the group needs from an other group, blocking in waitForkeys() until the full list available.\n"+
+		"  wk: a list of keys the group needs, from another group (static keys, format _key) or FIFO, blocking in waitForkeys() until the full list available.\n"+
 		"  Note: mode=block ignores r_delay and re= (patterns)!!\n"+
 		"Example:\n  1,3,5 thr=25 s_delay=125 mode=async\n  2,4 thr=10 mode=sync s_delay=0 x=2 xt=10 sb=1\n"+
 		"  # Commentaries are ignored :)\n"+

@@ -251,10 +251,7 @@ func parseGroupLine(line string, groupID, lineNum int, httpH2 bool) (*ThreadGrou
 				k = strings.TrimSpace(k)
 				if len(k) == 0 {
 					continue
-				}
-				if k[0] != '_' {
-					return nil, fmt.Errorf("line %d: wk keys must start with _ (got %s)", lineNum, k)
-				}
+				}				
 				group.Wait2Keys = append(group.Wait2Keys, k)
 			}
 
