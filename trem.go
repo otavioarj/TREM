@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.8.4"
+var version = "v1.9.2"
 
 // Global flags
 var verbose bool
@@ -30,10 +30,14 @@ var stats *StatsCollector
 // Values can be updated; last write wins
 var globalStaticVals sync.Map
 
+// Read-only after startup.
+var reVars map[string]string
+
 // pattern - regex extraction
 type pattern struct {
 	re      *regexp.Regexp
 	keyword string
+	src     string
 }
 
 // LogWriter - Interface for async logging
@@ -344,6 +348,10 @@ func main() {
 
 		configBanner = FormatConfig(*thrFlag, *delayFlag, loopStart, *loopTimesFlag, *cliFlag, *fbckFlag,
 			*kaFlag, verbose, *httpFlag, *proxyFlag, *hostFlag, *mtlsFlag, *modeFlag, *univFlag)
+	}
+
+	if err := checkVars(groups, *univFlag); err != nil {
+		exitErr(err.Error())
 	}
 
 	// Run orchestration

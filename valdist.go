@@ -249,6 +249,9 @@ func (d *ValDist) reader(fifo *os.File, logger LogWriter) {
 			if eqIdx := strings.Index(line, "="); eqIdx > 0 {
 				k = strings.TrimSpace(line[:eqIdx])
 				v = strings.TrimSpace(line[eqIdx+1:])
+				if err := redef(k, "FIFO"); err != nil {
+					exitErr(err.Error())
+				}
 				lastKey = k
 			} else {
 				if lastKey == "" {

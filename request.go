@@ -120,13 +120,14 @@ func (o *Orch) prepareReq(w *monkey, relIdx, absIdx int) (*TemplateReq, map[stri
 	tmpl := getTemplate(w.reqFiles[absIdx], raw)
 	values := make(map[string]string)
 
-	// Phase 1: Apply cached pattern values from previous request (same thread group)
-	// Other thread groups can use globalStaticVals to cross Group sharing
 	if w.lastPatternVals != nil {
 		for k, v := range w.lastPatternVals {
 			values[k] = v
+			// Keep global overrides for one request only.
+			if len(k) > 0 && k[0] == '_' {
+				delete(w.lastPatternVals, k)
+			}
 		}
-		w.lastPatternVals = nil // consumes it
 	}
 
 	// Phase 2: Apply static values from global store (extracted from previous requests with _ prefix)
@@ -748,13 +749,18 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 
 	w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
 	w.prevResp = resp
-	// Extract patterns and cache for next request
 	if w.patterns != nil && relIdx < len(w.patterns) && len(w.patterns[relIdx]) > 0 {
 		patternVals, err := applyPatterns(w.patterns[relIdx], resp, w.logger)
 		if err != nil {
 			return err
 		}
-		w.lastPatternVals = patternVals // cache para prepareReq
+		if w.lastPatternVals == nil {
+			w.lastPatternVals = patternVals
+		} else {
+			for k, v := range patternVals {
+				w.lastPatternVals[k] = v
+			}
+		}
 	}
 
 	// apply response actions (uses absIdx for global pattern matching)
@@ -777,48 +783,90 @@ func loadPatterns(path string) ([][]pattern, error) {
 	if err != nil {
 		return nil, err
 	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-
-	// Filter comment lines (# cmt)
-	var filtered []string
-	for _, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+	lines := strings.Split(string(data), "\n")
+	lo, hi := 0, len(lines)
+	for lo < hi-1 && strings.TrimSpace(lines[lo]) == "" {
+		lo++
+	}
+	for hi > lo+1 && strings.TrimSpace(lines[hi-1]) == "" {
+		hi--
+	}
+	patterns := make([][]pattern, 0, hi-lo)
+	for i := lo; i < hi; i++ {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "#") {
 			continue
 		}
-		filtered = append(filtered, line)
-	}
-	lines = filtered
-
-	patterns := make([][]pattern, len(lines))
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
 
 		// Empty line: read response but skip regex match
 		if line == "" {
-			patterns[i] = nil
+			patterns = append(patterns, nil)
 			continue
 		} else if line == ":" {
 			// Line with only : is fire-and-forget marker, keep empty slice for indexing
-			patterns[i] = []pattern{}
+			patterns = append(patterns, []pattern{})
 			continue
 		}
 
 		// multiple patterns per line separated by <space>$<space>!
 		parts := strings.Split(line, " $ ")
-		patterns[i] = make([]pattern, len(parts))
+		pats := make([]pattern, len(parts))
 		for j, part := range parts {
 			bef, aft, found := strings.Cut(part, "`:")
 			if !found {
 				return nil, errors.New("invalid regex line: " + line)
 			}
+			if aft == "" || strings.ContainsAny(aft, "$ \t\r\n") {
+				return nil, fmt.Errorf("Invalid var %q: %s:L%d", aft, path, i+1)
+			}
 			r, err := regexp.Compile(bef)
 			if err != nil {
 				return nil, err
 			}
-			patterns[i][j] = pattern{re: r, keyword: aft}
+			pats[j] = pattern{re: r, keyword: aft, src: fmt.Sprintf("%s:L%d", path, i+1)}
 		}
+		patterns = append(patterns, pats)
 	}
 	return patterns, nil
+}
+
+func checkVars(groups []*ThreadGroup, univ string) error {
+	reVars = make(map[string]string)
+	for _, g := range groups {
+		if g.Mode == "block" {
+			continue
+		}
+		for i, pats := range g.Patterns {
+			if i >= len(g.ReqIndices) {
+				break
+			}
+			for _, p := range pats {
+				if err := redef(p.keyword, p.src); err != nil {
+					return err
+				}
+				reVars[p.keyword] = p.src
+			}
+		}
+	}
+	if k, _, ok := strings.Cut(univ, "="); ok {
+		return redef(k, "-u")
+	}
+	return nil
+}
+
+func redef(k, src string) error {
+	prev, ok := reVars[k]
+	if !ok {
+		return nil
+	}
+	if src == "FIFO" {
+		src += ", " + prev
+	} else if i := strings.LastIndex(src, ":L"); i >= 0 && strings.HasPrefix(prev, src[:i]+":L") {
+		src = prev + "," + src[i+1:]
+	} else {
+		src = prev + ", " + src
+	}
+	return fmt.Errorf("Var %q redefinition: %s", k, src)
 }
 
 // applyResponseActions - applies response actions if pattern matches

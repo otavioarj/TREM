@@ -234,7 +234,7 @@ func applyPatterns(pats []pattern, prevResp string, logger LogWriter) (map[strin
 			return nil, fmt.Errorf("regex did not match for: %s", p.keyword)
 		}
 
-		extracted := decodeExtracted(m[1])
+		extracted := strings.Clone(decodeExtracted(m[1]))
 		values[p.keyword] = extracted
 		logger.Write(fmt.Sprintf("Matched %s: %s\n", p.keyword, extracted))
 
