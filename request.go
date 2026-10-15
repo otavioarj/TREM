@@ -591,8 +591,7 @@ func (o *Orch) doGlobalFlushH2() error {
 	var buf bytes.Buffer
 	for _, m := range o.monkeys {
 		for i, req := range m.blockH2Reqs {
-			streamID := h2.streamID
-			h2.streamID += 2
+			streamID := h2.nextStream()
 			h2.encodeReqFrames(&buf, req, streamID)
 
 			meta := reqMeta{

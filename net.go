@@ -327,7 +327,7 @@ func (o *Orch) closeWorkerConn(w *monkey) {
 		w.conn = nil
 	}
 	if w.h2conn != nil {
-		w.h2conn.conn.Close()
+		w.h2conn.close()
 		w.h2conn = nil
 	}
 }

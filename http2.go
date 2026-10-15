@@ -91,6 +91,17 @@ func init() {
 	copy(h2HandshakeData[n:], h2WindowUpdate)
 }
 
+// h2Resp - keeps one stream's response until it is delivered
+type h2Resp struct {
+	headers  [][2]string
+	body     bytes.Buffer
+	status   string
+	encoding string
+	bytesIn  int
+	done     bool
+	err      error
+}
+
 // H2Conn - wraps net.Conn with HTTP/2 state
 type H2Conn struct {
 	conn      net.Conn
@@ -99,6 +110,9 @@ type H2Conn struct {
 	encBuf    bytes.Buffer
 	streamID  uint32
 	handshook bool
+	streams   map[uint32]*h2Resp
+	ready     []uint32
+	ctrlIn    int
 }
 
 // newH2Conn - wraps conn for HTTP/2
@@ -110,6 +124,25 @@ func newH2Conn(conn net.Conn) *H2Conn {
 	h.enc = hpack.NewEncoder(&h.encBuf)
 	h.dec = hpack.NewDecoder(4096, nil)
 	return h
+}
+
+// nextStream - registers an outgoing stream before its frames are written
+func (h *H2Conn) nextStream() uint32 {
+	id := h.streamID
+	h.streamID += 2 // client streams are odd
+	if h.streams == nil {
+		h.streams = make(map[uint32]*h2Resp)
+	}
+	h.streams[id] = nil
+	return id
+}
+
+// close - releases pending responses with their connection
+func (h *H2Conn) close() {
+	h.streams = nil
+	h.ready = nil
+	h.ctrlIn = 0
+	h.conn.Close()
 }
 
 // handshake - sends connection preface and settings
@@ -200,8 +233,7 @@ func (h *H2Conn) sendReqH2(req *ParsedReq, threadID int, waitRsp bool) (resp, st
 		return "", "", err
 	}
 
-	streamID := h.streamID
-	h.streamID += 2 // next odd number
+	streamID := h.nextStream()
 
 	// Encode and send frames
 	var buf bytes.Buffer
@@ -248,8 +280,7 @@ func (h *H2Conn) sendBatchH2(reqs []*ParsedReq) (streamIDs []uint32, bytesOut in
 	var buf bytes.Buffer
 
 	for i, req := range reqs {
-		streamID := h.streamID
-		h.streamID += 2
+		streamID := h.nextStream()
 		streamIDs[i] = streamID
 		h.encodeReqFrames(&buf, req, streamID)
 	}
@@ -261,20 +292,89 @@ func (h *H2Conn) sendBatchH2(reqs []*ParsedReq) (streamIDs []uint32, bytesOut in
 	return streamIDs, buf.Len(), nil
 }
 
-// readResponse - reads frames until END_STREAM for given streamID
-// If streamID=0, accepts any stream (first HEADERS/DATA defines it)
-// Returns: respStreamID, resp body, status code, bytes read, error
+// framePayload - removes padding and optional HEADERS priority fields 
+func framePayload(payload []byte, flags byte, priority bool) ([]byte, error) {
+	if flags&flagPadded != 0 {
+		if len(payload) == 0 || int(payload[0]) > len(payload)-1 {
+			return nil, fmt.Errorf("invalid H2 padding")
+		}
+		payload = payload[1 : len(payload)-int(payload[0])]
+	}
+	if priority && flags&flagPriority != 0 {
+		if len(payload) < 5 {
+			return nil, fmt.Errorf("invalid H2 priority")
+		}
+		payload = payload[5:]
+	}
+	return payload, nil
+}
+
+// response - delivers and releases one completed stream, counting control bytes once.
+func (h *H2Conn) response(id uint32) (uint32, string, string, int, error) {
+	r := h.streams[id]
+	delete(h.streams, id)
+	if len(h.streams) == 0 {
+		h.streams = nil
+		h.ready = nil
+	}
+	n := r.bytesIn + h.ctrlIn
+	h.ctrlIn = 0
+	if r.err != nil {
+		return id, "", "", n, r.err
+	}
+
+	// Build response string (headers + body)
+	var sb strings.Builder
+	for _, hdr := range r.headers {
+		// Normalize H2 header names for HTTP/1.1 regex compatibility
+		sb.WriteString(toTitleCase(hdr[0]))
+		sb.WriteString(": ")
+		sb.WriteString(hdr[1])
+		sb.WriteString("\r\n")
+	}
+	sb.WriteString("\r\n")
+
+	// Decode body if compressed
+	decodedBytes, err := decodeBody(&r.body, r.encoding)
+	if err != nil {
+		return id, "", "", n, err
+	}
+	sb.Write(decodedBytes)
+	return id, sb.String(), r.status, n, nil
+}
+
+// readResponse - single reader; streamID=0 returns the next completed response 
 func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, status string, bytesIn int, err error) {
-	var headers [][2]string
-	var body bytes.Buffer
-	var encoding string
+	defer func() {
+		if err != nil {
+			h.close()
+		}
+	}()
+	if streamID != 0 {
+		r, ok := h.streams[streamID]
+		if !ok {
+			return 0, "", "", 0, fmt.Errorf("unknown H2 stream %d", streamID) 
+		} 
+		if r != nil && r.done {
+			return h.response(streamID)
+		}
+	} else { 
+		for len(h.ready) > 0 {
+			id := h.ready[0]
+			h.ready = h.ready[1:]
+			if r := h.streams[id]; r != nil && r.done {
+				return h.response(id)
+			}
+		}
+	}
 
-	respStreamID = streamID
 	firstRead := true
-	hdr := make([]byte, 9)
-
+	var hdr [9]byte
+	var hdrBuf bytes.Buffer
+	var hdrID uint32
+	var hdrEnd bool
 	for {
-		n, err := io.ReadFull(h.conn, hdr)
+		n, err := io.ReadFull(h.conn, hdr[:])
 		bytesIn += n
 		if err != nil {
 			return 0, "", "", bytesIn, err
@@ -282,10 +382,10 @@ func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, statu
 
 		// First frame validation: detect HTTP/1.1 fallback or invalid H2
 		if firstRead {
-			if bytes.HasPrefix(hdr, []byte("HTTP/")) {
+			if bytes.HasPrefix(hdr[:], []byte("HTTP/")) {
 				return 0, "", "", bytesIn, fmt.Errorf("%w: server responded HTTP/1.1", errH2NotSupported)
 			}
-			if err := validateH2FrameHeader(hdr); err != nil {
+			if err := validateH2FrameHeader(hdr[:]); err != nil {
 				return 0, "", "", bytesIn, err
 			}
 			firstRead = false
@@ -293,15 +393,15 @@ func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, statu
 
 		// H2 uses size in BIGEndian, lets bitwise it :)
 		length := int(hdr[0])<<16 | int(hdr[1])<<8 | int(hdr[2])
-		ftype := hdr[3]
-		flags := hdr[4]
-		// 4 bytes into correct endian
-		fStreamID := uint32(hdr[5]&0x7F)<<24 | uint32(hdr[6])<<16 | uint32(hdr[7])<<8 | uint32(hdr[8])
-
+		ftype, flags := hdr[3], hdr[4]
+		fStreamID := binary.BigEndian.Uint32(hdr[5:]) & 0x7fffffff
+		if hdrID != 0 && (ftype != frameContinuation || fStreamID != hdrID) {
+			return 0, "", "", bytesIn, fmt.Errorf("invalid H2 continuation")
+		}
 		var payload []byte
 		if length > 0 {
 			payload = make([]byte, length)
-			n, err := io.ReadFull(h.conn, payload)
+			n, err = io.ReadFull(h.conn, payload)
 			bytesIn += n
 			if err != nil {
 				return 0, "", "", bytesIn, err
@@ -310,56 +410,89 @@ func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, statu
 
 		// NOTE: Server push (PUSH_PROMISE) ignored - frames discarded
 		// Most APIs don't use push; browsers are primary consumers
+		var r *h2Resp
+		switch ftype {
+		case frameHeaders, frameContinuation, frameData, frameRstStream:
+			var ok bool
+			r, ok = h.streams[fStreamID]
+			// A completed stream may be followed by a NO_ERROR reset 
+			if ftype == frameRstStream && length == 4 && binary.BigEndian.Uint32(payload) == 0 && fStreamID != 0 && fStreamID&1 != 0 && fStreamID < h.streamID && (!ok || r != nil && r.done) {
+				h.ctrlIn += 9 + length
+				continue
+			}
+			if !ok {
+				return 0, "", "", bytesIn, fmt.Errorf("unknown H2 stream %d", fStreamID)
+			}
+			if r == nil {
+				r = &h2Resp{}
+				h.streams[fStreamID] = r
+			}
+			if r.done {
+				return 0, "", "", bytesIn, fmt.Errorf("closed H2 stream %d", fStreamID)
+			}
+			r.bytesIn += 9 + length
+		default:
+			h.ctrlIn += 9 + length
+		}
 
 		switch ftype {
 		case frameHeaders, frameContinuation:
-			// If streamID=0, accept any stream (first defines respStreamID)
-			if respStreamID == 0 {
-				respStreamID = fStreamID
-			}
-			if fStreamID != respStreamID {
-				continue // different stream, skip
+			if ftype == frameHeaders {
+				payload, err = framePayload(payload, flags, true)
+				if err != nil {
+					return 0, "", "", bytesIn, err
+				}
+				hdrEnd = flags&flagEndStream != 0
+				if flags&flagEndHeaders == 0 {
+					hdrID = fStreamID
+					hdrBuf.Write(payload)
+					continue
+				}
+			} else {
+				if hdrID == 0 {
+					return 0, "", "", bytesIn, fmt.Errorf("unexpected H2 continuation")
+				}
+				hdrBuf.Write(payload)
+				if flags&flagEndHeaders == 0 {
+					continue
+				}
+				payload = hdrBuf.Bytes()
+				hdrID = 0
 			}
 
-			// Decode HPACK
+			// Decode complete header blocks in connection order to preserve HPACK state
 			hdrs, err := h.dec.DecodeFull(payload)
 			if err != nil {
 				return 0, "", "", bytesIn, fmt.Errorf("hpack decode: %v", err)
 			}
-
 			for _, hf := range hdrs {
 				if hf.Name == ":status" {
-					status = hf.Value
+					r.status = hf.Value
 				} else {
-					headers = append(headers, [2]string{hf.Name, hf.Value})
+					r.headers = append(r.headers, [2]string{hf.Name, hf.Value})
 					if hf.Name == "content-encoding" {
-						encoding = hf.Value
+						r.encoding = hf.Value
 					}
 				}
 			}
+			hdrBuf.Reset()
+			r.done = hdrEnd
 
 		case frameData:
-			// If streamID=0, accept any stream (first defines respStreamID)
-			if respStreamID == 0 {
-				respStreamID = fStreamID
+			payload, err = framePayload(payload, flags, false)
+			if err != nil {
+				return 0, "", "", bytesIn, err
 			}
-			if fStreamID != respStreamID {
-				continue
-			}
-			// Handle padding if present
-			if flags&flagPadded != 0 && len(payload) > 0 {
-				padLen := int(payload[0])
-				if padLen < len(payload)-1 {
-					payload = payload[1 : len(payload)-padLen]
-				}
-			}
-			body.Write(payload)
+			r.body.Write(payload)
+			r.done = flags&flagEndStream != 0
 
 		case frameSettings:
 			// Server SETTINGS - ACK if not already ACK
 			if flags&0x1 == 0 {
-				ack := []byte{0, 0, 0, frameSettings, 0x1, 0, 0, 0, 0}
-				h.conn.Write(ack)
+				_, err = h.conn.Write(buildFrame(frameSettings, 0x1, 0, nil))
+				if err != nil {
+					return 0, "", "", bytesIn, err
+				}
 			}
 			continue
 
@@ -369,58 +502,43 @@ func (h *H2Conn) readResponse(streamID uint32) (respStreamID uint32, resp, statu
 
 		case framePing:
 			// Respond to PING
-			if flags&0x1 == 0 { // not ACK
-				pong := buildFrame(framePing, 0x1, 0, payload)
-				h.conn.Write(pong)
+			if flags&0x1 == 0 {
+				_, err = h.conn.Write(buildFrame(framePing, 0x1, 0, payload))
+				if err != nil {
+					return 0, "", "", bytesIn, err
+				}
 			}
 			continue
 
 		case frameGoAway:
 			errCode := uint32(0)
 			if len(payload) >= 8 {
-				errCode = uint32(payload[4])<<24 | uint32(payload[5])<<16 | uint32(payload[6])<<8 | uint32(payload[7])
+				errCode = binary.BigEndian.Uint32(payload[4:])
 			}
 			return 0, "", "", bytesIn, fmt.Errorf("GOAWAY received, error code: %d", errCode)
 
 		case frameRstStream:
-			if fStreamID == respStreamID && len(payload) >= 4 {
-				// 4 bytes into correct endian
-				errCode := uint32(payload[0])<<24 | uint32(payload[1])<<16 | uint32(payload[2])<<8 | uint32(payload[3])
-				return 0, "", "", bytesIn, fmt.Errorf("RST_STREAM: %d", errCode)
+			if len(payload) != 4 {
+				return 0, "", "", bytesIn, fmt.Errorf("invalid H2 reset")
 			}
-			continue
+			r.err = fmt.Errorf("RST_STREAM: %d", binary.BigEndian.Uint32(payload))
+			r.done = true
 
 		case framePushPromise:
-			// Server push ignored - just consume and discard
+			// Push is disabled in the client SETTINGS.
+			return 0, "", "", bytesIn, fmt.Errorf("unexpected H2 push")
+
+		default:
 			continue
 		}
 
-		// Check END_STREAM on this stream
-		if fStreamID == respStreamID && (flags&flagEndStream) != 0 {
-			break
+		if r.done {
+			if streamID == 0 || fStreamID == streamID {
+				return h.response(fStreamID)
+			}
+			h.ready = append(h.ready, fStreamID)
 		}
 	}
-
-	// Build response string (headers + body)
-	var sb strings.Builder
-	for _, hdr := range headers {
-		// Normalize header name to Title-Case for H2 <=> HTTP/1.1 compatibility
-		// H2 sends lowercase headers, but regexes may expect Title-Case as on HTTP/1.1
-		sb.WriteString(toTitleCase(hdr[0]))
-		sb.WriteString(": ")
-		sb.WriteString(hdr[1])
-		sb.WriteString("\r\n")
-	}
-	sb.WriteString("\r\n")
-
-	// Decode body if compressed
-	decodedBytes, err := decodeBody(&body, encoding)
-	if err != nil {
-		return 0, "", "", bytesIn, err
-	}
-	sb.Write(decodedBytes)
-
-	return respStreamID, sb.String(), status, bytesIn, nil
 }
 
 // buildFrame - builds HTTP/2 frame
