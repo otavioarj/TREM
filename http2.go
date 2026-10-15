@@ -183,10 +183,10 @@ func (h *H2Conn) encodeReqFrames(dst *bytes.Buffer, req *ParsedReq, streamID uin
 		flags |= flagEndStream
 	}
 
-	dst.Write(buildFrame(frameHeaders, flags, streamID, headerBlock))
+	writeFrame(dst, frameHeaders, flags, streamID, headerBlock)
 
 	if hasBody {
-		dst.Write(buildFrame(frameData, flagEndStream, streamID, req.Body))
+		writeFrame(dst, frameData, flagEndStream, streamID, req.Body)
 	}
 }
 
@@ -437,9 +437,19 @@ func buildFrame(ftype, flags byte, streamID uint32, payload []byte) []byte {
 	return frame
 }
 
-// sendOnConnH2 - sends on existing H2 connection
-func sendOnConnH2(raw []byte, h2 *H2Conn, threadID int) (resp, status string, err error) {
-	req := parseRawReq2H2(string(raw))
+// writeFrame - appends a frame directly to the batch buffer without a temporary payload copy.
+func writeFrame(dst *bytes.Buffer, ftype, flags byte, streamID uint32, payload []byte) {
+	length := len(payload)
+	hdr := [9]byte{byte(length >> 16), byte(length >> 8), byte(length), ftype, flags}
+	binary.BigEndian.PutUint32(hdr[5:], streamID)
+	dst.Grow(len(hdr) + length)
+	dst.Write(hdr[:])
+	dst.Write(payload)
+}
+
+// sendOnConnH2 - parses raw text and sends on an existing H2 connection.
+func sendOnConnH2(raw string, h2 *H2Conn, threadID int) (resp, status string, err error) {
+	req := parseRawReq2H2(raw)
 	if req == nil {
 		return "", "", fmt.Errorf("failed to parse request")
 	}

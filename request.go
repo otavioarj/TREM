@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -98,31 +99,22 @@ func parseRawReq2H2(raw string) *ParsedReq {
 	return req
 }
 
-// prepareReq - loads request template and applies pattern extractions
+// prepareReq - prepare request using snapshots from a shared request template.
 // relIdx: relative index in group (for patterns)
-// absIdx: absolute index in reqFiles (for file loading)
+// absIdx: absolute request index (for cached templates)
 // Returns: template, values from patterns+static, error
 func (o *Orch) prepareReq(w *monkey, relIdx, absIdx int) (*TemplateReq, map[string]string, error) {
-	var raw string
-
-	// use cache if available
-	if len(w.reqCache) > 0 {
-		raw = w.reqCache[absIdx]
-	} else {
-		data, err := os.ReadFile(w.reqFiles[absIdx])
-		if err != nil {
-			return nil, nil, err
-		}
-		raw = string(data)
-	}
-
-	// get parsed template from cache
-	tmpl := getTemplate(w.reqFiles[absIdx], raw)
-	values := make(map[string]string)
+	tmpl := w.reqTmpls[absIdx]
+	keyNames := tmpl.Names
+	values := make(map[string]string, len(keyNames))
 
 	if w.lastPatternVals != nil {
-		for k, v := range w.lastPatternVals {
-			values[k] = v
+		for _, k := range keyNames {
+			if v, ok := w.lastPatternVals[k]; ok {
+				values[k] = v
+			}
+		}
+		for k := range w.lastPatternVals {
 			// Keep global overrides for one request only.
 			if len(k) > 0 && k[0] == '_' {
 				delete(w.lastPatternVals, k)
@@ -131,13 +123,7 @@ func (o *Orch) prepareReq(w *monkey, relIdx, absIdx int) (*TemplateReq, map[stri
 	}
 
 	// Phase 2: Apply static values from global store (extracted from previous requests with _ prefix)
-	keyNames := getUniqueKeyNames(tmpl)
-	staticVals := collectStaticValues(keyNames, w.logger)
-	for k, v := range staticVals {
-		if _, exists := values[k]; !exists {
-			values[k] = v
-		}
-	}
+	collectStaticValues(keyNames, values, w.logger)
 
 	return tmpl, values, nil
 }
@@ -193,7 +179,7 @@ func (o *Orch) buildAndDispatch(w *monkey, relIdx, absIdx int, tmpl *TemplateReq
 
 // processReq - unified request processor for sync/async/block modes
 // relIdx = relative index within group (for patterns and barriers)
-// absIdx = absolute index in reqFiles (for loading request and response actions)
+// absIdx = absolute request index (for cached templates and response actions)
 func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	if verbose {
 		w.logger.Write(fmt.Sprintf("DEBUG: valChan len=%d, localBuffer[n]=%d\n",
@@ -217,7 +203,7 @@ func (o *Orch) processReq(w *monkey, relIdx, absIdx int) error {
 	}
 
 	// Phase 3: get non-static keys (key[0]!='_') needing values for request
-	keyNames := getUniqueKeyNames(tmpl)
+	keyNames := tmpl.Names
 	var keys []string
 	var needsFifo bool
 	for _, key := range keyNames {
@@ -365,7 +351,7 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 	w.blockOffsets = append(w.blockOffsets, len(w.blockBuf))
 	w.blockAbsIdx = append(w.blockAbsIdx, absIdx)
 	w.blockBuf = append(w.blockBuf, req...)
-	w.blockBuf = append(w.blockBuf, '\r', '\n') 
+	w.blockBuf = append(w.blockBuf, '\r', '\n')
 
 	// keepAll mode: never flush here, coordinator handles it
 	if o.keepAll {
@@ -422,7 +408,9 @@ func (o *Orch) flushBlock(w *monkey) error {
 			absIdx := w.blockAbsIdx[idx]
 
 			w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
-			w.prevResp = resp
+			if o.outFlag {
+				w.prevResp = resp
+			}
 			stats.ReportRequest(w.id, 0, uint32(bytesIn), 0)
 
 			// Apply response actions if configured
@@ -438,6 +426,10 @@ func (o *Orch) flushBlock(w *monkey) error {
 		stats.ReportRequest(w.id, 0, 0, uint32(bytesOut))
 
 		// Clear buffers for next batch
+		// Drop request references before keeping the slice capacity.
+		for i := range w.blockH2Reqs {
+			w.blockH2Reqs[i] = nil
+		}
 		w.blockH2Reqs = w.blockH2Reqs[:0]
 		w.blockAbsIdx = w.blockAbsIdx[:0]
 		return nil
@@ -468,7 +460,9 @@ func (o *Orch) flushBlock(w *monkey) error {
 		}
 
 		w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
-		w.prevResp = resp
+		if o.outFlag {
+			w.prevResp = resp
+		}
 
 		// Apply response actions if configured
 		if w.actionPatterns != nil && w.actionPatterns[absIdx] != nil {
@@ -540,7 +534,9 @@ func (o *Orch) doGlobalFlushH1() error {
 			}
 
 			m.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
-			m.prevResp = resp
+			if o.outFlag {
+				m.prevResp = resp
+			}
 
 			// Apply response actions if configured
 			if m.actionPatterns != nil && m.actionPatterns[absIdx] != nil {
@@ -630,7 +626,9 @@ func (o *Orch) doGlobalFlushH2() error {
 
 		m := meta.monkey
 		m.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", meta.absIdx+1, status))
-		m.prevResp = resp
+		if o.outFlag {
+			m.prevResp = resp
+		}
 		stats.ReportRequest(m.id, 0, uint32(bytesIn), 0)
 
 		// Apply response actions if configured
@@ -644,6 +642,10 @@ func (o *Orch) doGlobalFlushH2() error {
 
 	// Clear all monkey buffers
 	for _, m := range o.monkeys {
+		// Drop request references before keeping the slice capacity.
+		for i := range m.blockH2Reqs {
+			m.blockH2Reqs[i] = nil
+		}
 		m.blockH2Reqs = m.blockH2Reqs[:0]
 		m.blockAbsIdx = m.blockAbsIdx[:0]
 	}
@@ -731,7 +733,7 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 			return o.sendFireAndForget(w, req, addr, absIdx)
 		}
 
-		resp, status, err = o.sendWithReconnect(w, []byte(req), addr)
+		resp, status, err = o.sendWithReconnect(w, req, addr)
 	} else {
 		// no keep-alive: new connection each request
 		w.logger.Write(fmt.Sprintf("Conn (r%d): %s\n", absIdx+1, addr))
@@ -740,7 +742,7 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 			return o.sendFireAndForget(w, req, addr, absIdx)
 		}
 
-		resp, status, err = o.sendWithRetry(w, []byte(req), addr)
+		resp, status, err = o.sendWithRetry(w, req, addr)
 	}
 
 	if err != nil {
@@ -748,7 +750,9 @@ func (o *Orch) sendReq(w *monkey, relIdx, absIdx int, req string, addr string) e
 	}
 
 	w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
-	w.prevResp = resp
+	if o.outFlag {
+		w.prevResp = resp
+	}
 	if w.patterns != nil && relIdx < len(w.patterns) && len(w.patterns[relIdx]) > 0 {
 		patternVals, err := applyPatterns(w.patterns[relIdx], resp, w.logger)
 		if err != nil {
@@ -830,6 +834,7 @@ func loadPatterns(path string) ([][]pattern, error) {
 	return patterns, nil
 }
 
+// Check if a group of vars is used before :)
 func checkVars(groups []*ThreadGroup, univ string) error {
 	reVars = make(map[string]string)
 	for _, g := range groups {
@@ -907,29 +912,26 @@ func (o *Orch) applyResponseActions(w *monkey, idx int, req, resp, status string
 			o.pauseAllThreads()
 			o.checkPause(w)
 
-		case ActionSaveReq:
+		case ActionSaveReq, ActionSaveResp, ActionSaveAll:
 			// Save request that generated match
-			if err := os.WriteFile(action.arg, []byte(req), 0644); err != nil {
-				w.logger.Write(fmt.Sprintf("RA save error: %v\n", err))
-			} else {
-				w.logger.Write(fmt.Sprintf("RA saved req to: %s\n", action.arg))
-			}
-
-		case ActionSaveResp:
+			data, kind := req, "req"
 			// Save response that generated match
-			if err := os.WriteFile(action.arg, []byte(resp), 0644); err != nil {
-				w.logger.Write(fmt.Sprintf("RA save error: %v\n", err))
-			} else {
-				w.logger.Write(fmt.Sprintf("RA saved resp to: %s\n", action.arg))
+			switch action.actionType {
+			case ActionSaveResp:
+				data, kind = resp, "resp"
+			case ActionSaveAll:
+				data = fmt.Sprintf("=== REQUEST ===\n%s\n\n=== RESPONSE ===\n%s", req, resp)
+				kind = "req+resp"
 			}
-
-		case ActionSaveAll:
-			// Save both request and response
-			content := fmt.Sprintf("=== REQUEST ===\n%s\n\n=== RESPONSE ===\n%s", req, resp)
-			if err := os.WriteFile(action.arg, []byte(content), 0644); err != nil {
+			name := fmt.Sprintf("thr%d_%s", w.localID+1, filepath.Base(action.arg))
+			if o.uiManager != nil && len(o.uiManager.groups) > 1 {
+				name = fmt.Sprintf("g%d%s", w.groupID+1, name)
+			}
+			path := filepath.Join(filepath.Dir(action.arg), name)
+			if err := os.WriteFile(path, []byte(data), 0644); err != nil {
 				w.logger.Write(fmt.Sprintf("RA save error: %v\n", err))
 			} else {
-				w.logger.Write(fmt.Sprintf("RA saved req+resp to: %s\n", action.arg))
+				w.logger.Write(fmt.Sprintf("RA saved %s to: %s\n", kind, path))
 			}
 
 		case ActionExit:

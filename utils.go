@@ -483,7 +483,8 @@ func parseActions(s string) ([]respAction, error) {
 // setupValDist - creates and initializes value distributor
 func setupValDist(univFlag string, fmodeFlag int, fifoThreadIDs []int, keySubscriptions map[int][]string, logger LogWriter) *ValDist {
 	if univFlag == "" {
-		return NewValDist("", 1, fifoThreadIDs, keySubscriptions)
+		// Keep empty-mode state without FIFO queues.
+		return NewValDist("", 1, nil, nil)
 	}
 	if !strings.Contains(univFlag, "=") {
 		vd := NewValDist(univFlag, fmodeFlag, fifoThreadIDs, keySubscriptions)

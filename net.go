@@ -15,8 +15,8 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-// send - creates new conn and sends request
-func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, tlsCert *utls.Certificate, logger LogWriter,
+// send - sends raw H2 text or prepared H1 bytes over a new connection.
+func send(raw string, data []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, tlsCert *utls.Certificate, logger LogWriter,
 	threadID int, httpH2 bool) (resp, status string, err error) {
 	conn, err := dialWithProxy(addr, proxyURL)
 	if err != nil {
@@ -36,10 +36,10 @@ func send(raw []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Durati
 
 	// Route by protocol - parse only when needed for H2
 	if !httpH2 {
-		return sendOnConn(raw, conn, threadID)
+		return sendOnConn(data, conn, threadID)
 	}
 
-	req := parseRawReq2H2(string(raw))
+	req := parseRawReq2H2(raw)
 	if req == nil {
 		return "", "", fmt.Errorf("failed to parse request")
 	}
@@ -400,10 +400,14 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) error {
 	return fmt.Errorf("dial failed after %d retries: %v", o.maxRetries, lastErr)
 }
 
-// sendWithRetry - send with retry on error (routes by httpH2)
-func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string, error) {
+// sendWithRetry - retries raw request text using the selected protocol.
+func (o *Orch) sendWithRetry(w *monkey, raw string, addr string) (string, string, error) {
 	var lastErr error
 	backoff := 100 * time.Millisecond
+	var data []byte
+	if !o.httpH2 {
+		data = []byte(raw)
+	}
 
 	for attempt := 0; attempt < o.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -418,7 +422,7 @@ func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string
 			}
 		}
 
-		resp, status, err := send(raw, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, o.tlsCert, w.logger, w.id, o.httpH2)
+		resp, status, err := send(raw, data, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, o.tlsCert, w.logger, w.id, o.httpH2)
 		if err == nil {
 			return resp, status, nil
 		}
@@ -428,10 +432,14 @@ func (o *Orch) sendWithRetry(w *monkey, raw []byte, addr string) (string, string
 	return "", "", fmt.Errorf("send failed after %d retries: %v", o.maxRetries, lastErr)
 }
 
-// sendWithReconnect - send on existing conn, reconnect on error
-func (o *Orch) sendWithReconnect(w *monkey, raw []byte, addr string) (string, string, error) {
+// sendWithReconnect - sends raw text on an existing connection, reconnecting on error.
+func (o *Orch) sendWithReconnect(w *monkey, raw string, addr string) (string, string, error) {
 	var resp, status string
 	var err error
+	var data []byte
+	if !o.httpH2 {
+		data = []byte(raw)
+	}
 
 	// Try existing connection
 	if o.httpH2 {
@@ -454,7 +462,7 @@ func (o *Orch) sendWithReconnect(w *monkey, raw []byte, addr string) (string, st
 		w.connMu.Unlock()
 
 		if conn != nil {
-			resp, status, err = sendOnConn(raw, conn, w.id)
+			resp, status, err = sendOnConn(data, conn, w.id)
 			if err == nil {
 				return resp, status, nil
 			}
@@ -474,7 +482,7 @@ func (o *Orch) sendWithReconnect(w *monkey, raw []byte, addr string) (string, st
 	if o.httpH2 {
 		return sendOnConnH2(raw, w.h2conn, w.id)
 	}
-	return sendOnConn(raw, w.conn, w.id)
+	return sendOnConn(data, w.conn, w.id)
 }
 
 // dialNewConn - creates new connection for fire-and-forget (non-keepalive mode)

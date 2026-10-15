@@ -251,7 +251,7 @@ func parseGroupLine(line string, groupID, lineNum int, httpH2 bool) (*ThreadGrou
 				k = strings.TrimSpace(k)
 				if len(k) == 0 {
 					continue
-				}				
+				}
 				group.Wait2Keys = append(group.Wait2Keys, k)
 			}
 
@@ -420,11 +420,11 @@ func getFifoThreadIDs(groups []*ThreadGroup) []int {
 	return ids
 }
 
-// extractKeySubscriptions - extracts non-static FIFO keys from templates for each thread
+// extractKeySubscriptions - maps cached non-static template keys to FIFO threads.
 // Returns map[threadID][]keys where keys are the non-static ($key$, not $_key$) placeholders
 // that the thread will need based on its group's request templates.
 // Returns nil if no subscriptions needed (all groups use NoFifo).
-func extractKeySubscriptions(groups []*ThreadGroup, reqFiles []string) map[int][]string {
+func extractKeySubscriptions(groups []*ThreadGroup, reqTmpls []*TemplateReq) map[int][]string {
 	result := make(map[int][]string)
 	hasAny := false
 
@@ -438,19 +438,11 @@ func extractKeySubscriptions(groups []*ThreadGroup, reqFiles []string) map[int][
 		groupKeys := make(map[string]bool)
 
 		for _, reqIdx := range g.ReqIndices {
-			// Read request file
-			data, err := os.ReadFile(reqFiles[reqIdx])
-			if err != nil {
-				// Skip files that can't be read (will error later during execution)
-				continue
-			}
-
-			// Parse template and extract keys (reuses existing parseTemplate)
-			tmpl := parseTemplate(string(data))
-			for _, keyInfo := range tmpl.Keys {
+			tmpl := reqTmpls[reqIdx]
+			for _, key := range tmpl.Names {
 				// Only non-static keys (not starting with _)
-				if len(keyInfo.Name) > 0 && keyInfo.Name[0] != '_' {
-					groupKeys[keyInfo.Name] = true
+				if len(key) > 0 && key[0] != '_' {
+					groupKeys[key] = true
 				}
 			}
 		}

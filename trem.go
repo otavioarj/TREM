@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.9.2"
+var version = "v1.9.4"
 
 // Global flags
 var verbose bool
@@ -51,19 +51,18 @@ type monkey struct {
 	groupID         int // group this monkey belongs to
 	localID         int // thread ID within group (0-based)
 	logger          LogWriter
-	conn            net.Conn   // HTTP/1.1 persistent connection
-	h2conn          *H2Conn    // HTTP/2 connection wrapper
-	connAddr        string     // current connection address
-	connMu          sync.Mutex // connection mutex
-	prevResp        string     // only used with -o, to save last request of the chain
-	reqFiles        []string
-	reqIndices      []int       // which request indices to process (0-based, sorted)
-	patterns        [][]pattern // patterns for transitions
+	conn            net.Conn       // HTTP/1.1 persistent connection
+	h2conn          *H2Conn        // HTTP/2 connection wrapper
+	connAddr        string         // current connection address
+	connMu          sync.Mutex     // connection mutex
+	prevResp        string         // last response for -o
+	reqTmpls        []*TemplateReq // shared read-only templates
+	reqIndices      []int          // which request indices to process (0-based, sorted)
+	patterns        [][]pattern    // patterns for transitions
 	lastPatternVals map[string]string
 	// Response action patterns (read-only per thread, uses absolute indices)
 	actionPatterns map[int]*actionPattern
 	// Cache for loop optimization
-	reqCache      []string
 	loopStartReq  string
 	loopStartAddr string
 
@@ -237,6 +236,10 @@ func main() {
 	if len(reqFiles) < 2 && *modeFlag != "block" {
 		exitErr("Need at least 2 req files")
 	}
+	reqTmpls, err := loadTemplates(reqFiles)
+	if err != nil {
+		exitErr(err.Error())
+	}
 
 	// Load response action patterns (global, uses absolute indices)
 	actionPatterns, err := loadActionPatterns(*raFlag)
@@ -282,7 +285,7 @@ func main() {
 
 		// Extract key subscriptions for FIFO distribution
 		if *fkdistFlag {
-			keySubscriptions = extractKeySubscriptions(groups, reqFiles)
+			keySubscriptions = extractKeySubscriptions(groups, reqTmpls)
 		}
 
 		configBanner = formatGroupsBanner(groups, *cliFlag, *fbckFlag, verbose, *httpFlag, *proxyFlag, *mtlsFlag, *hostFlag, *univFlag)
@@ -355,21 +358,17 @@ func main() {
 	}
 
 	// Run orchestration
-	runOrchestration(groups, reqFiles, actionPatterns, *univFlag, *fmodeFlag,
+	runOrchestration(groups, reqTmpls, actionPatterns, *univFlag, *fmodeFlag,
 		*hostFlag, *outFlag, *kaFlag, *proxyFlag, *cliFlag, *touFlag,
 		*retryFlag, *httpFlag, *fwFlag, *fbckFlag, *mtlsFlag, *dumpFlag, windowSize, *delayFlag, *dsizeFlag, keySubscriptions)
 }
 
-// validateGroupHost - validates all requests in group target same host:port
+// validateGroupHost - checks cached requests in a group target the same host:port.
 // Returns the common address or error if hosts differ
-func validateGroupHost(reqFiles []string, reqIndices []int, hostFlag string) (string, error) {
+func validateGroupHost(reqTmpls []*TemplateReq, reqIndices []int, hostFlag string) (string, error) {
 	var expected string
 	for _, idx := range reqIndices {
-		data, err := os.ReadFile(reqFiles[idx])
-		if err != nil {
-			return "", fmt.Errorf("cannot read request file %d: %v", idx+1, err)
-		}
-		req := string(data)
+		req := reqTmpls[idx].Raw
 		req = normalizeReq(req, true)
 		addr, err := parseHost(req, hostFlag)
 		if err != nil {
@@ -385,7 +384,7 @@ func validateGroupHost(reqFiles []string, reqIndices []int, hostFlag string) (st
 }
 
 // runOrchestration - unified execution for both single and group modes
-func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns map[int]*actionPattern,
+func runOrchestration(groups []*ThreadGroup, reqTmpls []*TemplateReq, actionPatterns map[int]*actionPattern,
 	univFlag string, fmodeFlag int, hostFlag string, outFlag, kaFlag bool,
 	proxyFlag string, cliFlag, touFlag, retryFlag int, httpFlag, fwFlag bool,
 	fbckFlag int, mtlsFlag string, dumpFlag bool, windowSize int, defaultDelay int, maxDataSize int, keySubscriptions map[int][]string) {
@@ -425,7 +424,7 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 
 		// Validate -ka host requirement
 		if g.KeepAll {
-			_, err := validateGroupHost(reqFiles, g.ReqIndices, hostFlag)
+			_, err := validateGroupHost(reqTmpls, g.ReqIndices, hostFlag)
 			if err != nil {
 				exitErr(fmt.Sprintf("group %d: %v", g.ID+1, err))
 			}
@@ -449,7 +448,7 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 				groupID:        g.ID,
 				localID:        i,
 				logger:         ui.GetLogger(globalID),
-				reqFiles:       reqFiles,
+				reqTmpls:       reqTmpls,
 				reqIndices:     g.ReqIndices,
 				patterns:       g.Patterns,
 				actionPatterns: actionPatterns,
@@ -545,7 +544,7 @@ func runOrchestration(groups []*ThreadGroup, reqFiles []string, actionPatterns m
 			// Keep-all mode: dial shared connection on monkey[0] before starting workers
 			if o.keepAll {
 				w := o.monkeys[0]
-				addr, _ := validateGroupHost(w.reqFiles, o.reqIndices, o.hostFlag)
+				addr, _ := validateGroupHost(w.reqTmpls, o.reqIndices, o.hostFlag)
 				w.connAddr = addr
 				if err := o.dialWithRetry(w, addr); err != nil {
 					w.logger.Write(fmt.Sprintf("ERR: shared conn dial: %v\n", err))
@@ -789,19 +788,6 @@ func (o *Orch) runWorker(w *monkey) {
 	if len(reqIndices) == 0 {
 		w.logger.Write("ERR: no request indices assigned\n")
 		return
-	}
-
-	// Load cache if loop enabled (cache all reqFiles, access by absolute index)
-	if o.loopStart > 0 {
-		w.reqCache = make([]string, len(w.reqFiles))
-		for i, file := range w.reqFiles {
-			raw, err := os.ReadFile(file)
-			if err != nil {
-				w.logger.Write(fmt.Sprintf("ERR: cache load: %v\n", err))
-				return
-			}
-			w.reqCache[i] = string(raw)
-		}
 	}
 
 	// Keep-all mode: run specialized loop

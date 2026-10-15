@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,8 +18,9 @@ type KeyInfo struct {
 
 // TemplateReq - parsed request template with pre-extracted keys
 type TemplateReq struct {
-	Raw  string    // original request content
-	Keys []KeyInfo // placeholders sorted by offset
+	Raw   string    // original request content
+	Keys  []KeyInfo // placeholders sorted by offset
+	Names []string  // unique keys in first-use order
 }
 
 // templateCache - global cache for parsed templates (path → *TemplateReq)
@@ -31,6 +33,7 @@ func parseTemplate(raw string) *TemplateReq {
 		Raw:  raw,
 		Keys: make([]KeyInfo, 0, 8),
 	}
+	seen := make(map[string]bool)
 
 	i := 0
 	for i < len(raw) {
@@ -55,6 +58,10 @@ func parseTemplate(raw string) *TemplateReq {
 				Start: start,
 				End:   end + 1,
 			})
+			if !seen[name] {
+				seen[name] = true
+				tmpl.Names = append(tmpl.Names, name)
+			}
 		}
 
 		i = end + 1
@@ -78,21 +85,21 @@ func getTemplate(path string, raw string) *TemplateReq {
 	return tmpl
 }
 
-// getUniqueKeyNames - returns deduplicated slice of key names
-func getUniqueKeyNames(tmpl *TemplateReq) []string {
-	if len(tmpl.Keys) == 0 {
-		return nil
-	}
-
-	seen := make(map[string]bool, len(tmpl.Keys))
-	names := make([]string, 0, len(tmpl.Keys))
-	for _, k := range tmpl.Keys {
-		if !seen[k.Name] {
-			seen[k.Name] = true
-			names = append(names, k.Name)
+// loadTemplates - loads fixed request files once for all groups and workers.
+func loadTemplates(paths []string) ([]*TemplateReq, error) {
+	tmpls := make([]*TemplateReq, len(paths))
+	for i, path := range paths {
+		if cached, ok := templateCache.Load(path); ok {
+			tmpls[i] = cached.(*TemplateReq)
+			continue
 		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		tmpls[i] = getTemplate(path, string(raw))
 	}
-	return names
+	return tmpls, nil
 }
 
 // buildRequest - substitutes all keys in single pass using pre-parsed template
@@ -247,18 +254,17 @@ func applyPatterns(pats []pattern, prevResp string, logger LogWriter) (map[strin
 	return values, nil
 }
 
-// collectStaticValues - collects values from globalStaticVals for keys in template
+// collectStaticValues - fills missing globals without replacing local overrides.
 // Only collects for keys that exist in request and have values in global store
-func collectStaticValues(keys []string, logger LogWriter) map[string]string {
-	values := make(map[string]string)
+func collectStaticValues(keys []string, values map[string]string, logger LogWriter) {
 	for _, key := range keys {
 		if len(key) > 0 && key[0] == '_' {
 			if v, exists := globalStaticVals.Load(key); exists {
-				values[key] = v.(string)
+				if _, exists := values[key]; !exists {
+					values[key] = v.(string)
+				}
 				logger.Write(fmt.Sprintf("Static $%s$: %s\n", key, v.(string)))
 			}
 		}
 	}
-
-	return values
 }
