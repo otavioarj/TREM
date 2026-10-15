@@ -91,6 +91,7 @@ type Orch struct {
 	reqDelayMs    int // delay between requests (from -d or r_delay)
 	loopDelayMs   int // static delay before each xt loop cycle (from x_delay, cycle 0 excluded)
 	outFlag       bool
+	tls           bool
 	keepAlive     bool
 	proxyURL      string
 	loopStart     int
@@ -153,6 +154,7 @@ func main() {
 	touFlag := flag.Int("tou", 5000, "TLS dial timeout (ms)")
 	retryFlag := flag.Int("retry", 3, "Max connection retries")
 	httpFlag := flag.Bool("h2", false, "Force HTTP/2")
+	tlsFlag := flag.Bool("tls", true, "Use TLS")
 	univFlag := flag.String("u", "", "Universaly replaces key=val.\nIf key=value, ie., num=179, will match/replace every"+
 		" $num$ (requests) to 179.\nIf it's a path. ie., /tmp/fifo, will create a named-pipe where other program can write key=value"+
 		"\nExample of a password-spray racer: ./trem <params> -u /tmp/fifo || cat pass-spray.txt > /tmp/fifo\n"+
@@ -201,6 +203,9 @@ func main() {
 	flag.Parse()
 
 	verbose = *verboseFlag
+	if *httpFlag && !*tlsFlag {
+		exitErr("-h2 requires -tls")
+	}
 
 	// Validate mode flag
 	if *modeFlag != "async" && *modeFlag != "sync" && *modeFlag != "block" {
@@ -233,9 +238,6 @@ func main() {
 	}
 
 	reqFiles := strings.Split(*listFlag, ",")
-	if len(reqFiles) < 2 && *modeFlag != "block" {
-		exitErr("Need at least 2 req files")
-	}
 	reqTmpls, err := loadTemplates(reqFiles)
 	if err != nil {
 		exitErr(err.Error())
@@ -278,7 +280,7 @@ func main() {
 				}
 				g.Patterns = patterns[:numTransitions]
 			} else {
-				// No patterns file = fire-and-forget for all transitions
+				// No patterns file: read responses without extraction.
 				g.Patterns = make([][]pattern, numTransitions)
 			}
 		}
@@ -294,7 +296,7 @@ func main() {
 		isBlockMode := *modeFlag == "block"
 
 		// Block mode ignores -re
-		if !isBlockMode && *reFlag == "" {
+		if !isBlockMode && len(reqFiles) > 1 && *reFlag == "" {
 			exitErr("-re is required in single mode (or use -thrG for group mode, or mode=block)")
 		}
 
@@ -310,7 +312,7 @@ func main() {
 		if isBlockMode {
 			// Block mode: empty patterns
 			allPatterns = make([][]pattern, len(reqFiles)-1)
-		} else {
+		} else if *reFlag != "" {
 			allPatterns, err = loadPatterns(*reFlag)
 			if err != nil {
 				exitErr(err.Error())
@@ -360,17 +362,17 @@ func main() {
 	// Run orchestration
 	runOrchestration(groups, reqTmpls, actionPatterns, *univFlag, *fmodeFlag,
 		*hostFlag, *outFlag, *kaFlag, *proxyFlag, *cliFlag, *touFlag,
-		*retryFlag, *httpFlag, *fwFlag, *fbckFlag, *mtlsFlag, *dumpFlag, windowSize, *delayFlag, *dsizeFlag, keySubscriptions)
+		*retryFlag, *httpFlag, *tlsFlag, *fwFlag, *fbckFlag, *mtlsFlag, *dumpFlag, windowSize, *delayFlag, *dsizeFlag, keySubscriptions)
 }
 
 // validateGroupHost - checks cached requests in a group target the same host:port.
 // Returns the common address or error if hosts differ
-func validateGroupHost(reqTmpls []*TemplateReq, reqIndices []int, hostFlag string) (string, error) {
+func validateGroupHost(reqTmpls []*TemplateReq, reqIndices []int, hostFlag string, tls bool) (string, error) {
 	var expected string
 	for _, idx := range reqIndices {
 		req := reqTmpls[idx].Raw
 		req = normalizeReq(req, true)
-		addr, err := parseHost(req, hostFlag)
+		addr, err := parseHost(req, hostFlag, tls)
 		if err != nil {
 			return "", fmt.Errorf("request %d: %v", idx+1, err)
 		}
@@ -383,10 +385,10 @@ func validateGroupHost(reqTmpls []*TemplateReq, reqIndices []int, hostFlag strin
 	return expected, nil
 }
 
-// runOrchestration - unified execution for both single and group modes
+// runOrchestration - unified execution for both single and group modes 
 func runOrchestration(groups []*ThreadGroup, reqTmpls []*TemplateReq, actionPatterns map[int]*actionPattern,
 	univFlag string, fmodeFlag int, hostFlag string, outFlag, kaFlag bool,
-	proxyFlag string, cliFlag, touFlag, retryFlag int, httpFlag, fwFlag bool,
+	proxyFlag string, cliFlag, touFlag, retryFlag int, httpFlag, tlsFlag, fwFlag bool,
 	fbckFlag int, mtlsFlag string, dumpFlag bool, windowSize int, defaultDelay int, maxDataSize int, keySubscriptions map[int][]string) {
 
 	totalThreads := getTotalThreads(groups)
@@ -424,7 +426,7 @@ func runOrchestration(groups []*ThreadGroup, reqTmpls []*TemplateReq, actionPatt
 
 		// Validate -ka host requirement
 		if g.KeepAll {
-			_, err := validateGroupHost(reqTmpls, g.ReqIndices, hostFlag)
+			_, err := validateGroupHost(reqTmpls, g.ReqIndices, hostFlag, tlsFlag)
 			if err != nil {
 				exitErr(fmt.Sprintf("group %d: %v", g.ID+1, err))
 			}
@@ -473,6 +475,7 @@ func runOrchestration(groups []*ThreadGroup, reqTmpls []*TemplateReq, actionPatt
 			reqDelayMs:    reqDelay,
 			loopDelayMs:   g.XDelay,
 			outFlag:       outFlag,
+			tls:           tlsFlag,
 			keepAlive:     kaFlag,
 			proxyURL:      proxyFlag,
 			loopStart:     g.LoopStart,
@@ -544,7 +547,7 @@ func runOrchestration(groups []*ThreadGroup, reqTmpls []*TemplateReq, actionPatt
 			// Keep-all mode: dial shared connection on monkey[0] before starting workers
 			if o.keepAll {
 				w := o.monkeys[0]
-				addr, _ := validateGroupHost(w.reqTmpls, o.reqIndices, o.hostFlag)
+				addr, _ := validateGroupHost(w.reqTmpls, o.reqIndices, o.hostFlag, o.tls)
 				w.connAddr = addr
 				if err := o.dialWithRetry(w, addr); err != nil {
 					w.logger.Write(fmt.Sprintf("ERR: shared conn dial: %v\n", err))
@@ -635,17 +638,18 @@ func (o *Orch) runKeepAllOrchestration() {
 			}
 		}
 
-		// Signal workers flush is done
-		close(o.kaFlushDone)
-
 		iteration++
 
-		// Reset channels for next iteration
+		// Publish the next cycle before releasing current workers.
 		o.kaIterMu.Lock()
+		done := o.kaFlushDone
 		o.kaReadyChan = make(chan int, len(o.monkeys))
 		o.kaFlushDone = make(chan struct{})
 		o.kaIteration = iteration
 		o.kaIterMu.Unlock()
+
+		// Signal workers flush is done
+		close(done)
 	}
 }
 
@@ -828,11 +832,15 @@ func (o *Orch) runWorker(w *monkey) {
 
 			// Sync mode: signal ready for loop, then wait for release
 			if o.mode == "sync" {
-				o.loopReadyChan <- w.id
+				// Capture this cycle before the coordinator swaps channels.
+				o.barrierMu.Lock()
+				ready, loop := o.loopReadyChan, o.loopChan
+				o.barrierMu.Unlock()
+				ready <- w.id
 				select {
 				case <-o.quitChan:
 					return
-				case <-o.loopChan:
+				case <-loop:
 				}
 			}
 
@@ -922,8 +930,11 @@ func (o *Orch) runWorkerKeepAll(w *monkey) {
 		}
 
 		// Signal accumulation done, wait for global flush
-		o.kaReadyChan <- w.id
-		<-o.kaFlushDone
+		o.kaIterMu.Lock()
+		ready, done := o.kaReadyChan, o.kaFlushDone
+		o.kaIterMu.Unlock()
+		ready <- w.id
+		<-done
 
 		// Clear non-static buffers for next iteration
 		for k := range w.localBuffer {

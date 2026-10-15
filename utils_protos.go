@@ -56,10 +56,10 @@ func decodeBody(body *bytes.Buffer, encoding string) ([]byte, error) {
 	}
 }
 
-// parseHost - extracts host:port from request Host header or override
+// parseHost - extracts host:port using the selected TLS default port.
 // Uses regex with (?m) multiline flag to match directly without splitting lines
 // This is more efficient than iterating over all lines
-func parseHost(req, override string) (string, error) {
+func parseHost(req, override string, tls bool) (string, error) {
 	if override != "" {
 		return override, nil
 	}
@@ -69,7 +69,10 @@ func parseHost(req, override string) (string, error) {
 		h := m[1]
 		port := m[2]
 		if port == "" {
-			return h + ":443", nil
+			if tls {
+				return h + ":443", nil
+			}
+			return h + ":80", nil
 		}
 		return h + ":" + port, nil
 	}

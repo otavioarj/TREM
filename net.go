@@ -15,16 +15,16 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-// send - sends raw H2 text or prepared H1 bytes over a new connection.
+// send - sends raw H2 text or prepared H1 bytes with TLS selection for new connection.
 func send(raw string, data []byte, addr, proxyURL string, cliMode int, tlsTimeout time.Duration, tlsCert *utls.Certificate, logger LogWriter,
-	threadID int, httpH2 bool) (resp, status string, err error) {
+	threadID int, httpH2, tls bool) (resp, status string, err error) {
 	conn, err := dialWithProxy(addr, proxyURL)
 	if err != nil {
 		return "", "", err
 	}
 
-	host, port, _ := net.SplitHostPort(addr)
-	if port == "443" {
+	host, _, _ := net.SplitHostPort(addr)
+	if tls {
 		tlsConn, err := tlsHandshakeDo(conn, host, cliMode, tlsTimeout, logger, threadID, tlsCert, httpH2)
 		if err != nil {
 			conn.Close()
@@ -357,9 +357,8 @@ func (o *Orch) dialWithRetry(w *monkey, addr string) error {
 			continue
 		}
 
-		host, port, _ := net.SplitHostPort(addr)
-		// default is TLS!
-		if port != "8080" || port != "80" {
+		host, _, _ := net.SplitHostPort(addr)
+		if o.tls {
 			tlsConn, err := tlsHandshakeDo(conn, host, o.clientHelloID, o.tlsTimeout, w.logger, w.id, o.tlsCert, h2)
 			if err != nil {
 				conn.Close()
@@ -422,7 +421,7 @@ func (o *Orch) sendWithRetry(w *monkey, raw string, addr string) (string, string
 			}
 		}
 
-		resp, status, err := send(raw, data, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, o.tlsCert, w.logger, w.id, o.httpH2)
+		resp, status, err := send(raw, data, addr, o.proxyURL, o.clientHelloID, o.tlsTimeout, o.tlsCert, w.logger, w.id, o.httpH2, o.tls)
 		if err == nil {
 			return resp, status, nil
 		}
@@ -486,15 +485,15 @@ func (o *Orch) sendWithReconnect(w *monkey, raw string, addr string) (string, st
 }
 
 // dialNewConn - creates new connection for fire-and-forget (non-keepalive mode)
-func (o *Orch) dialNewConn(addr string) (net.Conn, error) {
+func (o *Orch) dialNewConn(w *monkey, addr string) (net.Conn, error) {
 	conn, err := dialWithProxy(addr, o.proxyURL)
 	if err != nil {
 		return nil, err
 	}
 
-	host, port, _ := net.SplitHostPort(addr)
-	if port == "443" {
-		tlsConn, err := tlsHandshakeDo(conn, host, o.clientHelloID, o.tlsTimeout, nil, -1, o.tlsCert, false)
+	host, _, _ := net.SplitHostPort(addr)
+	if o.tls {
+		tlsConn, err := tlsHandshakeDo(conn, host, o.clientHelloID, o.tlsTimeout, w.logger, w.id, o.tlsCert, false)
 		if err != nil {
 			conn.Close()
 			return nil, err

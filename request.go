@@ -147,9 +147,12 @@ func (o *Orch) doBarrier(w *monkey, relIdx int, addr string) error {
 	}
 
 	// Signal ready and wait for barrier release
-	o.readyChan <- w.id
+	o.barrierMu.Lock()
+	ready, start := o.readyChan, o.startChan
+	o.barrierMu.Unlock()
+	ready <- w.id
 	w.logger.Write("Ready, waiting sync...\n")
-	<-o.startChan
+	<-start
 	w.logger.Write("Sync!\n")
 
 	return nil
@@ -162,7 +165,7 @@ func (o *Orch) doBarrier(w *monkey, relIdx int, addr string) error {
 func (o *Orch) buildAndDispatch(w *monkey, relIdx, absIdx int, tmpl *TemplateReq, values map[string]string, checkBarrier bool) error {
 	req := buildRequest(tmpl, values)
 	req = normalizeReq(req, o.blockMode)
-	addr, err := parseHost(req, o.hostFlag)
+	addr, err := parseHost(req, o.hostFlag, o.tls)
 	if err != nil {
 		return err
 	}
@@ -688,7 +691,7 @@ func (o *Orch) sendFireAndForget(w *monkey, req, addr string, absIdx int) error 
 		o.closeWorkerConn(w)
 	} else {
 		// non-keepalive mode: create new connection
-		conn, err := o.dialNewConn(addr)
+		conn, err := o.dialNewConn(w, addr)
 		if err != nil {
 			return err
 		}
