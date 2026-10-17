@@ -7,18 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
+	"net"
 	"strings"
 
 	utls "github.com/refraction-networking/utls"
 )
-
-// Pre-compiled regex for parseHost
-// The (?m) flag enables multiline mode where ^ matches at line start
-var hostHeaderRe = regexp.MustCompile(`(?im)^Host:\s*([^:\r\n]+)(?::(\d+))?`)
-
-// httpVersionRe - matches HTTP/x.x at end of request line
-var httpVersionRe = regexp.MustCompile(`HTTP/\d(?:\.\d)?`)
 
 // decodeBody - decompresses gzip/deflate encoded body
 // Returns raw bytes if encoding is empty, identity, or unknown
@@ -56,25 +49,40 @@ func decodeBody(body *bytes.Buffer, encoding string) ([]byte, error) {
 	}
 }
 
-// parseHost - extracts host:port using the selected TLS default port.
-// Uses regex with (?m) multiline flag to match directly without splitting lines
-// This is more efficient than iterating over all lines
+// parseHost - reads only headers and applies the selected TLS default port
 func parseHost(req, override string, tls bool) (string, error) {
 	if override != "" {
 		return override, nil
 	}
-
-	// hostHeaderRe has (?m) flag, so ^ matches line start in multiline string
-	if m := hostHeaderRe.FindStringSubmatch(req); m != nil {
-		h := m[1]
-		port := m[2]
-		if port == "" {
-			if tls {
-				return h + ":443", nil
-			}
-			return h + ":80", nil
+	_, hdr, _ := splitReqHdr(req)
+	for hdr != "" {
+		var line string
+		line, hdr = readReqLine(hdr)
+		key, val, ok := strings.Cut(line, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "Host") {
+			continue
 		}
-		return h + ":" + port, nil
+		host := strings.TrimSpace(val)
+		port := "80"
+		if tls {
+			port = "443"
+		}
+		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+			host = host[1 : len(host)-1]
+			if net.ParseIP(host) == nil {
+				return "", fmt.Errorf("invalid Host header: %q", val)
+			}
+		} else if strings.Contains(host, ":") {
+			var err error
+			host, port, err = net.SplitHostPort(host)
+			if err != nil {
+				return "", fmt.Errorf("invalid Host header: %q", val)
+			}
+		}
+		if host == "" || port == "" || strings.ContainsAny(host, " \t") {
+			return "", fmt.Errorf("invalid Host header: %q", val)
+		}
+		return net.JoinHostPort(host, port), nil
 	}
 	return "", errors.New("no Host header found")
 }

@@ -212,14 +212,25 @@ func (h *H2Conn) encodeReqFrames(dst *bytes.Buffer, req *ParsedReq, streamID uin
 	hasBody := len(req.Body) > 0
 
 	flags := byte(flagEndHeaders)
-	if !hasBody {
+	if !hasBody && len(req.Trailers) == 0 {
 		flags |= flagEndStream
 	}
 
 	writeFrame(dst, frameHeaders, flags, streamID, headerBlock)
 
 	if hasBody {
-		writeFrame(dst, frameData, flagEndStream, streamID, req.Body)
+		flags := byte(0)
+		if len(req.Trailers) == 0 {
+			flags = flagEndStream
+		}
+		writeFrame(dst, frameData, flags, streamID, req.Body)
+	}
+	if len(req.Trailers) > 0 {
+		h.encBuf.Reset()
+		for _, hdr := range req.Trailers {
+			h.enc.WriteField(hpack.HeaderField{Name: strings.ToLower(hdr[0]), Value: hdr[1]})
+		}
+		writeFrame(dst, frameHeaders, flagEndHeaders|flagEndStream, streamID, h.encBuf.Bytes())
 	}
 }
 
@@ -567,9 +578,9 @@ func writeFrame(dst *bytes.Buffer, ftype, flags byte, streamID uint32, payload [
 
 // sendOnConnH2 - parses raw text and sends on an existing H2 connection.
 func sendOnConnH2(raw string, h2 *H2Conn, threadID int) (resp, status string, err error) {
-	req := parseRawReq2H2(raw)
-	if req == nil {
-		return "", "", fmt.Errorf("failed to parse request")
+	req, err := parseRawReq2H2(raw)
+	if err != nil {
+		return "", "", err
 	}
 	return h2.sendReqH2(req, threadID, true)
 }

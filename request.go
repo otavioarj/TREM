@@ -5,19 +5,24 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 )
 
 // ParsedReq - protocol-agnostic request structure
 type ParsedReq struct {
-	Method  string
-	Path    string
-	Host    string
-	Headers [][2]string // preserves order
-	Body    []byte
+	Method   string
+	Path     string
+	Host     string
+	Headers  [][2]string // preserves order
+	Body     []byte
+	Trailers [][2]string
 }
 
 // String - reconstructs raw HTTP request from ParsedReq (used for actions/logging)
@@ -37,66 +42,110 @@ func (p *ParsedReq) String() string {
 	}
 	sb.WriteString("\r\n")
 	sb.Write(p.Body)
+	if len(p.Trailers) > 0 {
+		sb.WriteString("\r\n")
+		for _, h := range p.Trailers {
+			sb.WriteString(h[0] + ": " + h[1] + "\r\n")
+		}
+	}
 	return sb.String()
 }
 
-// parseRawReq2H2 - parses HTTP/1.1 raw text into HTTP2 ParsedReq
+// parseRawReq2H2 - converts normalized text to H2, decoding chunked bodies and trailers
 // TREM always get request as HTTP/1.1, so pseudo-headers ARE IGNORED here!
-func parseRawReq2H2(raw string) *ParsedReq {
-	lines := strings.Split(raw, "\r\n")
-	if len(lines) == 0 {
-		return nil
+func parseRawReq2H2(raw string) (*ParsedReq, error) {
+	line, hdr, body := splitReqHdr(raw)
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return nil, errors.New("invalid request line")
 	}
-
-	req := &ParsedReq{
-		Headers: make([][2]string, 0, 16),
-	}
-
-	// Parse request line: METHOD PATH HTTP/1.1
-	parts := strings.SplitN(lines[0], " ", 3)
-	if len(parts) >= 2 {
-		req.Method = parts[0]
-		req.Path = parts[1]
-	}
-
-	// Parse headers
-	bodyIdx := -1
-	for i := 1; i < len(lines); i++ {
-		line := lines[i]
-		if line == "" {
-			bodyIdx = i + 1
-			break
+	req := &ParsedReq{Method: parts[0], Path: parts[1], Headers: make([][2]string, 0, 16)}
+	var conn map[string]bool
+	var te []string
+	for hdr != "" {
+		var line string
+		line, hdr = readReqLine(hdr)
+		key, val, ok := strings.Cut(line, ":")
+		if !ok || key == "" {
+			continue
 		}
-
-		idx := strings.Index(line, ":")
-		if idx > 0 {
-			key := strings.TrimSpace(line[:idx])
-			val := strings.TrimSpace(line[idx+1:])
-
-			// Extract host for :authority pseudo-header
-			if strings.EqualFold(key, "Host") {
+		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+		lower := strings.ToLower(key)
+		if lower == "host" {
+			if req.Host == "" {
 				req.Host = val
 			}
-
-			// SKIP headers that become pseudo-headers in h2
-			// or are connection-specific (not allowed in h2)
-			lower := strings.ToLower(key)
-			if lower == "host" || lower == "connection" ||
-				lower == "keep-alive" || lower == "transfer-encoding" ||
-				lower == "upgrade" || lower == "proxy-connection" {
+			continue
+		}
+		if lower == "connection" {
+			if conn == nil {
+				conn = make(map[string]bool)
+			}
+			for _, name := range strings.Split(val, ",") {
+				conn[strings.ToLower(strings.TrimSpace(name))] = true
+			}
+		}
+		if lower == "transfer-encoding" {
+			te = append(te, val)
+		}
+		req.Headers = append(req.Headers, [2]string{key, val})
+	}
+	if len(te) > 0 {
+		if len(te) != 1 || !strings.EqualFold(te[0], "chunked") {
+			return nil, errors.New("unsupported H2 Transfer-Encoding")
+		}
+		// The standard chunk reader also validates and collects trailers.
+		br := bufio.NewReader(strings.NewReader(raw))
+		r, err := http.ReadRequest(br)
+		if err != nil {
+			return nil, fmt.Errorf("chunked request: %w", err)
+		}
+		req.Body, err = io.ReadAll(r.Body)
+		r.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("chunked body: %w", err)
+		}
+		if _, err := br.Peek(1); err != io.EOF {
+			return nil, errors.New("data after chunked body")
+		}
+		names := make([]string, 0, len(r.Trailer))
+		for name := range r.Trailer {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if h2Hop(name, conn) {
 				continue
 			}
-
-			req.Headers = append(req.Headers, [2]string{key, val})
+			for _, val := range r.Trailer[name] {
+				req.Trailers = append(req.Trailers, [2]string{name, val})
+			}
 		}
+	} else {
+		req.Body = []byte(body)
 	}
-
-	// Extract body
-	if bodyIdx > 0 && bodyIdx < len(lines) {
-		req.Body = []byte(strings.Join(lines[bodyIdx:], "\r\n"))
+	headers := req.Headers[:0]
+	for _, h := range req.Headers {
+		if h2Hop(h[0], conn) || (strings.EqualFold(h[0], "TE") && !strings.EqualFold(h[1], "trailers")) {
+			continue
+		}
+		if len(te) > 0 && strings.EqualFold(h[0], "Content-Length") {
+			continue
+		}
+		headers = append(headers, h)
 	}
+	req.Headers = headers
+	if len(te) > 0 {
+		req.Headers = append(req.Headers, [2]string{"Content-Length", strconv.Itoa(len(req.Body))})
+	}
+	return req, nil
+}
 
-	return req
+// h2Hop - identifies connection-specific fields forbidden in H2
+func h2Hop(name string, conn map[string]bool) bool {
+	name = strings.ToLower(name)
+	return conn[name] || name == "connection" || name == "keep-alive" ||
+		name == "proxy-connection" || name == "transfer-encoding" || name == "upgrade"
 }
 
 // prepareReq - prepare request using snapshots from a shared request template.
@@ -310,9 +359,9 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 			}
 		}
 
-		parsed := parseRawReq2H2(req)
-		if parsed == nil {
-			return fmt.Errorf("failed to parse H2 request")
+		parsed, err := parseRawReq2H2(req)
+		if err != nil {
+			return err
 		}
 		w.blockH2Reqs = append(w.blockH2Reqs, parsed)
 		w.blockAbsIdx = append(w.blockAbsIdx, absIdx)
@@ -354,7 +403,6 @@ func (o *Orch) appendToBlock(w *monkey, relIdx, absIdx int, req, addr string) er
 	w.blockOffsets = append(w.blockOffsets, len(w.blockBuf))
 	w.blockAbsIdx = append(w.blockAbsIdx, absIdx)
 	w.blockBuf = append(w.blockBuf, req...)
-	w.blockBuf = append(w.blockBuf, '\r', '\n')
 
 	// keepAll mode: never flush here, coordinator handles it
 	if o.keepAll {
@@ -675,9 +723,9 @@ func (o *Orch) sendFireAndForget(w *monkey, req, addr string, absIdx int) error 
 	if o.keepAlive || o.httpH2 {
 		// keepalive mode: use existing connection
 		if o.httpH2 {
-			parsedReq := parseRawReq2H2(req)
-			if parsedReq == nil {
-				return fmt.Errorf("failed to parse request for fire-and-forget")
+			parsedReq, err := parseRawReq2H2(req)
+			if err != nil {
+				return err
 			}
 			if _, _, err := w.h2conn.sendReqH2(parsedReq, 0, false); err != nil {
 				return err

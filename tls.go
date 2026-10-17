@@ -107,19 +107,18 @@ func tlsHandshakeDo(conn net.Conn, host string, cliMode int, timeout time.Durati
 		return nil, err
 	}
 
+	state := tlsConn.ConnectionState()
 	if verbose {
 		latencyUs := uint32(time.Since(startTime).Microseconds())
 		stats.ReportTLS(threadID, latencyUs, 1)
 
-		state := tlsConn.ConnectionState()
 		logger.Write(fmt.Sprintf("[V] TLS ok: ver=0x%04x, cipher=0x%04x, alpn=%s\n",
 			state.Version, state.CipherSuite, state.NegotiatedProtocol))
-
-		// Warn if H2 requested but not negotiated
-		if h2 && state.NegotiatedProtocol != "h2" {
-			logger.Write(fmt.Sprintf("[V] WARNING: requested h2 but got alpn=%s, H2 handshake will likely fail\n",
-				state.NegotiatedProtocol))
-		}
+	}
+	if (h2 && state.NegotiatedProtocol != "h2") ||
+		(!h2 && state.NegotiatedProtocol != "" && state.NegotiatedProtocol != "http/1.1") {
+		logger.Write(fmt.Sprintf("WARN: cli=%d ALPN=%q conflicts with -h2=%t\n",
+			cliMode, state.NegotiatedProtocol, h2))
 	}
 
 	return tlsConn, nil

@@ -39,9 +39,9 @@ func send(raw string, data []byte, addr, proxyURL string, cliMode int, tlsTimeou
 		return sendOnConn(data, conn, threadID)
 	}
 
-	req := parseRawReq2H2(raw)
-	if req == nil {
-		return "", "", fmt.Errorf("failed to parse request")
+	req, err := parseRawReq2H2(raw)
+	if err != nil {
+		return "", "", err
 	}
 	h2 := newH2Conn(conn)
 	return h2.sendReqH2(req, threadID, true)

@@ -137,86 +137,108 @@ func buildRequest(tmpl *TemplateReq, values map[string]string) string {
 	return sb.String()
 }
 
-// normalizeReq - normalizes HTTP/1.1 request after all substitutions
+// readReqLine - accepts CRLF, LF or CR without scanning the body
+func readReqLine(s string) (string, string) {
+	i := strings.IndexAny(s, "\r\n")
+	if i < 0 {
+		return s, ""
+	}
+	n := i + 1
+	if s[i] == '\r' && n < len(s) && s[n] == '\n' {
+		n++
+	}
+	return s[:i], s[n:]
+}
+
+// splitReqHdr - separates headers at the first empty line, preserving body bytes!
+func splitReqHdr(raw string) (line, hdr, body string) {
+	line, hdr = readReqLine(raw)
+	rest := hdr
+	for rest != "" {
+		prev := rest
+		var h string
+		h, rest = readReqLine(rest)
+		if h == "" {
+			return line, hdr[:len(hdr)-len(prev)], rest
+		}
+	}
+	return line, hdr, ""
+}
+
+// hasToken - matches a complete comma-separated header token.
+func hasToken(s, token string) bool {
+	for s != "" {
+		var part string
+		part, s, _ = strings.Cut(s, ",")
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeReq - normalizes headers and length after substitutions, preserving body bytes.
 // - ensures HTTP/1.1 in request line
 // - normalizes line endings to \r\n
 // - calculates and sets Content-Length
 func normalizeReq(req string, blockMode bool) string {
-	reqLineEnd := strings.Index(req, "\n")
-	if reqLineEnd < 0 {
-		return req
-	}
-	requestLine := strings.TrimRight(req[:reqLineEnd], "\r")
-	// ensure HTTP/1.1
-	if !strings.Contains(requestLine, " HTTP/") {
-		requestLine += " HTTP/1.1"
-	} else if !strings.HasSuffix(requestLine, "HTTP/1.1") {
-		requestLine = httpVersionRe.ReplaceAllString(requestLine, "HTTP/1.1")
-	}
-	rest := req[reqLineEnd+1:]
-	// find headers/body separator
-	var headersPart, body string
-	if sepIdx := strings.Index(rest, "\r\n\r\n"); sepIdx >= 0 {
-		headersPart = rest[:sepIdx]
-		body = rest[sepIdx+4:]
-	} else if sepIdx := strings.Index(rest, "\n\n"); sepIdx >= 0 {
-		headersPart = rest[:sepIdx]
-		body = rest[sepIdx+2:]
+	line, hdr, body := splitReqHdr(req)
+	line = strings.TrimRight(line, " \t")
+	i := strings.LastIndexAny(line, " \t")
+	if i >= 0 && strings.IndexAny(line[:i], " \t") >= 0 && strings.HasPrefix(line[i+1:], "HTTP/") {
+		line = line[:i+1] + "HTTP/1.1"
 	} else {
-		headersPart = strings.TrimRight(rest, "\r\n")
-		body = ""
+		line += " HTTP/1.1"
 	}
-	// process headers
-	headerLines := strings.Split(headersPart, "\n")
-	headers := make([]string, 0, len(headerLines))
-	hasContentLen := false
-	hasTransferEnc := false
-	hasConn := false
-	contentLenIdx := -1
-	connKeep := "Connection: keep-alive"
-
-	for _, line := range headerLines {
-		line = strings.TrimRight(line, "\r")
-		if line == "" {
-			continue
-		}
-		lower := strings.ToLower(line)
-		if strings.HasPrefix(lower, "content-length:") {
-			hasContentLen = true
-			contentLenIdx = len(headers)
-		}
-		if strings.HasPrefix(lower, "transfer-encoding:") {
-			hasTransferEnc = true
-		}
-		if blockMode {
-			hconn := strings.Split(lower, "connection:")
-			if len(hconn) == 2 {
+	headers := make([]string, 0, 16)
+	hasLen, hasTE, hasConn := false, false, false
+	for hdr != "" {
+		var h string
+		h, hdr = readReqLine(hdr)
+		key, val, ok := strings.Cut(h, ":")
+		if ok {
+			key = strings.TrimSpace(key)
+			if strings.EqualFold(key, "Content-Length") {
+				hasLen = true
+			}
+			if strings.EqualFold(key, "Transfer-Encoding") {
+				hasTE = true
+			}
+			if blockMode && strings.EqualFold(key, "Connection") {
 				hasConn = true
-				if strings.TrimSpace(hconn[1]) == "close" {
-					line = connKeep
+				if hasToken(val, "close") {
+					tokens := strings.Split(val, ",")
+					for i, token := range tokens {
+						tokens[i] = strings.TrimSpace(token)
+						if strings.EqualFold(tokens[i], "close") {
+							tokens[i] = "keep-alive"
+						}
+					}
+					h = h[:strings.IndexByte(h, ':')+1] + " " + strings.Join(tokens, ", ")
 				}
 			}
 		}
-		headers = append(headers, line)
+		headers = append(headers, h)
 	}
-
 	if blockMode && !hasConn {
-		headers = append(headers, connKeep)
+		headers = append(headers, "Connection: keep-alive")
 	}
-	body = strings.TrimRight(body, "\r\n")
-	bodyLen := len(body)
-	// set Content-Length (skip if Transfer-Encoding present)
-	if !hasTransferEnc {
-		if hasContentLen && contentLenIdx >= 0 {
-			headers[contentLenIdx] = "Content-Length: " + strconv.Itoa(bodyLen)
-		} else if bodyLen > 0 {
-			headers = append(headers, "Content-Length: "+strconv.Itoa(bodyLen))
+	if !hasTE {
+		val := strconv.Itoa(len(body))
+		if hasLen {
+			for i, h := range headers {
+				key, _, ok := strings.Cut(h, ":")
+				if ok && strings.EqualFold(strings.TrimSpace(key), "Content-Length") {
+					headers[i] = h[:strings.IndexByte(h, ':')+1] + " " + val
+				}
+			}
+		} else if len(body) > 0 {
+			headers = append(headers, "Content-Length: "+val)
 		}
 	}
-	// rebuild request
 	var sb strings.Builder
 	sb.Grow(len(req) + 32)
-	sb.WriteString(requestLine)
+	sb.WriteString(line)
 	sb.WriteString("\r\n")
 	for _, h := range headers {
 		sb.WriteString(h)
