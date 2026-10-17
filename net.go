@@ -54,13 +54,14 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 		startTime = time.Now()
 	}
 
-	bytesOut := len(raw)
-	_, err = conn.Write(raw)
+	bytesOut, err := conn.Write(raw)
+	stats.ReportIO(threadID, 0, uint32(bytesOut))
 	if err != nil {
 		return "", "", err
 	}
 	reader := bufio.NewReader(conn)
 	resp, status, bytesIn, err := readHTTP1Resp(threadID, reader)
+	stats.ReportIO(threadID, uint32(bytesIn), 0)
 	if err != nil {
 		return "", "", err
 	}
@@ -69,7 +70,7 @@ func sendOnConn(raw []byte, conn net.Conn, threadID int) (resp, status string, e
 	if verbose {
 		latencyUs = uint32(time.Since(startTime).Microseconds())
 	}
-	stats.ReportRequest(threadID, latencyUs, uint32(bytesIn), uint32(bytesOut))
+	stats.ReportRequest(threadID, latencyUs, 0, 0)
 
 	return resp, status, nil
 }

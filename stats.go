@@ -17,14 +17,12 @@ const (
 	StatTLSRetry  uint8 = 1 << 3 // TLS retry attempt
 )
 
-// StatEvent - single event struct for all metric types (16 bytes)
+// StatEvent - single event struct for quueed metric types (8 bytes)
 type StatEvent struct {
 	Flags    uint8  // event type bitmask
 	ThreadID uint8  // 0-255
 	Status   uint16 // HTTP status or TLS attempts
 	Latency  uint32 // microseconds
-	BytesIn  uint32 // bytes received
-	BytesOut uint32 // bytes sent
 }
 
 // ErrorCount - tracks HTTP errors per thread+status
@@ -32,6 +30,14 @@ type ErrorCount struct {
 	ThreadID int
 	Status   int
 	Count    int
+}
+
+// statCounts - keeps each worker's totals apart to reduce cache contention
+type statCounts struct {
+	req atomic.Uint64 // total request count
+	in  atomic.Uint64 // bytes received
+	out atomic.Uint64 // bytes sent
+	_   [104]byte     // 128-byte stride keeps worker counters 
 }
 
 // StatsCollector - aggregates metrics from all threads
@@ -48,7 +54,6 @@ type StatsCollector struct {
 
 	// Request metrics - separate buffer for req/s (keeps last 2 seconds worth)
 	reqTimestamps []time.Time // for req/s calculation, not limited by windowSize
-	reqCount      uint64      // total request count
 
 	// Jitter samples (verbose only)
 	jitterSamples []float64 // latency samples in ms
@@ -57,9 +62,8 @@ type StatsCollector struct {
 	tlsLatencies []float64 // handshake latency samples
 	tlsAttempts  []int     // attempts per handshake
 
-	// I/O totals
-	totalBytesIn  uint64
-	totalBytesOut uint64
+	// Per-worker request and I/O totals
+	counts []statCounts
 
 	// HTTP errors - map["tid:status"] -> count
 	httpErrors map[string]int
@@ -75,14 +79,18 @@ type StatsCollector struct {
 	// Output
 	outputCh chan string
 	quitCh   chan struct{}
+	doneCh   chan struct{}
+	stopOnce sync.Once
 }
 
-// NewStatsCollector - creates collector with given window size
-func NewStatsCollector(windowSize int, verbose bool) *StatsCollector {
+// NewStatsCollector - creates collector with given window size and worker count.
+func NewStatsCollector(windowSize int, verbose bool, threads int) *StatsCollector {
 	bufSize := windowSize * 4 // buffer for bursts
 
 	sc := &StatsCollector{
 		eventCh:       make(chan StatEvent, bufSize),
+		counts:        make([]statCounts, threads),
+		doneCh:        make(chan struct{}),
 		windowSize:    windowSize,
 		verbose:       verbose,
 		reqTimestamps: make([]time.Time, 0, 128), // separate from windowSize
@@ -129,19 +137,46 @@ func (sc *StatsCollector) Report(event StatEvent) {
 	select {
 	case sc.eventCh <- event:
 	default:
-		// buffer full, drop metric (acceptable for stats)
+		// Totals are recorded separately; queued events may be dropped
 	}
 }
 
-// ReportRequest - helper for request completion
+// ReportRequest - records completion totals before queuing history samples
 func (sc *StatsCollector) ReportRequest(threadID int, latencyUs uint32, bytesIn, bytesOut uint32) {
+	sc.counts[threadID].req.Add(1)
+	sc.ReportIO(threadID, bytesIn, bytesOut)
 	sc.Report(StatEvent{
 		Flags:    StatReqDone,
 		ThreadID: uint8(threadID),
 		Latency:  latencyUs,
-		BytesIn:  bytesIn,
-		BytesOut: bytesOut,
 	})
+}
+
+// ReportIO - records bytes without a completion event; disabled outside verbose mode (-v)
+func (sc *StatsCollector) ReportIO(threadID int, bytesIn, bytesOut uint32) {
+	if !sc.verbose {
+		return
+	}
+	c := &sc.counts[threadID]
+	if bytesIn != 0 {
+		c.in.Add(uint64(bytesIn))
+	}
+	if bytesOut != 0 {
+		c.out.Add(uint64(bytesOut))
+	}
+}
+
+// totals - reads per-worker counters without blocking request processing
+func (sc *StatsCollector) totals() (req, in, out uint64) {
+	for i := range sc.counts {
+		c := &sc.counts[i]
+		req += c.req.Load()
+		if sc.verbose {
+			in += c.in.Load()
+			out += c.out.Load()
+		}
+	}
+	return
 }
 
 // ReportTLS - helper for TLS handshake completion
@@ -176,9 +211,10 @@ func (sc *StatsCollector) OutputChan() <-chan string {
 	return sc.outputCh
 }
 
-// Stop - signals worker to stop
+// Stop - drains queued events and waits for the final snapshot after producers finish
 func (sc *StatsCollector) Stop() {
-	close(sc.quitCh)
+	sc.stopOnce.Do(func() { close(sc.quitCh) })
+	<-sc.doneCh
 }
 
 // SetValDist - sets value distributor for FIFO status display
@@ -195,6 +231,8 @@ func (sc *StatsCollector) SetFifoWaiting(waiting bool) {
 
 // worker - consumes events and updates UI periodically
 func (sc *StatsCollector) worker() {
+	defer close(sc.doneCh)
+	defer close(sc.outputCh)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -203,7 +241,15 @@ func (sc *StatsCollector) worker() {
 	for {
 		select {
 		case <-sc.quitCh:
-			return
+			for {
+				select {
+				case event := <-sc.eventCh:
+					sc.processEvent(event)
+				default:
+					sc.pushUpdate()
+					return
+				}
+			}
 		case event := <-sc.eventCh:
 			sc.processEvent(event)
 		case <-ticker.C:
@@ -226,7 +272,6 @@ func (sc *StatsCollector) processEvent(e StatEvent) {
 		// Track request timestamp for req/s (keep last 2 seconds)
 		now := time.Now()
 		sc.reqTimestamps = append(sc.reqTimestamps, now)
-		sc.reqCount++
 
 		// Prune old timestamps (older than 2 seconds) using binary search
 		// Timestamps are always in ascending order, so binary search is valid
@@ -247,10 +292,6 @@ func (sc *StatsCollector) processEvent(e StatEvent) {
 				sc.jitterSamples = sc.jitterSamples[1:]
 			}
 		}
-
-		// Accumulate I/O
-		sc.totalBytesIn += uint64(e.BytesIn)
-		sc.totalBytesOut += uint64(e.BytesOut)
 
 	case e.Flags&StatTLSDone != 0:
 		if sc.verbose {
@@ -283,6 +324,7 @@ func (sc *StatsCollector) processEvent(e StatEvent) {
 
 // pushUpdate - formats and sends stats to UI
 func (sc *StatsCollector) pushUpdate() {
+	reqCount, bytesIn, bytesOut := sc.totals()
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 
@@ -325,9 +367,9 @@ func (sc *StatsCollector) pushUpdate() {
 	reqPerSec := sc.calcReqPerSec()
 	if sc.verbose {
 		avgJitter := sc.calcAvgJitter()
-		lines = append(lines, fmt.Sprintf("Req/s: %.2f | Avg Jitter: %.2fms | TotalReq: %d", reqPerSec, avgJitter, sc.reqCount))
+		lines = append(lines, fmt.Sprintf("Req/s: %.2f | Avg Jitter: %.2fms | TotalReq: %d", reqPerSec, avgJitter, reqCount))
 	} else {
-		lines = append(lines, fmt.Sprintf("Req/s: %.2f | TotalReq: %d", reqPerSec, sc.reqCount))
+		lines = append(lines, fmt.Sprintf("Req/s: %.2f | TotalReq: %d", reqPerSec, reqCount))
 	}
 
 	// Line 2: HTTP Errors
@@ -347,7 +389,7 @@ func (sc *StatsCollector) pushUpdate() {
 
 		// I/O totals
 		lines = append(lines, fmt.Sprintf("I/O Total: %s in, %s out",
-			formatBytes(sc.totalBytesIn), formatBytes(sc.totalBytesOut)))
+			formatBytes(bytesIn), formatBytes(bytesOut)))
 	}
 
 	output := strings.Join(lines, "\n")
@@ -356,7 +398,12 @@ func (sc *StatsCollector) pushUpdate() {
 	select {
 	case sc.outputCh <- output:
 	default:
-		// UI not consuming, skip update
+		// The collector is the only sender; replacing an old snapshot leaves room?
+		select {
+		case <-sc.outputCh:
+		default:
+		}
+		sc.outputCh <- output
 	}
 }
 

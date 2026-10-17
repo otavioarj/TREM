@@ -16,7 +16,7 @@ import (
 )
 
 // Release :)
-var version = "v1.9.5"
+var version = "v1.9.6"
 
 // Global flags
 var verbose bool
@@ -403,7 +403,7 @@ func runOrchestration(groups []*ThreadGroup, reqTmpls []*TemplateReq, actionPatt
 	valDist := setupValDist(univFlag, fmodeFlag, fifoThreadIDs, keySubscriptions, ui.GetLogger(0))
 
 	// Init stats
-	stats = NewStatsCollector(windowSize, verbose)
+	stats = NewStatsCollector(windowSize, verbose, totalThreads)
 	stats.SetValDist(valDist)
 
 	// Configure group offsets for stats G#T# display

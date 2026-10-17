@@ -435,6 +435,8 @@ func (o *Orch) flushBlock(w *monkey) error {
 
 		// Single TCP write with all requests
 		streamIDs, bytesOut, err := w.h2conn.sendBatchH2(w.blockH2Reqs)
+		// Report aggregate bytes out before response actions can stop the batch :)
+		stats.ReportIO(w.id, 0, uint32(bytesOut))
 		if err != nil {
 			return fmt.Errorf("H2 batch send: %v", err)
 		}
@@ -448,6 +450,7 @@ func (o *Orch) flushBlock(w *monkey) error {
 		// Read responses (order may vary due to H2 multiplexing!)
 		for i := 0; i < reqCount; i++ {
 			streamID, resp, status, bytesIn, err := w.h2conn.readResponse(0) // 0 = any stream
+			stats.ReportIO(w.id, uint32(bytesIn), 0)
 			if err != nil {
 				return fmt.Errorf("H2 read resp %d: %v", i+1, err)
 			}
@@ -462,7 +465,7 @@ func (o *Orch) flushBlock(w *monkey) error {
 			if o.outFlag {
 				w.prevResp = resp
 			}
-			stats.ReportRequest(w.id, 0, uint32(bytesIn), 0)
+			stats.ReportRequest(w.id, 0, 0, 0)
 
 			// Apply response actions if configured
 			if w.actionPatterns != nil && w.actionPatterns[absIdx] != nil {
@@ -472,9 +475,6 @@ func (o *Orch) flushBlock(w *monkey) error {
 				}
 			}
 		}
-
-		// Report aggregate bytes out
-		stats.ReportRequest(w.id, 0, 0, uint32(bytesOut))
 
 		// Clear buffers for next batch
 		// Drop request references before keeping the slice capacity.
@@ -495,8 +495,9 @@ func (o *Orch) flushBlock(w *monkey) error {
 	w.logger.Write(fmt.Sprintf("Flush %d reqs (%d bytes)\n", reqCount, len(w.blockBuf)))
 
 	// Single TCP write
-	bytesOut := uint32(len(w.blockBuf))
-	if _, err := w.conn.Write(w.blockBuf); err != nil {
+	bytesOut, err := w.conn.Write(w.blockBuf)
+	stats.ReportIO(w.id, 0, uint32(bytesOut))
+	if err != nil {
 		return fmt.Errorf("block write: %v", err)
 	}
 	reader := bufio.NewReader(w.conn)
@@ -504,11 +505,12 @@ func (o *Orch) flushBlock(w *monkey) error {
 	// Read responses in FIFO order (HTTP/1.1 pipelining RFC7230 guarantees order)
 	for i := 0; i < reqCount; i++ {
 		absIdx := w.blockAbsIdx[i]
-		stats.ReportRequest(w.id, 0, 0, 0)
-		resp, status, _, err := readHTTP1Resp(w.id, reader)
+		resp, status, bytesIn, err := readHTTP1Resp(w.id, reader)
+		stats.ReportIO(w.id, uint32(bytesIn), 0)
 		if err != nil {
 			return fmt.Errorf("block read resp %d: %v", i+1, err)
 		}
+		stats.ReportRequest(w.id, 0, 0, 0)
 
 		w.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
 		if o.outFlag {
@@ -523,9 +525,6 @@ func (o *Orch) flushBlock(w *monkey) error {
 			}
 		}
 	}
-
-	// Report stats (aggregate for the flush)
-	stats.ReportRequest(w.id, 0, 0, bytesOut)
 
 	// Clear buffers for next batch
 	w.blockBuf = w.blockBuf[:0]
@@ -569,7 +568,9 @@ func (o *Orch) doGlobalFlushH1() error {
 		totalReqs, totalSize, len(o.monkeys)))
 
 	// Single TCP write
-	if _, err := conn.Write(totalBuf); err != nil {
+	bytesOut, err := conn.Write(totalBuf)
+	stats.ReportIO(o.monkeys[0].id, 0, uint32(bytesOut))
+	if err != nil {
 		return fmt.Errorf("global flush write: %v", err)
 	}
 
@@ -579,10 +580,12 @@ func (o *Orch) doGlobalFlushH1() error {
 	for _, m := range o.monkeys {
 		for i := 0; i < len(m.blockOffsets); i++ {
 			absIdx := m.blockAbsIdx[i]
-			resp, status, _, err := readHTTP1Resp(m.id, reader)
+			resp, status, bytesIn, err := readHTTP1Resp(m.id, reader)
+			stats.ReportIO(m.id, uint32(bytesIn), 0)
 			if err != nil {
 				return fmt.Errorf("global read resp m%d r%d: %v", m.id, absIdx+1, err)
 			}
+			stats.ReportRequest(m.id, 0, 0, 0)
 
 			m.logger.Write(fmt.Sprintf("HTTP (r%d) %s\n", absIdx+1, status))
 			if o.outFlag {
@@ -604,7 +607,6 @@ func (o *Orch) doGlobalFlushH1() error {
 		m.blockAbsIdx = m.blockAbsIdx[:0]
 	}
 
-	stats.ReportRequest(o.monkeys[0].id, 0, 0, uint32(totalSize))
 	return nil
 }
 
@@ -657,8 +659,9 @@ func (o *Orch) doGlobalFlushH2() error {
 		totalReqs, len(o.monkeys)))
 
 	// Single TCP write
-	bytesOut := buf.Len()
-	if _, err := h2.conn.Write(buf.Bytes()); err != nil {
+	bytesOut, err := h2.conn.Write(buf.Bytes())
+	stats.ReportIO(o.monkeys[0].id, 0, uint32(bytesOut))
+	if err != nil {
 		return fmt.Errorf("H2 global flush write: %v", err)
 	}
 
@@ -666,6 +669,7 @@ func (o *Orch) doGlobalFlushH2() error {
 	for i := 0; i < totalReqs; i++ {
 		streamID, resp, status, bytesIn, err := h2.readResponse(0)
 		if err != nil {
+			stats.ReportIO(o.monkeys[0].id, uint32(bytesIn), 0)
 			return fmt.Errorf("H2 global read resp %d: %v", i+1, err)
 		}
 
@@ -700,7 +704,6 @@ func (o *Orch) doGlobalFlushH2() error {
 		m.blockAbsIdx = m.blockAbsIdx[:0]
 	}
 
-	stats.ReportRequest(o.monkeys[0].id, 0, 0, uint32(bytesOut))
 	return nil
 }
 
@@ -718,7 +721,6 @@ func (o *Orch) extractReq(w *monkey, i int) string {
 // Used when patterns[relIdx] is empty, indicating no response processing needed
 func (o *Orch) sendFireAndForget(w *monkey, req, addr string, absIdx int) error {
 	w.logger.Write(fmt.Sprintf("Fire&Forget (r%d)\n", absIdx+1))
-	bytesOut := uint32(len(req))
 
 	if o.keepAlive || o.httpH2 {
 		// keepalive mode: use existing connection
@@ -727,11 +729,13 @@ func (o *Orch) sendFireAndForget(w *monkey, req, addr string, absIdx int) error 
 			if err != nil {
 				return err
 			}
-			if _, _, err := w.h2conn.sendReqH2(parsedReq, 0, false); err != nil {
+			if _, _, err := w.h2conn.sendReqH2(parsedReq, w.id, false); err != nil {
 				return err
 			}
 		} else {
-			if _, err := w.conn.Write([]byte(req)); err != nil {
+			n, err := w.conn.Write([]byte(req))
+			stats.ReportIO(w.id, 0, uint32(n))
+			if err != nil {
 				return err
 			}
 		}
@@ -742,14 +746,15 @@ func (o *Orch) sendFireAndForget(w *monkey, req, addr string, absIdx int) error 
 		if err != nil {
 			return err
 		}
-		_, err = conn.Write([]byte(req))
+		n, err := conn.Write([]byte(req))
+		stats.ReportIO(w.id, 0, uint32(n))
 		conn.Close()
 		if err != nil {
 			return err
 		}
 	}
 
-	stats.ReportRequest(w.id, 0, 0, bytesOut)
+	stats.ReportRequest(w.id, 0, 0, 0)
 	w.prevResp = ""
 	return nil
 }

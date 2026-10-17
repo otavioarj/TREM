@@ -249,9 +249,9 @@ func (h *H2Conn) sendReqH2(req *ParsedReq, threadID int, waitRsp bool) (resp, st
 	// Encode and send frames
 	var buf bytes.Buffer
 	h.encodeReqFrames(&buf, req, streamID)
-	bytesOut := buf.Len()
-
-	if _, err := h.conn.Write(buf.Bytes()); err != nil {
+	bytesOut, err := h.conn.Write(buf.Bytes())
+	stats.ReportIO(threadID, 0, uint32(bytesOut))
+	if err != nil {
 		return "", "", err
 	}
 
@@ -262,6 +262,7 @@ func (h *H2Conn) sendReqH2(req *ParsedReq, threadID int, waitRsp bool) (resp, st
 
 	// Read response
 	_, resp, status, bytesIn, err := h.readResponse(streamID)
+	stats.ReportIO(threadID, uint32(bytesIn), 0)
 	if err != nil {
 		return "", "", err
 	}
@@ -276,12 +277,13 @@ func (h *H2Conn) sendReqH2(req *ParsedReq, threadID int, waitRsp bool) (resp, st
 	if verbose {
 		latencyUs = uint32(time.Since(startTime).Microseconds())
 	}
-	stats.ReportRequest(threadID, latencyUs, uint32(bytesIn), uint32(bytesOut))
+	stats.ReportRequest(threadID, latencyUs, 0, 0)
 	return resp, status, nil
 }
 
 // sendBatchH2 - sends multiple requests in single TCP write (H2 multiplexing)
 // Returns streamIDs for response correlation
+// bytesOut includes partial writes on error!!
 func (h *H2Conn) sendBatchH2(reqs []*ParsedReq) (streamIDs []uint32, bytesOut int, err error) {
 	if err := h.handshake(); err != nil {
 		return nil, 0, err
@@ -296,11 +298,11 @@ func (h *H2Conn) sendBatchH2(reqs []*ParsedReq) (streamIDs []uint32, bytesOut in
 		h.encodeReqFrames(&buf, req, streamID)
 	}
 
-	if _, err := h.conn.Write(buf.Bytes()); err != nil {
-		return nil, 0, err
+	n, err := h.conn.Write(buf.Bytes())
+	if err != nil {
+		return nil, n, err
 	}
-
-	return streamIDs, buf.Len(), nil
+	return streamIDs, n, nil
 }
 
 // framePayload - removes padding and optional HEADERS priority fields 
