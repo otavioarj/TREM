@@ -150,8 +150,9 @@ go build -ldflags="-s -w" -trimpath
 | `-tou` | 5000 | TLS handshake timeout in milliseconds |
 | `-retry` | 3 | Max retries on connection/TLS errors |
 | `-v` | false | Verbose debug output (see [Verbose Mode](#verbose-mode)) |
-| `-sw` | 10 | Stats window size (auto-set to 50 if verbose and < 50) |
-| `-h2` | false | Use HTTP/2 (default: HTTP/1.1, see [HTTP/2 Support](#http2-support)) |
+| `-sw` | 10 | Timing sample window and retained HTTP error categories (minimum 50 with `-v`) |
+| `-h2` | false | Use HTTP/2 (requires TLS, see [HTTP/2 Support](#http2-support)) |
+| `-tls` | true | Enable TLS; `-h2=true` requires `-tls=true` |
 | `-fw` | true | FIFO wait: block until first value written to named pipe |
 | `-fmode` | 2 | FIFO distribution: 1=Broadcast (all threads), 2=Round-robin |
 | `-fbck` | 64 | FIFO block consumption: max values to drain per request (0=unlimited) |
@@ -259,7 +260,7 @@ With -ka:
 5. Read responses in order, dispatch to respective threads
 6. Repeat for each loop iteration (`-xt`)
 
-> **Note on `x_delay` + `ka`**: In keep-all mode the shared TLS connection is dialed **once** before the workers start and reused across every cycle — it is not re-dialed per iteration. An `x_delay` that exceeds the server's idle timeout can therefore cause the connection to be dropped **during** the inter-cycle wait; the following global flush will fail and fall back to a reconnect attempt. When pairing `x_delay` with `ka`, keep the delay below the target's idle timeout, or expect a reconnect (and its cost) on each cycle whose wait outlives the connection.
+> **Note on `x_delay` + `ka`**: In keep-all mode the shared TLS connection is dialed **once** before the workers start and reused across every cycle; it is not re-dialed per iteration. An `x_delay` that exceeds the server's idle timeout can therefore cause the connection to be dropped **during** the inter-cycle wait; the following global flush will fail and fall back to a reconnect attempt. When pairing `x_delay` with `ka`, keep the delay below the target's idle timeout, or expect a reconnect (and its cost) on each cycle whose wait outlives the connection.
 
 **Protocol details:**
 - **HTTP/1.1**: All requests concatenated, pipelined in single write
@@ -274,7 +275,7 @@ With -ka:
 ```bash
 ./trem -l "race.txt" -thr 100 -xt 50 -mode block -ka -h2
 ```
-Sends 100 × 50 = 5000 requests through a single TLS connection, with each iteration's requests going out in one TCP write (if total size < `-dsize`).
+Sends 100 × 50 = 5000 requests through a single TLS connection, with each iteration's requests sent in one TCP write. A write can span multiple TCP segments ((if total size < `-dsize`).
 
 ### Sync Barriers (`-sb`)
 
@@ -352,7 +353,7 @@ req_indices thr=N mode=sync|async|block s_delay=N [r_delay=N] [x=N] [xt=N] [x_de
 
 > **Note**: `mode=block` ignores `r_delay` and `re=` parameters.
 
-> **Note**: `x_delay=N` inserts a static wait of N ms **before each `xt` loop cycle**. Cycle 0 (the initial request chain) is excluded, mirroring how `xt` counts iterations, and there is no wait after the final cycle. It is optional and a no-op without `xt`. Unlike `s_delay` — which schedules group start/boot and inter-group ordering — `x_delay` is loop-scoped and repeats on every iteration. Typical use: give an external process (e.g. a database snapshot) a quiet window between iterations. See [Keep-All Mode](#keep-all-mode--ka) for a caveat when combined with `ka`.
+> **Note**: `x_delay=N` inserts a static wait of N ms **before each `xt` loop cycle**. Cycle 0 (the initial request chain) is excluded, mirroring how `xt` counts iterations, and there is no wait after the final cycle. It is optional and a no-op without `xt`. Unlike `s_delay` (which schedules group start/boot and inter-group ordering), `x_delay` is loop-scoped and repeats on every iteration. Typical use: give an external process (e.g. a database snapshot) a quiet window between iterations. See [Keep-All Mode](#keep-all-mode--ka) for a caveat when combined with `ka`.
 
 > **Note**: Request indices can be **duplicated across groups**, allowing different groups to process the same request with different configurations.
 
@@ -409,7 +410,7 @@ Group 1 extracts `$_session$` which Group 2 uses, but Group 1 threads don't wast
 
 ## Cross-Group Synchronization
 
-The `wk=` (wait keys) parameter enables fine-grained synchronization between thread groups by blocking a group until specific keys become available — [static keys](#global-static-keys) in `globalStaticVals`, or plain FIFO keys in the thread buffer.
+The `wk=` (wait keys) parameter enables fine-grained synchronization between thread groups by blocking a group until specific keys become available ([static keys](#global-static-keys) in `globalStaticVals`, or plain FIFO keys in the thread buffer).
 
 ### Wait Keys (`wk=`)
 
@@ -495,9 +496,9 @@ The most powerful combination for race condition attacks:
 
 ## Global Static Keys
 
-**Global static keys** are keys whose name begins with an underscore (`_op`, `_token`, `_session`). They are TREM's mechanism for a value that must be **the same everywhere** — shared by every thread, across every group, and reused on every loop iteration. Internally they live in a single process-wide store, `globalStaticVals`, which holds exactly **one value per key**.
+**Global static keys** are keys whose name begins with an underscore (`_op`, `_token`, `_session`). They are TREM's mechanism for a value that must be **the same everywhere**, shared by every thread, across every group, and reused on every loop iteration. Internally they live in a single process-wide store, `globalStaticVals`, which holds exactly **one value per key**.
 
-This section is the complete reference for `globalStaticVals`. The scoped subsections elsewhere — [Cross-Group Value Sharing](#cross-group-value-sharing), [Wait Keys](#wait-keys-wk), [Persistent Keys](#persistent-keys-_key) — each describe one facet and point back here.
+This section is the complete reference for `globalStaticVals`. The scoped subsections elsewhere ([Cross-Group Value Sharing](#cross-group-value-sharing), [Wait Keys](#wait-keys-wk), [Persistent Keys](#persistent-keys-_key)) each describe one facet and point back here.
 
 ### How a static key is created
 
@@ -505,17 +506,19 @@ A `_`-key enters `globalStaticVals` from any of these sources:
 
 - **`-u` initial value:** `-u "_token=eyJ..."` seeds the key before any request (see [Static Mode](#static-mode)).
 - **FIFO feed:** a `_key=value` line written to the FIFO (see [FIFO Mode](#fifo-mode-dynamic-injection)).
-- **Regex extraction:** a capture whose placeholder name is `_`-prefixed, e.g. `` ...([^;]+)`_session `` (see [Regex Patterns File](#regex-patterns-file--re)). The extracted value is stored globally and becomes visible to every group.
+- **Regex extraction:** a capture whose placeholder name is `_`-prefixed, e.g. `` ...([^;]+)`:_session `` (see [Regex Patterns File](#regex-patterns-file--re)). The extracted value is stored globally and becomes visible to every group.
 
 In requests a static key is referenced like any other: `$_token$`.
+
+Non-`_` regex values persist within the extracting thread across subsequent requests and loops. See [Static Mode](#static-mode) for variable name restrictions.
 
 ### Peculiarities (read before using)
 
 These behaviors distinguish a static key from an ordinary FIFO key, and are the most common source of surprises:
 
-1. **Always broadcast — `-fmode` does not apply.** A static key is delivered to **every** thread, regardless of the [FIFO distribution mode](#fifo-distribution-modes--fmode). Round-robin (`-fmode 2`) and per-request draining (`-fbck`) govern **non-`_` keys only**. You cannot make a `_`-key hand a different value to each thread or each request.
+1. **Always broadcast (`-fmode` does not apply).** A static key is delivered to **every** thread, regardless of the [FIFO distribution mode](#fifo-distribution-modes--fmode). Round-robin (`-fmode 2`) and per-request draining (`-fbck`) govern **non-`_` keys only**. You cannot make a `_`-key hand a different value to each thread or each request.
 
-2. **Single value — last one wins.** `globalStaticVals` stores one value per key. Feeding a second value for the same `_`-key **overwrites** the first; only the last survives. This includes **continuation lines** in the FIFO: because a bare line (no `=`) inherits the previous key, writing
+2. **Single value (last one wins).** `globalStaticVals` stores one value per key. Feeding a second value for the same `_`-key **overwrites** the first; only the last survives. This includes **continuation lines** in the FIFO: because a bare line (no `=`) inherits the previous key, writing
 
    ```
    _ee=valueA
@@ -523,15 +526,15 @@ These behaviors distinguish a static key from an ordinary FIFO key, and are the 
    valueC
    ```
 
-   stores `_ee` three times and keeps only `valueC` — the earlier values are silently discarded. TREM emits a one-time `WARN` per key when a `_`-key receives continuation values, precisely to catch this. If you intended one value **per request**, the key must **not** be `_`-prefixed — use a plain FIFO key (see [FIFO Mode](#fifo-mode-dynamic-injection)), which round-robins and is consumed one value per request.
+   stores `_ee` three times and keeps only `valueC`; the earlier values are silently discarded. TREM emits a one-time `WARN` per key when a `_`-key receives continuation values, precisely to catch this. If you intended one value **per request**, the key must **not** be `_`-prefixed; use a plain FIFO key (see [FIFO Mode](#fifo-mode-dynamic-injection)), which round-robins and is consumed one value per request.
 
-3. **Resolved before the FIFO channel.** Static keys are read straight from `globalStaticVals` when a request is prepared, *before* the per-request FIFO drain runs. That is why `-fbck` and round-robin never touch them, and why a `_`-key is never "consumed" — it is read, not popped.
+3. **Resolved before the FIFO channel.** Static keys are read straight from `globalStaticVals` when a request is prepared, *before* the per-request FIFO drain runs. That is why `-fbck` and round-robin never touch them, and why a `_`-key is never "consumed"; it is read, not popped.
 
 4. **Persistent across loops.** Once set, a static key is reused by every request and every loop iteration (`xt`) until a new value for the same key overwrites it. Ideal for a token obtained once and replayed many times.
 
 ### Waiting on a static key (`wk=`)
 
-A group can block until a key is present in `globalStaticVals` using `wk=` — the wait is infinite, with no timeout. See [Wait Keys](#wait-keys-wk) for the full mechanism and cross-group dependency chains.
+A group can block until a key is present in `globalStaticVals` using `wk=`; the wait is infinite, with no timeout. See [Wait Keys](#wait-keys-wk) for the full mechanism and cross-group dependency chains.
 
 ### Choosing static vs. FIFO
 
@@ -542,7 +545,7 @@ A group can block until a key is present in `globalStaticVals` using `wk=` — t
 
 ## Regex Patterns File (`-re`)
 
-The patterns file defines how values are extracted from responses and injected into subsequent requests. Each line corresponds to a request transition (line N extracts from response N to populate request N+1).
+The patterns file defines how values are extracted from responses and injected into subsequent requests. Each non-comment entry applies to the corresponding response (entry N extracts from response N for subsequent requests).
 
 ### Line Format
 
@@ -565,23 +568,22 @@ regex`:<key> $ regex2`:<key2> $ ... regexN`:<keyN>
 
 ### Example
 
-Given requests: `login.txt`, `setup.txt`, `verify.txt`, `action.txt`
+In single mode, given requests: `login.txt`, `setup.txt`, `verify.txt`, `action.txt`
 
 ```
 # patterns.txt
-Set-Cookie:\s*session=([^;]+)`_session $ name="csrf" value="([^"]+)"`_csrf
+Set-Cookie:\s*session=([^;]+)`:_session $ name="csrf" value="([^"]+)"`:_csrf
 :
-
-token="([^"]+)"`token
+token="([^"]+)"`:token
 ```
 
 **Behavior:**
-1. Line 1: Extract `_session` and `_csrf` from login response → used in setup.txt
-2. Line 2: Fire & Forget - setup.txt sent, response not read
-3. Line 3: Empty - verify.txt response read but no extraction
-4. Line 4: Extract `token` from verify response → used in action.txt (but line 3 is empty, so this extracts from verify.txt response for action.txt)
+1. Request 1: Extract `_session` and `_csrf` from the login response for setup.txt.
+2. Request 2: Send setup.txt without reading its response.
+3. Request 3: Extract `token` from the verify.txt response for action.txt.
+4. Request 4: Read the action.txt response without extraction.
 
-> **Note**: A capture named with a `_` prefix is stored as a [global static key](#global-static-keys) — it persists globally and is shared across thread groups (single value; the last extraction wins).
+> **Note**: A capture named with a `_` prefix is stored as a [global static key](#global-static-keys); it persists globally and is shared across thread groups (single value; the last extraction wins).
 
 ## Response Actions (`-ra`)
 
@@ -597,12 +599,14 @@ Where:
 - `regex`: Golang regular expression to match against response
 - `actions`: One or more actions to execute on match
 
+Each request index accepts one regex definition; multiple actions share that match.
+
 ### Available Actions
 
 | Action | Description |
 |--------|-------------|
 | `prt("msg")` | Print message to the matching thread's tab  |
-| `pra("msg")` | Print message to ALL threads tabs on first matching |
+| `pra("msg")` | Print message to ALL thread tabs on each match |
 | `pt`         | Pause the matching thread (Enter to continue) |
 | `pat`        | Pause ALL thread (Enter to continue)  |
 | `sre("path")` | Save the request that generated the match to file  |
@@ -610,15 +614,17 @@ Where:
 | `sa("path")` | Save both request and response to file |
 | `e` | Graceful exit (always use as last action if combined) |
 
+`sre`, `srp` and `sa` preserve the directory and prefix the basename with `thrN_` for one group or `gMthrN_` for multiple groups. Group and thread IDs are 1-based. Repeated matches by the same thread overwrite the same output path; files are not appended.
+
 ### Example
 
 ```
 # actions.txt
-2,3:"success":true`:sa("/tmp/poc.txt"), pra("EXPLOITED!"),pat e
+2,3:"success":true`:sa("/tmp/poc.txt"), pra("EXPLOITED!"), e
 ```
 
 When response 2 or 3 contains `"success":true`:
-1. Save request+response to `/tmp/poc.txt`
+1. Save request+response to `/tmp/thrN_poc.txt` (or `/tmp/gMthrN_poc.txt` with multiple groups).
 2. Print "EXPLOITED!" to all threads
 3. Exit gracefully
 
@@ -632,9 +638,9 @@ Provides dynamic value injection into requests via static assignment or FIFO pip
 ./trem -l "req1.txt,req2.txt" -re patterns.txt -u "token=abc123"
 ```
 
-Replaces every `$token$` in all requests with `abc123`.
+Supplies `abc123` for `$token$` in each request. Non-`_` regex values persist across subsequent requests and loops within the same thread. `_`-prefixed values are shared across threads and groups (see [Global Static Keys](#global-static-keys)).
 
-> **Note**: Values extracted by regex patterns (via `-re`) take priority over `-u` static values. This allows `-u` to provide initial values that can be overridden by extracted values in subsequent requests or loops.
+> **Note**: Each regex destination name must be unique across active pattern files and must not also be supplied by `-u` or FIFO. Conflicts are fatal. Reusing a placeholder, updating a FIFO value or repeating the same extraction in a loop is allowed.
 
 ### FIFO Mode (Dynamic Injection)
 
@@ -688,9 +694,9 @@ Thread 2: pass3, pass6
 
 ### Persistent Keys (`_key`)
 
-> This subsection covers the FIFO-feed facet only. For the full behavior of static keys — always-broadcast, single-value/last-wins, continuation collapse — see [Global Static Keys](#global-static-keys).
+> This subsection covers the FIFO-feed facet only. For the full behavior of static keys (always-broadcast, single-value/last-wins, continuation collapse), see [Global Static Keys](#global-static-keys).
 
-Keys starting with underscore are [global static values](#global-static-keys): they are never consumed in the FIFO and persist across all loops. They hold a **single** value — to change it, feed a new `_key=value` line later, which **overwrites** the previous one (last value wins):
+Keys starting with underscore are [global static values](#global-static-keys): they are never consumed in the FIFO and persist across all loops. They hold a **single** value; to change it, feed a new `_key=value` line later, which **overwrites** the previous one (last value wins):
 
 ```
 _bearer=eyJhbGciOiJIUzI1NiIs...
@@ -751,7 +757,7 @@ By default in group mode, TREM analyzes each group's request templates and only 
 **How it works:**
 
 1. Before starting, TREM parses all request templates for each group
-2. Extracts non-static keys (`$key$`, not `$_key$` — see [Global Static Keys](#global-static-keys)) from each group's requests
+2. Extracts non-static keys (`$key$`, not `$_key$`; see [Global Static Keys](#global-static-keys)) from each group's requests
 3. Builds a subscription map: which threads need which keys
 4. FIFO dispatcher only sends keys to subscribed threads
 
@@ -809,7 +815,7 @@ TREM supports HTTP/2 natively with a handcrafted protocol implementation. Reques
 
 **Intended Limitations:**
 - Flow control assumes server window ≥ 10MB
-- Server push (PUSH_PROMISE) frames discarded
+- Server push is disabled (`SETTINGS_ENABLE_PUSH=0`); receiving `PUSH_PROMISE` is a protocol error.
 
 **When to use HTTP/2:**
 - Target server requires HTTP/2
@@ -889,18 +895,26 @@ Outputs:
 
 ## Stats Panel
 
-Real-time metrics in the UI, it uses a windows of events (`-sw`) to control how many events are collected to display metrics, e.g., `-sw 25` will use 25 events (i.e., request sent) to display, default is 10, normal mode, although it can be increased to better granularity if needed. When using [verbose mode](#verbose-mode) (`-v`) windows size is set to 50 if `-sw` is lower than 50.
+Request and I/O totals use per-worker atomic counters. The collector refreshes the panel every 100ms during the first second, then every 500ms. It publishes a final snapshot after processing queued events at shutdown.
+
+`-sw` controls timing sample histories and retained HTTP error categories (default 10, minimum 50 with `-v`). It does not limit `TotalReq` or define the req/s time window.
 
 **Normal mode:**
-- Req/s: requests per second
-- TotalReq: total requests sent
-- HTTP Errs: errors by group/thread and status (e.g., `G1T1(401)x5`)
-- Univ.: current FIFO path and last value
+
+- Req/s: completion events processed during the last second.
+- TotalReq: completed requests and successful fire-and-forget sends, including HTTP 4xx/5xx responses. Connection failures do not count as completed requests.
+- HTTP Errs: errors by group/thread and status (e.g., `G1T1(401)x5`).
+- Univ.: current FIFO path and last value.
+
+Req/s, HTTP error events and timing samples use a bounded queue; events may be dropped under saturation. Request and I/O totals are recorded independently of that queue.
 
 **Verbose mode (`-v`)** adds:
-- Avg Jitter: latency variance
-- TLS latency and retry averages
-- I/O totals (bytes in/out)
+
+- Avg Jitter: mean absolute difference between consecutive latency samples.
+- TLS handshake latency and attempt averages.
+- I/O totals: bytes reported by the HTTP send and read paths.
+
+I/O accounting is disabled when `-v=false`.
 
 ## UI Controls
 
@@ -922,6 +936,12 @@ The UI displays a **TreeView** on the left showing all groups and their threads.
 ```bash
 ./trem -l "auth.txt,race.txt" -re patterns.txt -thr 20 -mode sync
 ```
+
+**Single-request race with FIFO and response actions:**
+```bash
+./trem -l "race.txt" -thr 50 -mode sync -u /tmp/fifo -ra actions.txt
+```
+A single-request chain does not require `-re`. If supplied, its patterns apply to that response and can publish `_`-prefixed values to other groups.
 
 **Single-packet attack (block mode with HTTP/2):**
 ```bash
@@ -957,7 +977,7 @@ Sends 100 × 50 = 5000 requests through single TLS connection, each iteration in
 **Fire & Forget with selective response reading:**
 ```bash
 # patterns.txt:
-# session=([^;]+)`_session
+# session=([^;]+)`:_session
 # :
 # (empty line - reads response, no extraction)
 
@@ -1035,7 +1055,7 @@ Sends 100 × 50 = 5000 requests through single TLS connection, each iteration in
 # actions.txt:
 # 1:"success"`:sre("/tmp/winner.txt"), e
 
-./trem -l "verify.txt" -re patterns.txt -u /tmp/spray -thr 100 -xt 0 -fmode 2 -ra actions.txt
+./trem -l "verify.txt" -u /tmp/spray -thr 100 -x 1 -xt 0 -fmode 2 -ra actions.txt
 ```
 
 **Complete exploitation workflow:**
@@ -1051,7 +1071,7 @@ Sends 100 × 50 = 5000 requests through single TLS connection, each iteration in
 
 With `actions.txt`:
 ```
-3:"exploited"\s*:\s*true`:sa("/tmp/poc.txt"), pa("SUCCESS!"), e
+3:"exploited"\s*:\s*true`:sa("/tmp/poc.txt"), pra("SUCCESS!"), e
 ```
 
 **Complete exploitation with keep-all and wait keys:**
@@ -1069,5 +1089,5 @@ With `actions.txt`:
 
 With `actions.txt`:
 ```
-3:"exploited"\s*:\s*true`:sa("/tmp/poc.txt"), pa("SUCCESS!"), e
+3:"exploited"\s*:\s*true`:sa("/tmp/poc.txt"), pra("SUCCESS!"), e
 ```
